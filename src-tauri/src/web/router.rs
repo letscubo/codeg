@@ -1503,6 +1503,9 @@ pub fn build_router(
         )
         .route("/terminal_kill", post(handlers::terminal::terminal_kill))
         .route("/terminal_list", post(handlers::terminal::terminal_list))
+        // ─── MyClaw fork ext (letscubo) —— 上游无,前缀 /myclaw/* 与平台对接 ───
+        // 受同一 require_token 保护(必须在这组内,不能进 public_api)。
+        .route("/myclaw/exec", post(handlers::myclaw::exec::exec))
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {

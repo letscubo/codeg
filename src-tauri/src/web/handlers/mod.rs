@@ -21,6 +21,8 @@ pub mod git;
 pub mod logging;
 pub mod mcp;
 pub mod model_provider;
+// ─── fork(letscubo)专属,上游无此模块 ───
+pub mod myclaw;
 pub mod office_tools;
 pub mod office_watch_proxy;
 pub mod pet;
