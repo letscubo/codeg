@@ -18,7 +18,7 @@ use minisign_verify::{PublicKey, Signature};
 /// Tauri-format minisign public key — copied verbatim from
 /// `tauri.conf.json` `plugins.updater.pubkey`. Base64 of the two-line
 /// `minisign.pub` file (`untrusted comment:` + `RW…` key line).
-const TAURI_PUBKEY_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ4OEM3NkMyMTVENjdBODgKUldTSWV0WVZ3bmFNU0NnSzhpdFg2bXFmMHFidWd1eWpuZ2Y2WmU5QmVXdWVrU0ZpOCt2dnd6WW4K";
+const TAURI_PUBKEY_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhBMDNERDExMzIwQjE2OApSV1Jvc1NBVDBUMmdDSHdqaWxTcERlQW9ZYkljaCtsT1JXMkZxR1BzaWdoWHdiaGhtWXhvYWthVgo=";
 
 /// Decode an outer base64 wrapper into the inner minisign text file.
 fn unwrap_base64(b64: &str) -> Result<String, String> {
@@ -87,8 +87,8 @@ mod tests {
 
     #[test]
     fn bare_key_line_parses() {
-        let text = "untrusted comment: minisign public key: 488C76C215D67A88\n\
-                    RWSIetYVwnaMSCgK8itX6mqf0qbuguyjngf6Ze9BeWuekSFi8+vvwzYn\n";
+        let text = "untrusted comment: minisign public key: 8A03DD11320B168\n\
+                    RWRosSAT0T2gCHwjilSpDeAoYbIch+lORW2FqGPsighXwbhhmYxoakaV\n";
         parse_public_key(text).expect("two-line pub text should parse");
     }
 
