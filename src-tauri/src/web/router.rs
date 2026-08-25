@@ -1505,7 +1505,10 @@ pub fn build_router(
         .route("/terminal_list", post(handlers::terminal::terminal_list))
         // ─── MyClaw fork ext (letscubo) —— 上游无,前缀 /myclaw/* 与平台对接 ───
         // 受同一 require_token 保护(必须在这组内,不能进 public_api)。
+        // exec=同步一次性;task=异步(POST 提交拿 taskId,GET 轮询实时累积输出)。
         .route("/myclaw/exec", post(handlers::myclaw::exec::exec))
+        .route("/myclaw/task", post(handlers::myclaw::task::submit))
+        .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {
