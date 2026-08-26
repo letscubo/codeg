@@ -24,11 +24,38 @@ pub fn create_backend(
                     "chat_id is required".into(),
                 ));
             }
+            let session_defaults = if cfg.direct_chat_enabled {
+                let folder_path = cfg
+                    .default_folder_path
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        ChatChannelError::ConfigurationInvalid(
+                            "default_folder_path is required when direct_chat_enabled is true"
+                                .into(),
+                        )
+                    })?;
+                let agent_type = cfg
+                    .default_agent_type
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        ChatChannelError::ConfigurationInvalid(
+                            "default_agent_type is required when direct_chat_enabled is true"
+                                .into(),
+                        )
+                    })?;
+                Some(ChannelSessionDefaults {
+                    folder_path,
+                    agent_type,
+                })
+            } else {
+                None
+            };
             Ok(Box::new(telegram::TelegramBackend::new(
                 channel_id,
                 token,
                 cfg.chat_id,
                 cfg.topic_mode,
+                session_defaults,
             )))
         }
         ChannelType::Weixin => {

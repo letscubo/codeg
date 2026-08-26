@@ -11,7 +11,9 @@ use super::i18n::{self, Lang};
 use super::manager::ChatChannelManager;
 use super::session_bridge::SessionBridge;
 use super::session_commands;
-use super::types::{ChannelMessageTarget, IncomingCommand, InteractiveMessage, RichMessage};
+use super::types::{
+    ChannelMessageTarget, ChannelSessionDefaults, IncomingCommand, InteractiveMessage, RichMessage,
+};
 use crate::acp::manager::ConnectionManager;
 use crate::db::service::{app_metadata_service, chat_channel_message_log_service};
 use crate::web::event_bridge::EventEmitter;
@@ -101,6 +103,7 @@ pub fn spawn_command_dispatcher(
                 cmd.channel_id,
                 &cmd.sender_id,
                 &cmd.target,
+                cmd.session_defaults.as_ref(),
                 cmd.callback_data.as_deref(),
                 config.lang,
             )
@@ -201,6 +204,7 @@ async fn dispatch_command(
     channel_id: i32,
     sender_id: &str,
     target: &ChannelMessageTarget,
+    session_defaults: Option<&ChannelSessionDefaults>,
     callback_data: Option<&str>,
     lang: Lang,
 ) -> DispatchResponse {
@@ -262,6 +266,25 @@ async fn dispatch_command(
                     .await,
                     target,
                 );
+            }
+            if session_defaults.is_some() {
+                return dispatch_task(
+                    text,
+                    db,
+                    manager,
+                    conn_mgr,
+                    emitter,
+                    bridge,
+                    data_dir,
+                    channel_id,
+                    sender_id,
+                    target,
+                    session_defaults,
+                    true,
+                    lang,
+                    prefix,
+                )
+                .await;
             }
             return DispatchResponse::current(command_handlers::handle_help(prefix, lang), target);
         }
@@ -329,21 +352,23 @@ async fn dispatch_command(
             }
         }
         "task" | "do" => {
-            let result = session_commands::handle_task(
-                db, args, channel_id, sender_id, target, manager, conn_mgr, emitter, bridge, lang,
-                prefix, data_dir,
+            dispatch_task(
+                args,
+                db,
+                manager,
+                conn_mgr,
+                emitter,
+                bridge,
+                data_dir,
+                channel_id,
+                sender_id,
+                target,
+                session_defaults,
+                false,
+                lang,
+                prefix,
             )
-            .await;
-            DispatchResponse {
-                message: Some(DispatchMessage::Rich(result.message)),
-                target: result.response_target,
-                extra_messages: result
-                    .extra_responses
-                    .into_iter()
-                    .map(|(message, target)| (DispatchMessage::Rich(message), target))
-                    .collect(),
-                post_action: result.post_action,
-            }
+            .await
         }
         "sessions" => DispatchResponse::current(
             session_commands::handle_sessions(db, channel_id, sender_id, target, lang, prefix)
@@ -388,6 +413,52 @@ async fn dispatch_command(
                 .with_title(i18n::unknown_command_title(lang)),
             target,
         ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_task(
+    text: &str,
+    db: &DatabaseConnection,
+    manager: &ChatChannelManager,
+    conn_mgr: &ConnectionManager,
+    emitter: &EventEmitter,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    data_dir: &Path,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+    session_defaults: Option<&ChannelSessionDefaults>,
+    suppress_started_message: bool,
+    lang: Lang,
+    prefix: &str,
+) -> DispatchResponse {
+    if let Some(defaults) = session_defaults {
+        if let Err(error) =
+            session_commands::apply_session_defaults(db, channel_id, sender_id, defaults).await
+        {
+            return DispatchResponse::current(
+                RichMessage::error(format!("Failed to prepare default chat context: {error}")),
+                target,
+            );
+        }
+    }
+
+    let result = session_commands::handle_task(
+        db, text, channel_id, sender_id, target, manager, conn_mgr, emitter, bridge, lang, prefix,
+        data_dir,
+    )
+    .await;
+    let hide_started_message = suppress_started_message && result.post_action.is_some();
+    DispatchResponse {
+        message: (!hide_started_message).then_some(DispatchMessage::Rich(result.message)),
+        target: result.response_target,
+        extra_messages: result
+            .extra_responses
+            .into_iter()
+            .map(|(message, target)| (DispatchMessage::Rich(message), target))
+            .collect(),
+        post_action: result.post_action,
     }
 }
 
@@ -506,6 +577,7 @@ mod tests {
             channel_id,
             "sender-1",
             &target,
+            None,
             Some(&format!("cfg:folder:{folder_id}")),
             Lang::En,
         )
@@ -537,6 +609,7 @@ mod tests {
             channel_id,
             "sender-1",
             &target,
+            None,
             None,
             Lang::En,
         )

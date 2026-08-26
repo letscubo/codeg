@@ -321,8 +321,35 @@ async fn process_envelope(
     // and delivered fire-and-forget so an unreachable endpoint can't stall the
     // subscriber loop. Runs even with zero enabled IM channels.
     if !config.webhooks.is_empty() {
-        let payload =
-            super::webhook::build_webhook_payload(&event_type, &envelope.connection_id, &msg);
+        let context = {
+            let guard = bridge.lock().await;
+            guard.get(&envelope.connection_id).map(|session| {
+                let channel_type = session.target.is_telegram().then(|| "telegram".to_string());
+                let scope = if session.target.is_telegram_direct() {
+                    Some("direct".to_string())
+                } else if session.target.is_telegram() {
+                    Some("group".to_string())
+                } else {
+                    None
+                };
+                super::webhook::WebhookEventContext {
+                    channel_id: session.channel_id,
+                    channel_type,
+                    conversation_id: session.conversation_id,
+                    sender_id: session.sender_id.clone(),
+                    chat_id: session.target.chat_id.clone(),
+                    thread_key: session.target.thread_key.clone(),
+                    thread_kind: session.target.thread_kind.clone(),
+                    scope,
+                }
+            })
+        };
+        let payload = super::webhook::build_webhook_payload_with_context(
+            &event_type,
+            &envelope.connection_id,
+            &msg,
+            context.as_ref(),
+        );
         super::webhook::spawn_webhook_delivery(
             webhook_client.clone(),
             config.webhooks.clone(),

@@ -424,6 +424,51 @@ pub async fn handle_callback(
 
 // ── /task ──
 
+pub async fn apply_session_defaults(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    defaults: &crate::chat_channel::types::ChannelSessionDefaults,
+) -> Result<(), String> {
+    let ctx = sender_context_service::get_or_create(db, channel_id, sender_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let default_agent = if ctx.current_agent_type.is_none() {
+        Some(
+            parse_agent_type(&defaults.agent_type)
+                .ok_or_else(|| format!("unknown default agent: {}", defaults.agent_type))?,
+        )
+    } else {
+        None
+    };
+
+    if ctx.current_folder_id.is_none() {
+        let folder_path = defaults.folder_path.trim();
+        if folder_path.is_empty() {
+            return Err("default folder path is empty".to_string());
+        }
+        let folder = folder_service::add_folder(db, folder_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        sender_context_service::update_folder(db, channel_id, sender_id, Some(folder.id))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    if let Some(agent_type) = default_agent {
+        sender_context_service::update_agent(
+            db,
+            channel_id,
+            sender_id,
+            Some(agent_type_to_string(agent_type)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_task(
     db: &DatabaseConnection,
@@ -1797,6 +1842,63 @@ mod tests {
 
         assert_eq!(ctx.current_agent_type.as_deref(), Some("codex"));
         assert_eq!(message.title.as_deref(), Some("Agent Selected"));
+    }
+
+    #[tokio::test]
+    async fn direct_chat_defaults_fill_missing_sender_context() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let defaults = crate::chat_channel::types::ChannelSessionDefaults {
+            folder_path: "/tmp/codeg-direct-default".to_string(),
+            agent_type: "codex".to_string(),
+        };
+
+        apply_session_defaults(&db.conn, channel_id, "sender-1", &defaults)
+            .await
+            .expect("apply defaults");
+
+        let ctx = sender_context_service::get_or_create(&db.conn, channel_id, "sender-1")
+            .await
+            .expect("context");
+        assert!(ctx.current_folder_id.is_some());
+        assert_eq!(ctx.current_agent_type.as_deref(), Some("codex"));
+    }
+
+    #[tokio::test]
+    async fn direct_chat_defaults_do_not_override_explicit_sender_choices() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let selected_folder = seed_folder(&db, "/tmp/codeg-selected-folder").await;
+        sender_context_service::update_folder(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            Some(selected_folder),
+        )
+        .await
+        .expect("select folder");
+        sender_context_service::update_agent(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            Some("claude_code".to_string()),
+        )
+        .await
+        .expect("select agent");
+        let defaults = crate::chat_channel::types::ChannelSessionDefaults {
+            folder_path: "/tmp/codeg-direct-default".to_string(),
+            agent_type: "codex".to_string(),
+        };
+
+        apply_session_defaults(&db.conn, channel_id, "sender-1", &defaults)
+            .await
+            .expect("apply defaults");
+
+        let ctx = sender_context_service::get_or_create(&db.conn, channel_id, "sender-1")
+            .await
+            .expect("context");
+        assert_eq!(ctx.current_folder_id, Some(selected_folder));
+        assert_eq!(ctx.current_agent_type.as_deref(), Some("claude_code"));
     }
 
     #[tokio::test]

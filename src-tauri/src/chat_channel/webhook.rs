@@ -16,6 +16,18 @@ use serde::{Deserialize, Serialize};
 
 use super::types::RichMessage;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookEventContext {
+    pub channel_id: i32,
+    pub channel_type: Option<String>,
+    pub conversation_id: i32,
+    pub sender_id: String,
+    pub chat_id: Option<String>,
+    pub thread_key: Option<String>,
+    pub thread_kind: Option<String>,
+    pub scope: Option<String>,
+}
+
 /// One configured webhook sink. Persisted (as a JSON array) under the
 /// `chat_event_webhooks` app-metadata key and mirrored on the frontend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,21 +61,45 @@ pub fn build_webhook_payload(
     connection_id: &str,
     msg: &RichMessage,
 ) -> serde_json::Value {
+    build_webhook_payload_with_context(event_type, connection_id, msg, None)
+}
+
+pub fn build_webhook_payload_with_context(
+    event_type: &str,
+    connection_id: &str,
+    msg: &RichMessage,
+    context: Option<&WebhookEventContext>,
+) -> serde_json::Value {
     let fields: Vec<serde_json::Value> = msg
         .fields
         .iter()
         .map(|(label, value)| serde_json::json!({ "label": label, "value": value }))
         .collect();
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
+        "event_id": uuid::Uuid::new_v4().to_string(),
         "event": event_type,
         "level": msg.level,
         "title": msg.title,
         "body": msg.body,
         "fields": fields,
         "connection_id": connection_id,
+        "occurred_at": chrono::Utc::now().to_rfc3339(),
         "source": "codeg",
-    })
+    });
+
+    if let Some(context) = context {
+        payload["channel_id"] = serde_json::json!(context.channel_id);
+        payload["channel_type"] = serde_json::json!(context.channel_type);
+        payload["conversation_id"] = serde_json::json!(context.conversation_id);
+        payload["sender_id"] = serde_json::json!(context.sender_id);
+        payload["chat_id"] = serde_json::json!(context.chat_id);
+        payload["thread_key"] = serde_json::json!(context.thread_key);
+        payload["thread_kind"] = serde_json::json!(context.thread_kind);
+        payload["scope"] = serde_json::json!(context.scope);
+    }
+
+    payload
 }
 
 /// Build the shared reqwest client used for webhook delivery. Mirrors the
@@ -179,6 +215,35 @@ mod tests {
         assert_eq!(payload["level"], "error");
         assert_eq!(payload["title"], "Agent Error");
         assert!(payload["fields"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn payload_includes_chat_session_correlation() {
+        let context = WebhookEventContext {
+            channel_id: 7,
+            channel_type: Some("telegram".to_string()),
+            conversation_id: 42,
+            sender_id: "1001".to_string(),
+            chat_id: Some("1001".to_string()),
+            thread_key: Some("1001".to_string()),
+            thread_kind: Some("telegram_direct".to_string()),
+            scope: Some("direct".to_string()),
+        };
+
+        let payload = build_webhook_payload_with_context(
+            "turn_complete",
+            "conn-abc",
+            &sample_msg(),
+            Some(&context),
+        );
+
+        assert_eq!(payload["channel_id"], 7);
+        assert_eq!(payload["channel_type"], "telegram");
+        assert_eq!(payload["conversation_id"], 42);
+        assert_eq!(payload["chat_id"], "1001");
+        assert_eq!(payload["scope"], "direct");
+        assert!(payload["event_id"].as_str().is_some());
+        assert!(payload["occurred_at"].as_str().is_some());
     }
 
     #[test]

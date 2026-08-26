@@ -12,6 +12,7 @@ pub struct TelegramBackend {
     bot_token: String,
     chat_id: String,
     topic_mode: bool,
+    session_defaults: Option<ChannelSessionDefaults>,
     client: reqwest::Client,
     status: Arc<Mutex<ChannelConnectionStatus>>,
     channel_id: i32,
@@ -22,11 +23,18 @@ pub struct TelegramBackend {
 }
 
 impl TelegramBackend {
-    pub fn new(channel_id: i32, bot_token: String, chat_id: String, topic_mode: bool) -> Self {
+    pub fn new(
+        channel_id: i32,
+        bot_token: String,
+        chat_id: String,
+        topic_mode: bool,
+        session_defaults: Option<ChannelSessionDefaults>,
+    ) -> Self {
         Self {
             bot_token,
             chat_id,
             topic_mode,
+            session_defaults,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(60))
@@ -255,6 +263,7 @@ impl ChatChannelBackend for TelegramBackend {
             .await
             .unwrap_or_else(|_| self.chat_id.clone());
         let topic_mode = self.topic_mode;
+        let session_defaults = self.session_defaults.clone();
         let status = self.status.clone();
 
         tokio::spawn(async move {
@@ -338,6 +347,7 @@ impl ChatChannelBackend for TelegramBackend {
                                                 channel_id,
                                                 &configured_chat_id,
                                                 topic_mode,
+                                                &sender_id,
                                                 message,
                                             );
                                             tracing::debug!("[Telegram] dispatching: {clean_text}");
@@ -349,6 +359,7 @@ impl ChatChannelBackend for TelegramBackend {
                                                     callback_data: None,
                                                     target,
                                                     metadata: update.clone(),
+                                                    session_defaults: session_defaults.clone(),
                                                 })
                                                 .await;
                                             if let Err(e) = send_result {
@@ -399,6 +410,7 @@ impl ChatChannelBackend for TelegramBackend {
                                             channel_id,
                                             &configured_chat_id,
                                             topic_mode,
+                                            &sender_id,
                                             message,
                                         );
                                         tracing::debug!("[Telegram] dispatching callback: {data}");
@@ -410,6 +422,7 @@ impl ChatChannelBackend for TelegramBackend {
                                                 callback_data: Some(data.to_string()),
                                                 target,
                                                 metadata: update.clone(),
+                                                session_defaults: session_defaults.clone(),
                                             })
                                             .await;
                                         if let Err(e) = send_result {
@@ -695,16 +708,17 @@ fn telegram_message_target(
     channel_id: i32,
     configured_chat_id: &str,
     topic_mode: bool,
+    sender_id: &str,
     message: &serde_json::Value,
 ) -> ChannelMessageTarget {
-    if !topic_mode {
-        return ChannelMessageTarget::channel(channel_id);
-    }
-
     let chat_id = message
         .pointer("/chat/id")
         .and_then(json_scalar_to_string)
         .unwrap_or_else(|| configured_chat_id.to_string());
+
+    if !topic_mode {
+        return ChannelMessageTarget::telegram_direct(channel_id, chat_id, sender_id);
+    }
 
     if let Some(thread_key) = message
         .pointer("/message_thread_id")
@@ -895,7 +909,7 @@ mod tests {
         // A numeric chat_id short-circuits before any getChat call, so this
         // resolves offline. (The `@username` → getChat branch is covered by
         // real-device / HTTP-mock testing.)
-        let backend = TelegramBackend::new(1, "token".into(), "-100123".into(), true);
+        let backend = TelegramBackend::new(1, "token".into(), "-100123".into(), true, None);
         assert_eq!(backend.canonical_chat_id().await.unwrap(), "-100123");
     }
 
@@ -921,15 +935,18 @@ mod tests {
     }
 
     #[test]
-    fn target_parser_uses_channel_target_when_topic_mode_is_disabled() {
+    fn target_parser_keeps_direct_chat_identity_when_topic_mode_is_disabled() {
         let message = serde_json::json!({
             "chat": { "id": -100123 },
             "message_thread_id": 8
         });
 
-        let target = telegram_message_target(7, "-100123", false, &message);
+        let target = telegram_message_target(7, "-100123", false, "42", &message);
 
-        assert_eq!(target, ChannelMessageTarget::channel(7));
+        assert_eq!(
+            target,
+            ChannelMessageTarget::telegram_direct(7, "-100123", "42")
+        );
     }
 
     #[test]
@@ -941,11 +958,11 @@ mod tests {
         });
 
         assert_eq!(
-            telegram_message_target(7, "-100123", true, &general),
+            telegram_message_target(7, "-100123", true, "42", &general),
             ChannelMessageTarget::telegram_general(7, "-100123")
         );
         assert_eq!(
-            telegram_message_target(7, "-100123", true, &topic),
+            telegram_message_target(7, "-100123", true, "42", &topic),
             ChannelMessageTarget::telegram_forum_topic(7, "-100123", "2")
         );
     }

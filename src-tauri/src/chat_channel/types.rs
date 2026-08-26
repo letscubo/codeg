@@ -15,6 +15,16 @@ pub struct TelegramConfig {
     pub chat_id: String,
     #[serde(default)]
     pub topic_mode: bool,
+    #[serde(default)]
+    pub direct_chat_enabled: bool,
+    pub default_folder_path: Option<String>,
+    pub default_agent_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSessionDefaults {
+    pub folder_path: String,
+    pub agent_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +67,7 @@ pub struct IncomingCommand {
     pub callback_data: Option<String>,
     pub target: ChannelMessageTarget,
     pub metadata: serde_json::Value,
+    pub session_defaults: Option<ChannelSessionDefaults>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,6 +100,20 @@ impl ChannelMessageTarget {
         }
     }
 
+    pub fn telegram_direct(
+        channel_id: i32,
+        chat_id: impl Into<String>,
+        sender_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel_id,
+            chat_id: Some(chat_id.into()),
+            thread_key: Some(sender_id.into()),
+            thread_kind: Some(TELEGRAM_DIRECT_THREAD_KIND.to_string()),
+            provider_payload: None,
+        }
+    }
+
     pub fn telegram_forum_topic(
         channel_id: i32,
         chat_id: impl Into<String>,
@@ -112,6 +137,19 @@ impl ChannelMessageTarget {
         self.thread_kind.as_deref() == Some(TELEGRAM_GENERAL_THREAD_KIND)
     }
 
+    pub fn is_telegram_direct(&self) -> bool {
+        self.thread_kind.as_deref() == Some(TELEGRAM_DIRECT_THREAD_KIND)
+    }
+
+    pub fn is_telegram(&self) -> bool {
+        matches!(
+            self.thread_kind.as_deref(),
+            Some(TELEGRAM_DIRECT_THREAD_KIND)
+                | Some(TELEGRAM_GENERAL_THREAD_KIND)
+                | Some(TELEGRAM_FORUM_THREAD_KIND)
+        )
+    }
+
     pub fn matches_thread(&self, other: &Self) -> bool {
         self.channel_id == other.channel_id
             && self.chat_id == other.chat_id
@@ -122,6 +160,7 @@ impl ChannelMessageTarget {
 
 pub const TELEGRAM_FORUM_THREAD_KIND: &str = "telegram_forum_topic";
 pub const TELEGRAM_GENERAL_THREAD_KIND: &str = "telegram_general_topic";
+pub const TELEGRAM_DIRECT_THREAD_KIND: &str = "telegram_direct";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
