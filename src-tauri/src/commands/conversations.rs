@@ -1129,6 +1129,29 @@ pub async fn get_folder_conversation_core(
                 .map(|f| f.path),
         };
         tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
+            // OpenClaw: prefer codeg's own ACP transcript. The bridge's ACP
+            // session id (our `external_id`) never matches any file in the
+            // gateway's store — the gateway keys its files by a different
+            // uuid — so `OpenClawParser` resolves nothing for conversations
+            // codeg started (turns_total=0, measured), and the folder+time
+            // fallback below misses whenever conversations share a gateway
+            // session. Since `transcript_dir_for` now records OpenClaw's wire
+            // (live + session/load replay hydration), that transcript is the
+            // id-exact source; fall through to the native parser only when no
+            // transcript exists (conversations that predate recording).
+            if at == AgentType::OpenClaw {
+                let native = AcpNativeParser::new(at);
+                if let Ok(d) = native.get_conversation(&eid) {
+                    return Ok((
+                        d.turns,
+                        d.session_stats,
+                        None,
+                        d.summary.title,
+                        d.summary.model,
+                        d.transcript_watermark,
+                    ));
+                }
+            }
             let parser: Box<dyn AgentParser> = match at {
                 AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
                 AgentType::Codex => Box::new(CodexParser::new()),

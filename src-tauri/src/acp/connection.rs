@@ -1068,6 +1068,20 @@ fn pi_launch_preflight(runtime_env: &BTreeMap<String, String>) -> Option<String>
 /// reading the agent's native transcript, and recording those too would double
 /// the storage while risking two disagreeing histories.
 fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
+    // OpenClaw records here too, despite being a built-in with its own parser.
+    // It is a bridge: `openclaw acp` mints an ACP session id while the actual
+    // transcript is written by its resident gateway under a DIFFERENT session
+    // uuid, and nothing on disk links the two — so `OpenClawParser` can never
+    // resolve a conversation's `external_id` (measured: turns_total=0 on every
+    // conversation; the folder+started_at fallback also misses whenever several
+    // conversations share one gateway session). Recording the ACP wire on our
+    // side, like custom agents, is the only id-stable source of its history.
+    // The read path prefers this transcript for OpenClaw (see
+    // `get_folder_conversation_core`), and `session/load` replay hydration
+    // backfills conversations that predate recording.
+    if agent_type == AgentType::OpenClaw {
+        return Some(registry::registry_id_for(agent_type));
+    }
     agent_type
         .custom_id()
         .map(|_| registry::registry_id_for(agent_type))
