@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.28.2-1"
+version = "0.28.2-2"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
