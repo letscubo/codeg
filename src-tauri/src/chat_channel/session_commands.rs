@@ -1864,8 +1864,6 @@ pub async fn auto_resume_with_prompt(
         }
     };
 
-    // The text rides as the pending kickoff: the SessionStarted handler sends
-    // it once the session (and its session/load restore) is up.
     {
         let session = ActiveSession {
             channel_id,
@@ -1879,7 +1877,7 @@ pub async fn auto_resume_with_prompt(
             tool_call_inputs: std::collections::HashMap::new(),
             delegation_rendered: std::collections::HashSet::new(),
             last_flushed: Instant::now(),
-            pending_prompt: Some(text.to_string()),
+            pending_prompt: None,
             permission_pending: None,
         };
         bridge.lock().await.register(connection_id.clone(), session);
@@ -1890,9 +1888,32 @@ pub async fn auto_resume_with_prompt(
         channel_id,
         sender_id,
         Some(conv.id),
-        Some(connection_id),
+        Some(connection_id.clone()),
     )
     .await;
+
+    // Send the text DIRECTLY, not via `pending_prompt`: `spawn_agent` already
+    // waited for SessionStarted internally (its dedup gate), so the
+    // SessionStarted event was consumed BEFORE the bridge entry above existed
+    // — a prompt parked on `pending_prompt` here would sleep forever
+    // (observed on D6: resume spawned, session loaded, message never sent).
+    // `pending_prompt` remains only as the busy fallback below, where the
+    // TurnComplete arm retries it.
+    if let Err(e) = send_chat_prompt(conn_mgr, &connection_id, text).await {
+        if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
+            if let Some(s) = bridge.lock().await.get_mut(&connection_id) {
+                s.pending_prompt = Some(text.to_string());
+            }
+            return Some(RichMessage::info(i18n::agent_busy_retry(lang).to_string()));
+        }
+        bridge.lock().await.remove(&connection_id);
+        let _ = conn_mgr.cancel(db, &connection_id).await;
+        let _ = sender_context_service::clear_connection(db, channel_id, sender_id).await;
+        return Some(RichMessage::error(format!(
+            "{}{e}",
+            i18n::failed_to_send_message_label(lang)
+        )));
+    }
 
     Some(RichMessage::info(i18n::message_sent(lang)))
 }
