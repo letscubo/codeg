@@ -47,7 +47,21 @@ pub enum ClientMsg {
         #[serde(default)]
         since_seq: Option<u64>,
     },
-    /// Cancel a prior `attach` by `subscription_id`.
+    /// Subscribe this WebSocket to the ENTIRE instance's ACP event stream
+    /// (every connection, present and future), sourced from the in-process
+    /// `InternalEventBus`. Live-only by design: there is no snapshot and no
+    /// seq cursor — per-connection `event_seq` counters cannot form a single
+    /// resume point across the whole bus. A client that reconnects (or gets
+    /// `Detached{lagged}`) simply re-sends `attach_all` and reconciles any
+    /// gap from its own durable store (for MyClaw web: the `chat_messages`
+    /// mirror, which the turn_complete webhook keeps ~2s fresh).
+    ///
+    /// This is the successor of the always-on legacy global firehose for the
+    /// "watch everything" use case (a page showing conversations driven from
+    /// other surfaces, e.g. Telegram channel turns): opt-in per socket
+    /// instead of unconditionally pushed to every client.
+    AttachAll { subscription_id: String },
+    /// Cancel a prior `attach` / `attach_all` by `subscription_id`.
     Detach { subscription_id: String },
     /// Liveness check. Server replies with `pong`.
     Ping,
@@ -74,6 +88,11 @@ pub enum ServerMsg {
         events: Vec<Arc<EventEnvelope>>,
         high_water_seq: u64,
     },
+    /// Ack for `attach_all`: the live tap is registered; every `Event` frame
+    /// tagged with this `subscription_id` from here on is bus-wide (the
+    /// envelope's own `connection_id` says which connection it belongs to).
+    /// Deliberately carries no seq/snapshot — see `ClientMsg::AttachAll`.
+    AttachedAll { subscription_id: String },
     /// Live event delivered after the initial Snapshot/Replay frame.
     Event {
         subscription_id: String,

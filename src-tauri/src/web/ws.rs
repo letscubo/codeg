@@ -315,6 +315,41 @@ async fn handle_client_msg(
                 }
             }
         }
+        ClientMsg::AttachAll { subscription_id } => {
+            // Same replace-on-reattach semantics as `Attach`.
+            if let Some(old) = subscriptions.remove(&subscription_id) {
+                old.handle.abort();
+            }
+            // Subscribe the bus BEFORE the ack goes out, so an event fired
+            // between ack and subscribe can't be missed. Live-only: no
+            // snapshot frame, no cursor (see ClientMsg::AttachAll docs).
+            let receiver = state.acp_event_bus.subscribe();
+            if outbound_tx
+                .send(ServerMsg::AttachedAll {
+                    subscription_id: subscription_id.clone(),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            *next_epoch = next_epoch.wrapping_add(1);
+            let epoch = *next_epoch;
+            // The per-connection forwarder is envelope-type-compatible with
+            // the bus receiver, so it is reused verbatim: Lagged → the client
+            // re-sends `attach_all` and reconciles from its durable store;
+            // Closed (bus dropped, i.e. process teardown) → ConnectionGone,
+            // which the client treats the same as a server shutdown here.
+            let handle = ws_attach::spawn_forwarder(
+                subscription_id.clone(),
+                epoch,
+                state.acp_event_bus.metrics().clone(),
+                receiver,
+                outbound_tx.clone(),
+                cleanup_tx.clone(),
+            );
+            subscriptions.insert(subscription_id, ActiveSubscription { handle, epoch });
+        }
         ClientMsg::Detach { subscription_id } => {
             if let Some(sub) = subscriptions.remove(&subscription_id) {
                 sub.handle.abort();
