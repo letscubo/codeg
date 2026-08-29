@@ -352,6 +352,17 @@ pub struct SessionState {
     /// live `AcpEvent::Error` can still surface the latest agent failure.
     pub last_error: Option<SessionLastError>,
 
+    /// Set by `ConnectionManager::disconnect` (and everything routed through
+    /// it: the idle sweep, owner-window teardown, disconnect_all) BEFORE the
+    /// `Disconnect` command is queued. Killing the agent process makes some
+    /// CLIs exit non-zero (openclaw's launcher turns the SIGTERM into a bare
+    /// exit 1), which the protocol future reports as an error — but a teardown
+    /// codeg itself ordered is not an agent failure. The terminal-error emit in
+    /// `run_connection` checks this flag and goes straight to `Disconnected`,
+    /// so channel bridges (Telegram) don't broadcast a spurious "Agent Error"
+    /// for every planned reclaim.
+    pub deliberate_teardown: bool,
+
     /// Single-fire signal that fires when `SessionStarted` applies (i.e.
     /// `external_id` transitioned from None → Some). `ConnectionManager::
     /// spawn_agent` holds the per-(agent, working_dir, session_id) dedup
@@ -577,6 +588,7 @@ impl SessionState {
             usage: None,
             selectors_ready: false,
             last_error: None,
+            deliberate_teardown: false,
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),

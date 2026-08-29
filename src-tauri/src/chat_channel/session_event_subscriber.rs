@@ -597,11 +597,7 @@ async fn handle_acp_envelope(
             }
         }
 
-        AcpEvent::TurnComplete {
-            stop_reason,
-            agent_type,
-            ..
-        } => {
+        AcpEvent::TurnComplete { stop_reason, .. } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
                 let target = session.target.clone();
@@ -620,19 +616,23 @@ async fn handle_acp_envelope(
                 let lang = get_lang(db).await;
                 let body = format_completion(&content, tool_count, lang);
 
-                let msg = RichMessage::info(body)
-                    .with_title(match lang {
-                        Lang::ZhCn | Lang::ZhTw => "任务完成",
-                        _ => "Turn Complete",
-                    })
-                    .with_field("Agent", agent_type)
-                    .with_field(
+                // Plain text, no card: the buffered content IS the agent's
+                // reply, and wrapping it in a "Turn Complete" info card with
+                // Agent / Stop Reason fields made every answer read like a
+                // system notification. Decorations only for abnormal ends
+                // (cancelled etc.), where there is no reply to speak for
+                // itself.
+                let msg = if stop_reason == "end_turn" {
+                    RichMessage::info(body)
+                } else {
+                    RichMessage::info(body).with_field(
                         match lang {
                             Lang::ZhCn | Lang::ZhTw => "结束原因",
                             _ => "Stop Reason",
                         },
                         localize_stop_reason(stop_reason, lang),
-                    );
+                    )
+                };
 
                 let _ = manager.send_to_target(&target, &msg).await;
 
@@ -727,7 +727,10 @@ async fn handle_acp_envelope(
                     crate::db::entities::conversation::ConversationStatus::Cancelled,
                 )
                 .await;
-                clear_session_route(db, channel_id, &sender_id, &target).await;
+                // Connection-only: the process died but the conversation and
+                // its transcript survive, so the sender's next message can
+                // auto-resume it (session/load) instead of starting over.
+                clear_session_connection(db, channel_id, &sender_id, &target).await;
             }
         }
 
@@ -743,7 +746,13 @@ async fn handle_acp_envelope(
                     let target = session.target.clone();
                     drop(guard);
 
-                    clear_session_route(db, channel_id, &sender_id, &target).await;
+                    // Keep `current_conversation_id`: a Disconnected here is
+                    // routinely the idle sweep reclaiming the process, and the
+                    // sender's next message should continue the SAME
+                    // conversation via auto-resume, no matter how much time
+                    // passed. Only `/new` (or a route proven unusable — the
+                    // SessionStarted conflict path) clears the conversation.
+                    clear_session_connection(db, channel_id, &sender_id, &target).await;
                 }
             }
         }
@@ -796,6 +805,25 @@ async fn clear_session_route(
         }
     } else {
         let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+    }
+}
+
+/// Connection-only teardown: forget the dead process handle but KEEP the
+/// conversation binding, so the next inbound message auto-resumes the same
+/// conversation. (Topic bindings already work this way — their
+/// `clear_connection` never dropped the conversation.)
+async fn clear_session_connection(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+) {
+    if target.is_telegram_forum_topic() {
+        if let Ok(Some(binding)) = thread_binding_service::get_by_target(db, target).await {
+            let _ = thread_binding_service::clear_connection(db, binding.id).await;
+        }
+    } else {
+        let _ = sender_context_service::clear_connection(db, channel_id, sender_id).await;
     }
 }
 

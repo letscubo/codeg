@@ -2022,6 +2022,20 @@ pub async fn spawn_agent_connection(
         }
 
         if let Err(e) = result {
+            // A teardown codeg itself ordered (idle sweep, explicit disconnect,
+            // owner-window cleanup) is not an agent failure, even when killing
+            // the process makes it exit non-zero (openclaw's launcher turns the
+            // SIGTERM into a bare exit 1 and the protocol future reports
+            // "Process exited with exit status: 1"). Emitting that as a
+            // terminal Error made channel bridges broadcast a spurious
+            // "Agent Error" for every planned reclaim; go straight to
+            // `Disconnected` instead.
+            let deliberate = state_clone.read().await.deliberate_teardown;
+            if deliberate {
+                tracing::info!(
+                    "[ACP] suppressing terminal error after deliberate teardown: {e}"
+                );
+            } else {
             let code = e.code().map(String::from);
             emit_with_state(
                 &state_clone,
@@ -2052,6 +2066,7 @@ pub async fn spawn_agent_connection(
                 },
             )
             .await;
+            }
         }
 
         emit_with_state(

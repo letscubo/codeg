@@ -1986,12 +1986,20 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        let cmd_tx = {
+        let entry = {
             let mut connections = self.connections.lock().await;
-            connections.remove(conn_id).map(|conn| conn.cmd_tx)
+            connections
+                .remove(conn_id)
+                .map(|conn| (conn.cmd_tx, Arc::clone(&conn.state)))
         };
-        if let Some(cmd_tx) = cmd_tx {
+        if let Some((cmd_tx, state)) = entry {
             tracing::info!("[ACP] disconnect connection={}", conn_id);
+            // Mark the teardown as codeg-ordered BEFORE the command is queued:
+            // killing the agent process makes some CLIs exit non-zero, and the
+            // terminal-error emit in `run_connection` must be able to tell a
+            // planned reclaim from a real crash (spurious "Agent Error" to
+            // channel bridges otherwise — see SessionState::deliberate_teardown).
+            state.write().await.deliberate_teardown = true;
             let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
             Ok(())
         } else {
@@ -2174,7 +2182,7 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_by_owner_window(&self, owner_window_label: &str) -> usize {
-        let cmd_txs = {
+        let entries = {
             let mut connections = self.connections.lock().await;
             let ids: Vec<String> = connections
                 .iter()
@@ -2190,14 +2198,16 @@ impl ConnectionManager {
             let mut txs = Vec::with_capacity(ids.len());
             for id in ids {
                 if let Some(conn) = connections.remove(&id) {
-                    txs.push(conn.cmd_tx);
+                    txs.push((conn.cmd_tx, Arc::clone(&conn.state)));
                 }
             }
             txs
         };
 
-        let disconnected = cmd_txs.len();
-        for cmd_tx in cmd_txs {
+        let disconnected = entries.len();
+        for (cmd_tx, state) in entries {
+            // Planned teardown, same as `disconnect` — see deliberate_teardown.
+            state.write().await.deliberate_teardown = true;
             let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
         }
         tracing::info!(

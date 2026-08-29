@@ -570,176 +570,111 @@ pub fn help_title(lang: Lang) -> &'static str {
 }
 
 pub fn help_body(lang: Lang, prefix: &str) -> String {
+    // Persistent-conversation command surface (2026-08 revamp). The old
+    // navigation commands (/folder /agent /task /sessions /resume /search
+    // /today) are hidden; /cancel /approve /deny still work but stay out of
+    // the list on purpose (they only matter mid-flow, where the bot points
+    // at them contextually).
     match lang {
         Lang::ZhCn => format!(
-            "{prefix}folder - 选择工作目录\n\
-             {prefix}agent - 选择 Agent\n\
-             {prefix}task <描述> - 创建会话并执行任务\n\
-             {prefix}sessions - 当前目录的活跃会话\n\
-             {prefix}resume [ID] - 最近会话 / 恢复指定会话\n\
-             {prefix}cancel - 取消当前任务\n\
-             {prefix}approve [always] - 批准权限请求\n\
-             {prefix}deny - 拒绝权限请求\n\
+            "直接发消息即可对话；无论隔多久，都会继续当前会话。\n\
              \n\
-             {prefix}search <关键词> - 搜索会话\n\
-             {prefix}today - 今日活动汇总\n\
-             {prefix}status - 渠道连接状态\n\
-             {prefix}help - 显示帮助\n\
-             \n\
-             有活跃会话时，直接发文本即可继续对话"
+             {prefix}tasks - 会话列表 / 切换会话\n\
+             {prefix}status - 当前会话状态\n\
+             {prefix}new - 开启新会话\n\
+             {prefix}models - 查看可用模型\n\
+             {prefix}model <名称> - 切换模型\n\
+             {prefix}help - 显示帮助"
         ),
         Lang::ZhTw => format!(
-            "{prefix}folder - 選擇工作目錄\n\
-             {prefix}agent - 選擇 Agent\n\
-             {prefix}task <描述> - 建立對話並執行任務\n\
-             {prefix}sessions - 當前目錄的活躍對話\n\
-             {prefix}resume [ID] - 最近對話 / 恢復指定對話\n\
-             {prefix}cancel - 取消當前任務\n\
-             {prefix}approve [always] - 批准權限請求\n\
-             {prefix}deny - 拒絕權限請求\n\
+            "直接發訊息即可對話；無論隔多久，都會繼續當前對話。\n\
              \n\
-             {prefix}search <關鍵字> - 搜尋對話\n\
-             {prefix}today - 今日活動匯總\n\
-             {prefix}status - 頻道連線狀態\n\
-             {prefix}help - 顯示幫助\n\
-             \n\
-             有活躍對話時，直接發文字即可繼續對話"
+             {prefix}tasks - 對話清單 / 切換對話\n\
+             {prefix}status - 當前對話狀態\n\
+             {prefix}new - 開啟新對話\n\
+             {prefix}models - 檢視可用模型\n\
+             {prefix}model <名稱> - 切換模型\n\
+             {prefix}help - 顯示幫助"
         ),
         Lang::Ja => format!(
-            "{prefix}folder - 作業フォルダを選択\n\
-             {prefix}agent - エージェントを選択\n\
-             {prefix}task <説明> - セッションを作成してタスクを実行\n\
-             {prefix}sessions - フォルダ内のアクティブセッション\n\
-             {prefix}resume [ID] - 最近のセッション / セッションを再開\n\
-             {prefix}cancel - 現在のタスクをキャンセル\n\
-             {prefix}approve [always] - 権限を承認\n\
-             {prefix}deny - 権限を拒否\n\
+            "メッセージを送るだけで会話できます。時間が空いても同じ会話が続きます。\n\
              \n\
-             {prefix}search <キーワード> - セッション検索\n\
-             {prefix}today - 本日の活動まとめ\n\
-             {prefix}status - チャンネル接続状況\n\
-             {prefix}help - ヘルプを表示\n\
-             \n\
-             セッションがアクティブな場合、テキストを送信するだけで会話を続けられます"
+             {prefix}tasks - 会話一覧 / 切り替え\n\
+             {prefix}status - 現在の会話の状態\n\
+             {prefix}new - 新しい会話を開始\n\
+             {prefix}models - 利用可能なモデル\n\
+             {prefix}model <名前> - モデルを切り替え\n\
+             {prefix}help - ヘルプを表示"
         ),
         Lang::Ko => format!(
-            "{prefix}folder - 작업 폴더 선택\n\
-             {prefix}agent - 에이전트 선택\n\
-             {prefix}task <설명> - 세션 생성 및 작업 실행\n\
-             {prefix}sessions - 폴더 내 활성 세션\n\
-             {prefix}resume [ID] - 최근 대화 / 세션 재개\n\
-             {prefix}cancel - 현재 작업 취소\n\
-             {prefix}approve [always] - 권한 승인\n\
-             {prefix}deny - 권한 거부\n\
+            "메시지를 보내면 바로 대화합니다. 시간이 지나도 같은 대화가 이어집니다.\n\
              \n\
-             {prefix}search <키워드> - 대화 검색\n\
-             {prefix}today - 오늘의 활동 요약\n\
-             {prefix}status - 채널 연결 상태\n\
-             {prefix}help - 도움말 표시\n\
-             \n\
-             세션이 활성화된 경우 텍스트를 보내면 대화를 계속할 수 있습니다"
+             {prefix}tasks - 대화 목록 / 전환\n\
+             {prefix}status - 현재 대화 상태\n\
+             {prefix}new - 새 대화 시작\n\
+             {prefix}models - 사용 가능한 모델\n\
+             {prefix}model <이름> - 모델 전환\n\
+             {prefix}help - 도움말"
         ),
         Lang::Es => format!(
-            "{prefix}folder - Seleccionar carpeta de trabajo\n\
-             {prefix}agent - Seleccionar agente\n\
-             {prefix}task <desc> - Crear sesion y ejecutar tarea\n\
-             {prefix}sessions - Sesiones activas en la carpeta\n\
-             {prefix}resume [ID] - Recientes / reanudar una sesion\n\
-             {prefix}cancel - Cancelar tarea actual\n\
-             {prefix}approve [always] - Aprobar permiso\n\
-             {prefix}deny - Denegar permiso\n\
+            "Escriba un mensaje para conversar; la conversacion actual continua sin importar el tiempo.\n\
              \n\
-             {prefix}search <palabra> - Buscar conversaciones\n\
-             {prefix}today - Resumen de hoy\n\
-             {prefix}status - Estado de canales\n\
-             {prefix}help - Mostrar ayuda\n\
-             \n\
-             Cuando hay una sesion activa, simplemente escriba texto para continuar"
+             {prefix}tasks - Lista / cambiar de conversacion\n\
+             {prefix}status - Estado de la conversacion actual\n\
+             {prefix}new - Nueva conversacion\n\
+             {prefix}models - Modelos disponibles\n\
+             {prefix}model <nombre> - Cambiar de modelo\n\
+             {prefix}help - Mostrar ayuda"
         ),
         Lang::De => format!(
-            "{prefix}folder - Arbeitsordner auswahlen\n\
-             {prefix}agent - Agent auswahlen\n\
-             {prefix}task <Beschreibung> - Sitzung erstellen und Aufgabe ausfuhren\n\
-             {prefix}sessions - Aktive Sitzungen im Ordner\n\
-             {prefix}resume [ID] - Neueste Sitzungen / Sitzung fortsetzen\n\
-             {prefix}cancel - Aktuelle Aufgabe abbrechen\n\
-             {prefix}approve [always] - Berechtigung genehmigen\n\
-             {prefix}deny - Berechtigung verweigern\n\
+            "Einfach eine Nachricht senden; die aktuelle Unterhaltung wird fortgesetzt, egal wie viel Zeit vergeht.\n\
              \n\
-             {prefix}search <Stichwort> - Sitzungen suchen\n\
-             {prefix}today - Heutige Zusammenfassung\n\
-             {prefix}status - Kanalstatus\n\
-             {prefix}help - Hilfe anzeigen\n\
-             \n\
-             Bei aktiver Sitzung einfach Text eingeben, um das Gesprach fortzusetzen"
+             {prefix}tasks - Unterhaltungen auflisten / wechseln\n\
+             {prefix}status - Status der aktuellen Unterhaltung\n\
+             {prefix}new - Neue Unterhaltung\n\
+             {prefix}models - Verfuegbare Modelle\n\
+             {prefix}model <Name> - Modell wechseln\n\
+             {prefix}help - Hilfe anzeigen"
         ),
         Lang::Fr => format!(
-            "{prefix}folder - Selectionner le dossier de travail\n\
-             {prefix}agent - Selectionner l'agent\n\
-             {prefix}task <desc> - Creer une session et executer une tache\n\
-             {prefix}sessions - Sessions actives dans le dossier\n\
-             {prefix}resume [ID] - Sessions recentes / reprendre une session\n\
-             {prefix}cancel - Annuler la tache en cours\n\
-             {prefix}approve [always] - Approuver la permission\n\
-             {prefix}deny - Refuser la permission\n\
+            "Envoyez un message pour discuter ; la conversation en cours continue quel que soit le delai.\n\
              \n\
-             {prefix}search <mot-cle> - Rechercher des sessions\n\
-             {prefix}today - Resume du jour\n\
-             {prefix}status - Statut des canaux\n\
-             {prefix}help - Afficher l'aide\n\
-             \n\
-             Lorsqu'une session est active, envoyez du texte pour continuer la conversation"
+             {prefix}tasks - Lister / changer de conversation\n\
+             {prefix}status - Etat de la conversation actuelle\n\
+             {prefix}new - Nouvelle conversation\n\
+             {prefix}models - Modeles disponibles\n\
+             {prefix}model <nom> - Changer de modele\n\
+             {prefix}help - Afficher l'aide"
         ),
         Lang::Pt => format!(
-            "{prefix}folder - Selecionar pasta de trabalho\n\
-             {prefix}agent - Selecionar agente\n\
-             {prefix}task <desc> - Criar sessao e executar tarefa\n\
-             {prefix}sessions - Sessoes ativas na pasta\n\
-             {prefix}resume [ID] - Recentes / retomar uma sessao\n\
-             {prefix}cancel - Cancelar tarefa atual\n\
-             {prefix}approve [always] - Aprovar permissao\n\
-             {prefix}deny - Negar permissao\n\
+            "Envie uma mensagem para conversar; a conversa atual continua, nao importa quanto tempo passe.\n\
              \n\
-             {prefix}search <palavra> - Buscar sessoes\n\
-             {prefix}today - Resumo de hoje\n\
-             {prefix}status - Status dos canais\n\
-             {prefix}help - Mostrar ajuda\n\
-             \n\
-             Quando uma sessao esta ativa, basta digitar texto para continuar a conversa"
+             {prefix}tasks - Listar / trocar de conversa\n\
+             {prefix}status - Estado da conversa atual\n\
+             {prefix}new - Nova conversa\n\
+             {prefix}models - Modelos disponiveis\n\
+             {prefix}model <nome> - Trocar de modelo\n\
+             {prefix}help - Mostrar ajuda"
         ),
         Lang::Ar => format!(
-            "{prefix}folder - اختيار مجلد العمل\n\
-             {prefix}agent - اختيار الوكيل\n\
-             {prefix}task <وصف> - انشاء جلسة وتنفيذ مهمة\n\
-             {prefix}sessions - الجلسات النشطة في المجلد\n\
-             {prefix}resume [ID] - الجلسات الاخيرة / استئناف جلسة\n\
-             {prefix}cancel - الغاء المهمة الحالية\n\
-             {prefix}approve [always] - الموافقة على الاذن\n\
-             {prefix}deny - رفض الاذن\n\
+            "أرسل رسالة للمحادثة؛ تستمر المحادثة الحالية مهما طال الوقت.\n\
              \n\
-             {prefix}search <كلمة> - البحث في الجلسات\n\
-             {prefix}today - ملخص اليوم\n\
-             {prefix}status - حالة القنوات\n\
-             {prefix}help - عرض المساعدة\n\
-             \n\
-             عندما تكون الجلسة نشطة، ارسل نصا لمتابعة المحادثة"
+             {prefix}tasks - قائمة المحادثات / التبديل\n\
+             {prefix}status - حالة المحادثة الحالية\n\
+             {prefix}new - محادثة جديدة\n\
+             {prefix}models - النماذج المتاحة\n\
+             {prefix}model <الاسم> - تبديل النموذج\n\
+             {prefix}help - عرض المساعدة"
         ),
         Lang::En => format!(
-            "{prefix}folder - Select working folder\n\
-             {prefix}agent - Select agent\n\
-             {prefix}task <desc> - Create session & run task\n\
-             {prefix}sessions - Active sessions in folder\n\
-             {prefix}resume [ID] - Recent conversations / resume a session\n\
-             {prefix}cancel - Cancel current task\n\
-             {prefix}approve [always] - Approve permission\n\
-             {prefix}deny - Deny permission\n\
+            "Just send a message to chat; the current conversation continues no matter how long you pause.\n\
              \n\
-             {prefix}search <keyword> - Search conversations\n\
-             {prefix}today - Today's activity summary\n\
-             {prefix}status - Channel connection status\n\
-             {prefix}help - Show help\n\
-             \n\
-             When a session is active, just type text to continue the conversation"
+             {prefix}tasks - List / switch conversations\n\
+             {prefix}status - Current conversation status\n\
+             {prefix}new - Start a fresh conversation\n\
+             {prefix}models - Available models\n\
+             {prefix}model <name> - Switch model\n\
+             {prefix}help - Show this help"
         ),
     }
 }

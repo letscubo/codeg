@@ -267,6 +267,26 @@ async fn dispatch_command(
                     target,
                 );
             }
+            // No live process, but the sender may still have a CURRENT
+            // conversation (the idle sweep reclaims processes; conversations
+            // are permanent). Auto-resume it with this text as the prompt —
+            // however long ago the last message was. Falls through to the
+            // new-task path only when the route points at nothing usable.
+            if let Ok(ctx) =
+                crate::db::service::sender_context_service::get_or_create(db, channel_id, sender_id)
+                    .await
+            {
+                if let Some(conv_id) = ctx.current_conversation_id {
+                    if let Some(msg) = session_commands::auto_resume_with_prompt(
+                        db, text, conv_id, channel_id, sender_id, target, conn_mgr, emitter,
+                        bridge, lang, data_dir,
+                    )
+                    .await
+                    {
+                        return DispatchResponse::current(msg, target);
+                    }
+                }
+            }
             if session_defaults.is_some() {
                 return dispatch_task(
                     text,
@@ -295,94 +315,47 @@ async fn dispatch_command(
     let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
     match command.as_str() {
-        // Existing commands
-        "search" => {
-            if args.is_empty() {
-                DispatchResponse::current(
-                    RichMessage::info(i18n::search_usage(lang, prefix))
-                        .with_title(i18n::invalid_args_title(lang)),
-                    target,
-                )
-            } else {
-                DispatchResponse::current(
-                    command_handlers::handle_search(db, args, lang).await,
-                    target,
-                )
-            }
-        }
-        "today" => {
-            DispatchResponse::current(command_handlers::handle_today(db, lang).await, target)
-        }
-        "status" => {
-            DispatchResponse::current(command_handlers::handle_status(manager, lang).await, target)
-        }
-        "help" | "start" => {
-            DispatchResponse::current(command_handlers::handle_help(prefix, lang), target)
-        }
-
-        // Session commands
-        "folder" => {
-            if args.is_empty() {
-                DispatchResponse::from_session_message(
-                    session_commands::handle_folder_picker(db, channel_id, sender_id, lang, prefix)
-                        .await,
-                    target,
-                )
-            } else {
-                DispatchResponse::current(
-                    session_commands::handle_folder(db, args, channel_id, sender_id, lang, prefix)
-                        .await,
-                    target,
-                )
-            }
-        }
-        "agent" => {
-            if args.is_empty() {
-                DispatchResponse::from_session_message(
-                    session_commands::handle_agent_picker(db, channel_id, sender_id, lang, prefix)
-                        .await,
-                    target,
-                )
-            } else {
-                DispatchResponse::current(
-                    session_commands::handle_agent(db, args, channel_id, sender_id, lang, prefix)
-                        .await,
-                    target,
-                )
-            }
-        }
-        "task" | "do" => {
-            dispatch_task(
-                args,
-                db,
-                manager,
-                conn_mgr,
-                emitter,
-                bridge,
-                data_dir,
-                channel_id,
-                sender_id,
-                target,
-                session_defaults,
-                false,
-                lang,
-                prefix,
-            )
-            .await
-        }
-        "sessions" => DispatchResponse::current(
-            session_commands::handle_sessions(db, channel_id, sender_id, target, lang, prefix)
-                .await,
-            target,
-        ),
-        "resume" => DispatchResponse::current(
-            session_commands::handle_resume(
+        // ── Channel command surface (2026-08 revamp) ─────────────────────
+        // Visible set: /tasks /status /new /models /model /help. The old
+        // navigation commands (/folder /agent /task /sessions /resume
+        // /search /today) are HIDDEN for now — they fall through to the
+        // unknown-command arm below, not deleted, so restoring one is a
+        // one-line move. /cancel /approve /deny stay functional but are
+        // left out of /help: cancel is the only brake on a runaway turn,
+        // and approve/deny answer permission cards — hiding their handlers
+        // would wedge those flows.
+        "tasks" => DispatchResponse::current(
+            session_commands::handle_tasks(
                 db, args, channel_id, sender_id, target, manager, conn_mgr, emitter, bridge, lang,
                 prefix, data_dir,
             )
             .await,
             target,
         ),
+        "status" => DispatchResponse::current(
+            session_commands::handle_session_status(db, channel_id, sender_id, bridge, lang, prefix)
+                .await,
+            target,
+        ),
+        "new" => DispatchResponse::current(
+            session_commands::handle_new_session(db, channel_id, sender_id, bridge, conn_mgr, lang)
+                .await,
+            target,
+        ),
+        "models" => DispatchResponse::current(
+            session_commands::handle_models(db, channel_id, sender_id, lang, prefix).await,
+            target,
+        ),
+        "model" => DispatchResponse::current(
+            session_commands::handle_model_set(
+                db, args, channel_id, sender_id, bridge, conn_mgr, lang, prefix,
+            )
+            .await,
+            target,
+        ),
+        "help" | "start" => {
+            DispatchResponse::current(command_handlers::handle_help(prefix, lang), target)
+        }
         "cancel" => DispatchResponse::current(
             session_commands::handle_cancel(
                 db, channel_id, sender_id, target, conn_mgr, bridge, lang,
@@ -479,6 +452,9 @@ impl DispatchResponse {
         }
     }
 
+    // Kept for the hidden picker commands (/folder /agent) — restoring one
+    // re-lights this path.
+    #[allow(dead_code)]
     fn from_session_message(
         message: session_commands::SessionCommandMessage,
         target: &ChannelMessageTarget,
@@ -509,6 +485,9 @@ impl DispatchResponse {
 }
 
 enum DispatchMessage {
+    // Interactive pickers ride the hidden /folder /agent commands; the variant
+    // stays for their return.
+    #[allow(dead_code)]
     Rich(RichMessage),
     Interactive(InteractiveMessage),
 }

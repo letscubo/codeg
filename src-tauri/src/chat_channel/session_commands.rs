@@ -1777,6 +1777,706 @@ fn truncate_title(s: &str) -> String {
     }
 }
 
+// ── Persistent-session channel UX ──────────────────────────────────────────
+//
+// Direct-chat (non-topic) senders keep ONE current conversation across process
+// reclaims: the idle sweep may kill the agent CLI at any time, but the
+// conversation row and its transcript survive, so a later message respawns the
+// agent with the conversation's external_id (`session/load` restores context)
+// and continues where it left off. `/new` is the only way a sender abandons
+// the current conversation; `/tasks` lists and switches; `/status` inspects;
+// `/models` + `/model` read/set the model.
+
+/// Auto-resume the sender's persisted conversation for a plain-text message
+/// that arrived with no live bridge session.
+///
+/// Returns `None` when the route is unusable (conversation/folder deleted) —
+/// the caller falls through to the new-task path after the stale route was
+/// cleared here. Non-topic targets only; topic threads keep their own binding
+/// flow.
+#[allow(clippy::too_many_arguments)]
+pub async fn auto_resume_with_prompt(
+    db: &DatabaseConnection,
+    text: &str,
+    conversation_id: i32,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+    conn_mgr: &ConnectionManager,
+    emitter: &EventEmitter,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    lang: Lang,
+    data_dir: &Path,
+) -> Option<RichMessage> {
+    let conv = match conversation_service::get_by_id(db, conversation_id).await {
+        Ok(c) => c,
+        Err(_) => {
+            // Conversation is gone — clear the stale route and start fresh.
+            let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+            return None;
+        }
+    };
+    let folder = match folder_service::get_folder_by_id(db, conv.folder_id).await {
+        Ok(Some(f)) => f,
+        _ => {
+            let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+            return None;
+        }
+    };
+
+    let runtime_env = match build_chat_session_runtime_env(
+        db,
+        conv.agent_type,
+        conv.external_id.as_deref(),
+        data_dir,
+    )
+    .await
+    {
+        Ok(env) => env,
+        Err(e) => {
+            return Some(RichMessage::error(format!(
+                "{}{e}",
+                i18n::failed_to_start_agent_label(lang)
+            )));
+        }
+    };
+
+    let owner_label = owner_label_for(channel_id, sender_id, target);
+    let connection_id = match conn_mgr
+        .spawn_agent(
+            conv.agent_type,
+            Some(folder.path.clone()),
+            conv.external_id.clone(),
+            runtime_env,
+            owner_label,
+            emitter.clone(),
+            None,
+            BTreeMap::new(),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return Some(RichMessage::error(format!(
+                "{}{e}",
+                i18n::failed_to_start_agent_label(lang)
+            )));
+        }
+    };
+
+    // The text rides as the pending kickoff: the SessionStarted handler sends
+    // it once the session (and its session/load restore) is up.
+    {
+        let session = ActiveSession {
+            channel_id,
+            sender_id: sender_id.to_string(),
+            target: target.clone(),
+            conversation_id: conv.id,
+            connection_id: connection_id.clone(),
+            agent_type: conv.agent_type,
+            content_buffer: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_inputs: std::collections::HashMap::new(),
+            delegation_rendered: std::collections::HashSet::new(),
+            last_flushed: Instant::now(),
+            pending_prompt: Some(text.to_string()),
+            permission_pending: None,
+        };
+        bridge.lock().await.register(connection_id.clone(), session);
+    }
+
+    let _ = sender_context_service::update_session(
+        db,
+        channel_id,
+        sender_id,
+        Some(conv.id),
+        Some(connection_id),
+    )
+    .await;
+
+    Some(RichMessage::info(i18n::message_sent(lang)))
+}
+
+/// `/tasks` — list the sender's recent conversations in the current folder,
+/// or switch to one by list number (`/tasks 2`).
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_tasks(
+    db: &DatabaseConnection,
+    args: &str,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+    manager: &ChatChannelManager,
+    conn_mgr: &ConnectionManager,
+    emitter: &EventEmitter,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    lang: Lang,
+    prefix: &str,
+    data_dir: &Path,
+) -> RichMessage {
+    let ctx = match sender_context_service::get_or_create(db, channel_id, sender_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang)));
+        }
+    };
+    let Some(folder_id) = ctx.current_folder_id else {
+        return RichMessage::info(i18n::no_folder_selected(lang, prefix));
+    };
+
+    let mut convs = match conversation_service::list_by_folder(db, folder_id, None, None, None, None)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_list_sessions_label(lang)));
+        }
+    };
+    convs.truncate(10);
+
+    if convs.is_empty() {
+        return RichMessage::info(match lang {
+            Lang::ZhCn | Lang::ZhTw => "还没有会话。直接发消息即可开始新会话。".to_string(),
+            _ => "No conversations yet. Just send a message to start one.".to_string(),
+        });
+    }
+
+    // `/tasks N` → switch to the Nth entry of the SAME list rendered below.
+    if !args.is_empty() {
+        let Ok(n) = args.trim().parse::<usize>() else {
+            return RichMessage::info(match lang {
+                Lang::ZhCn | Lang::ZhTw => format!("用法:{prefix}tasks 或 {prefix}tasks <编号>"),
+                _ => format!("Usage: {prefix}tasks or {prefix}tasks <number>"),
+            });
+        };
+        let Some(conv) = convs.get(n.wrapping_sub(1)) else {
+            return RichMessage::info(match lang {
+                Lang::ZhCn | Lang::ZhTw => format!("编号超出范围(1-{})", convs.len()),
+                _ => format!("Number out of range (1-{})", convs.len()),
+            });
+        };
+        // Point the route at the chosen conversation. No process is spawned
+        // here — the next message auto-resumes it, so switching is free.
+        let _ = sender_context_service::update_session(db, channel_id, sender_id, Some(conv.id), None)
+            .await;
+        let title = conv.title.as_deref().unwrap_or("(untitled)");
+        let _ = manager; // reserved: title sync is topic-only today
+        return RichMessage::info(format!("[{}] #{} {}", conv.agent_type, conv.id, title))
+            .with_title(match lang {
+                Lang::ZhCn | Lang::ZhTw => "已切换会话",
+                _ => "Switched conversation",
+            });
+    }
+
+    let _ = (conn_mgr, emitter, bridge, data_dir, target); // switching spawns nothing
+
+    let mut body = String::new();
+    for (i, c) in convs.iter().enumerate() {
+        let title = c.title.as_deref().unwrap_or("(untitled)");
+        let marker = if ctx.current_conversation_id == Some(c.id) {
+            " ←"
+        } else {
+            ""
+        };
+        body.push_str(&format!("{}. [{}] {}{}\n", i + 1, c.agent_type, title, marker));
+    }
+    body.push_str(&match lang {
+        Lang::ZhCn | Lang::ZhTw => format!("\n{prefix}tasks <编号> 切换 · {prefix}new 新会话"),
+        _ => format!("\n{prefix}tasks <number> to switch · {prefix}new for a fresh one"),
+    });
+    RichMessage::info(body.trim_end()).with_title(match lang {
+        Lang::ZhCn | Lang::ZhTw => "会话列表",
+        _ => "Conversations",
+    })
+}
+
+/// `/status` — the sender's current conversation, agent, model and whether a
+/// live process is attached right now (a reclaimed one auto-revives on the
+/// next message, so "idle" is informational, not an error).
+pub async fn handle_session_status(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    lang: Lang,
+    prefix: &str,
+) -> RichMessage {
+    let ctx = match sender_context_service::get_or_create(db, channel_id, sender_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang)));
+        }
+    };
+    let Some(conv_id) = ctx.current_conversation_id else {
+        return RichMessage::info(match lang {
+            Lang::ZhCn | Lang::ZhTw => {
+                format!("当前没有进行中的会话。直接发消息开始,或 {prefix}tasks 查看历史。")
+            }
+            _ => format!(
+                "No current conversation. Send a message to start one, or {prefix}tasks to browse."
+            ),
+        });
+    };
+    let conv = match conversation_service::get_by_id(db, conv_id).await {
+        Ok(c) => c,
+        Err(_) => {
+            return RichMessage::info(i18n::conversation_not_found(lang));
+        }
+    };
+    let live = {
+        let guard = bridge.lock().await;
+        guard.find_by_sender(channel_id, sender_id).is_some()
+    };
+    let title = conv.title.as_deref().unwrap_or("(untitled)");
+    let model = current_model_label(db, conv.agent_type, conv.external_id.as_deref()).await;
+    let state_label = match (live, lang) {
+        (true, Lang::ZhCn | Lang::ZhTw) => "运行中",
+        (true, _) => "live",
+        (false, Lang::ZhCn | Lang::ZhTw) => "待机(下条消息自动唤醒)",
+        (false, _) => "idle (auto-revives on next message)",
+    };
+    RichMessage::info(format!("#{} {}", conv.id, title))
+        .with_title(match lang {
+            Lang::ZhCn | Lang::ZhTw => "当前会话",
+            _ => "Current conversation",
+        })
+        .with_field("Agent", conv.agent_type.to_string())
+        .with_field(
+            match lang {
+                Lang::ZhCn | Lang::ZhTw => "模型",
+                _ => "Model",
+            },
+            model,
+        )
+        .with_field(
+            match lang {
+                Lang::ZhCn | Lang::ZhTw => "状态",
+                _ => "State",
+            },
+            state_label.to_string(),
+        )
+}
+
+/// `/new` — abandon the current conversation route. The next message starts a
+/// brand-new conversation; the old one stays in `/tasks` and can be switched
+/// back to at any time.
+pub async fn handle_new_session(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    conn_mgr: &ConnectionManager,
+    lang: Lang,
+) -> RichMessage {
+    // Drop the live bridge session (if any) so the old connection can't hijack
+    // the next message; the process itself is left to the idle sweep.
+    let dropped = {
+        let mut guard = bridge.lock().await;
+        let conn_id = guard
+            .find_by_sender(channel_id, sender_id)
+            .map(|s| s.connection_id.clone());
+        if let Some(ref id) = conn_id {
+            guard.remove(id);
+        }
+        conn_id
+    };
+    if let Some(conn_id) = dropped {
+        let _ = conn_mgr.disconnect(&conn_id).await;
+    }
+    let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+    RichMessage::info(match lang {
+        Lang::ZhCn | Lang::ZhTw => "已开启新会话,下一条消息生效。",
+        _ => "Fresh conversation started — your next message begins it.",
+    })
+}
+
+// ── /models · /model ───────────────────────────────────────────────────────
+
+/// The openclaw gateway config on disk. Providers carry the model catalog;
+/// `agents.defaults.model.primary` is the agent-level default.
+fn read_openclaw_config() -> Option<serde_json::Value> {
+    let path = dirs::home_dir()?.join(".openclaw").join("openclaw.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// All `provider/model` ids from the gateway's provider blocks.
+fn openclaw_catalog(cfg: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(provs) = cfg
+        .get("models")
+        .and_then(|m| m.get("providers"))
+        .and_then(|p| p.as_object())
+    {
+        for (pid, blk) in provs {
+            if let Some(models) = blk.get("models").and_then(|m| m.as_array()) {
+                for m in models {
+                    if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                        out.push(format!("{pid}/{id}"));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn openclaw_default_model(cfg: &serde_json::Value) -> Option<String> {
+    cfg.get("agents")?
+        .get("defaults")?
+        .get("model")?
+        .get("primary")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// The gateway session key an openclaw conversation's bridge is attached to:
+/// an explicit `OPENCLAW_SESSION_KEY` in the agent env wins (the bridge was
+/// spawned with `--session <key>`); otherwise the bridge auto-mints
+/// `agent:main:acp-bridge:<acp-session-id>` (verified on-disk in the
+/// gateway's sessions.json).
+async fn openclaw_session_key_for(db: &DatabaseConnection, external_id: &str) -> String {
+    if let Ok(Some(setting)) =
+        crate::db::service::agent_setting_service::get_by_agent_type(db, AgentType::OpenClaw).await
+    {
+        if let Some(env_json) = setting.env_json.as_deref() {
+            if let Ok(env) = serde_json::from_str::<BTreeMap<String, String>>(env_json) {
+                if let Some(key) = env.get("OPENCLAW_SESSION_KEY").filter(|v| !v.is_empty()) {
+                    return key.clone();
+                }
+            }
+        }
+    }
+    format!("agent:main:acp-bridge:{external_id}")
+}
+
+/// Run `openclaw <args...>`, optionally feeding stdin, and capture stdout.
+async fn run_openclaw_cli(args: &[&str], stdin: Option<&str>) -> Result<String, String> {
+    let bin = crate::commands::acp::resolve_npx_command("openclaw")
+        .await
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "openclaw".to_string());
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn openclaw: {e}"))?;
+    if let Some(input) = stdin {
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(input.as_bytes()).await;
+        }
+    } else {
+        drop(child.stdin.take());
+    }
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
+        .await
+        .map_err(|_| "openclaw CLI timed out".to_string())?
+        .map_err(|e| format!("openclaw CLI: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(300)
+            .collect());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// One `sessions.patch` against the gateway. `gateway call` exits 0 even when
+/// the method fails — the truth is the JSON `ok` field.
+async fn openclaw_sessions_patch(session_key: &str, model: &str) -> Result<(), String> {
+    let params = serde_json::json!({ "key": session_key, "model": model }).to_string();
+    let stdout = run_openclaw_cli(
+        &["gateway", "call", "sessions.patch", "--params", &params, "--json"],
+        None,
+    )
+    .await?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|_| format!("unparseable: {stdout}"))?;
+    if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(());
+    }
+    Err(parsed
+        .get("error")
+        .and_then(|e| e.get("message").or_else(|| e.get("code")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("gateway returned ok=false")
+        .to_string())
+}
+
+/// Register every provider-block model into `agents.defaults.models` (the
+/// session-model whitelist). Stock instances only whitelist the primary, so
+/// `sessions.patch` for anything else fails "model not allowed" until healed.
+async fn openclaw_heal_whitelist() -> Result<(), String> {
+    let cfg = read_openclaw_config().ok_or("cannot read openclaw.json")?;
+    let ids = openclaw_catalog(&cfg);
+    if ids.is_empty() {
+        return Err("no provider models found".into());
+    }
+    let mut wl = serde_json::Map::new();
+    for id in ids {
+        wl.insert(id, serde_json::json!({}));
+    }
+    let patch =
+        serde_json::json!({ "agents": { "defaults": { "models": serde_json::Value::Object(wl) } } });
+    run_openclaw_cli(&["config", "patch", "--stdin"], Some(&patch.to_string()))
+        .await
+        .map(|_| ())
+}
+
+/// Best-effort "which model is this conversation on" label for `/status` and
+/// `/models`. openclaw: agent default (a session override set via `/model` is
+/// reported when we can read it back; absent one, the default applies).
+/// Other agents: the sole `*MODEL*` env entry, if any.
+async fn current_model_label(
+    db: &DatabaseConnection,
+    agent_type: AgentType,
+    _external_id: Option<&str>,
+) -> String {
+    if agent_type == AgentType::OpenClaw {
+        return read_openclaw_config()
+            .and_then(|cfg| openclaw_default_model(&cfg))
+            .unwrap_or_else(|| "default".into());
+    }
+    if let Ok(Some(setting)) =
+        crate::db::service::agent_setting_service::get_by_agent_type(db, agent_type).await
+    {
+        if let Some(env_json) = setting.env_json.as_deref() {
+            if let Ok(env) = serde_json::from_str::<BTreeMap<String, String>>(env_json) {
+                let models: Vec<_> = env
+                    .iter()
+                    .filter(|(k, _)| k.contains("MODEL"))
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                if let [one] = models.as_slice() {
+                    return one.clone();
+                }
+            }
+        }
+    }
+    "default".into()
+}
+
+/// `/models` — the current conversation's agent, its active model, and (for
+/// openclaw) the catalog of switchable models.
+pub async fn handle_models(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    lang: Lang,
+    prefix: &str,
+) -> RichMessage {
+    let ctx = match sender_context_service::get_or_create(db, channel_id, sender_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang)));
+        }
+    };
+    let fallback_agent = ctx
+        .current_agent_type
+        .as_deref()
+        .and_then(parse_agent_type)
+        .unwrap_or(AgentType::OpenClaw);
+    let agent_type = match ctx.current_conversation_id {
+        Some(conv_id) => match conversation_service::get_by_id(db, conv_id).await {
+            Ok(c) => c.agent_type,
+            Err(_) => fallback_agent,
+        },
+        None => fallback_agent,
+    };
+
+    let current = current_model_label(db, agent_type, None).await;
+    let mut body = format!(
+        "{}: {}\n",
+        match lang {
+            Lang::ZhCn | Lang::ZhTw => "当前模型",
+            _ => "Current model",
+        },
+        current
+    );
+
+    if agent_type == AgentType::OpenClaw {
+        match read_openclaw_config() {
+            Some(cfg) => {
+                let catalog = openclaw_catalog(&cfg);
+                if catalog.is_empty() {
+                    body.push_str(match lang {
+                        Lang::ZhCn | Lang::ZhTw => "(未发现可用模型目录)",
+                        _ => "(no model catalog found)",
+                    });
+                } else {
+                    body.push('\n');
+                    for id in &catalog {
+                        // Bare model name is what sessions.patch accepts.
+                        let bare = id.split('/').next_back().unwrap_or(id);
+                        body.push_str(&format!("· {bare}\n"));
+                    }
+                    body.push_str(&match lang {
+                        Lang::ZhCn | Lang::ZhTw => format!("\n{prefix}model <名称> 切换本会话模型"),
+                        _ => format!("\n{prefix}model <name> to switch this conversation"),
+                    });
+                }
+            }
+            None => body.push_str(match lang {
+                Lang::ZhCn | Lang::ZhTw => "(读取 openclaw 配置失败)",
+                _ => "(failed to read openclaw config)",
+            }),
+        }
+    } else {
+        body.push_str(&match lang {
+            Lang::ZhCn | Lang::ZhTw => {
+                format!("{prefix}model <名称> 修改该 Agent 的模型(下一条消息生效)")
+            }
+            _ => format!("{prefix}model <name> sets this agent's model (takes effect next message)"),
+        });
+    }
+
+    RichMessage::info(body.trim_end())
+        .with_title(match lang {
+            Lang::ZhCn | Lang::ZhTw => "模型",
+            _ => "Models",
+        })
+        .with_field("Agent", agent_type.to_string())
+}
+
+/// `/model <name>` — set the model. openclaw: per-conversation, via the
+/// gateway's `sessions.patch` (immediate, with a one-shot whitelist heal on
+/// "model not allowed"). Other agents: rewrite the sole `*MODEL*` env entry
+/// and drop the live connection so the next message respawns with it.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_model_set(
+    db: &DatabaseConnection,
+    args: &str,
+    channel_id: i32,
+    sender_id: &str,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    conn_mgr: &ConnectionManager,
+    lang: Lang,
+    prefix: &str,
+) -> RichMessage {
+    let model = args.trim();
+    if model.is_empty() {
+        return handle_models(db, channel_id, sender_id, lang, prefix).await;
+    }
+    let ctx = match sender_context_service::get_or_create(db, channel_id, sender_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang)));
+        }
+    };
+
+    let fallback_agent = ctx
+        .current_agent_type
+        .as_deref()
+        .and_then(parse_agent_type)
+        .unwrap_or(AgentType::OpenClaw);
+    let (agent_type, external_id) = match ctx.current_conversation_id {
+        Some(conv_id) => match conversation_service::get_by_id(db, conv_id).await {
+            Ok(c) => (c.agent_type, c.external_id),
+            Err(_) => (fallback_agent, None),
+        },
+        None => (fallback_agent, None),
+    };
+
+    if agent_type == AgentType::OpenClaw {
+        let Some(ext) = external_id.as_deref() else {
+            return RichMessage::info(match lang {
+                Lang::ZhCn | Lang::ZhTw => "当前会话还没有底层 agent 会话,先发一条消息再切模型。",
+                _ => "This conversation has no agent session yet — send a message first.",
+            });
+        };
+        let key = openclaw_session_key_for(db, ext).await;
+        let mut result = openclaw_sessions_patch(&key, model).await;
+        if let Err(ref e) = result {
+            if e.to_lowercase().contains("model not allowed") {
+                if openclaw_heal_whitelist().await.is_ok() {
+                    result = openclaw_sessions_patch(&key, model).await;
+                }
+            }
+        }
+        return match result {
+            Ok(()) => RichMessage::info(format!(
+                "{} → {model}",
+                match lang {
+                    Lang::ZhCn | Lang::ZhTw => "本会话模型已切换",
+                    _ => "Conversation model switched",
+                }
+            )),
+            Err(e) => RichMessage::error(format!(
+                "{}: {e}",
+                match lang {
+                    Lang::ZhCn | Lang::ZhTw => "切换失败",
+                    _ => "Switch failed",
+                }
+            )),
+        };
+    }
+
+    // Generic agents: rewrite the single *MODEL* env entry.
+    let Ok(Some(setting)) =
+        crate::db::service::agent_setting_service::get_by_agent_type(db, agent_type).await
+    else {
+        return RichMessage::error("agent setting not found".to_string());
+    };
+    let mut env: BTreeMap<String, String> = setting
+        .env_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let model_keys: Vec<String> = env
+        .keys()
+        .filter(|k| k.contains("MODEL"))
+        .cloned()
+        .collect();
+    let [key] = model_keys.as_slice() else {
+        return RichMessage::info(match lang {
+            Lang::ZhCn | Lang::ZhTw => format!("该 Agent({agent_type})暂不支持渠道内切模型。"),
+            _ => format!("Model switching isn't supported for this agent ({agent_type}) here."),
+        });
+    };
+    env.insert(key.clone(), model.to_string());
+    let env_json = serde_json::to_string(&env).ok();
+    if let Err(e) = crate::db::service::agent_setting_service::update(
+        db,
+        agent_type,
+        crate::db::service::agent_setting_service::AgentSettingsUpdate {
+            enabled: setting.enabled,
+            env_json,
+            model_provider_id: setting.model_provider_id,
+        },
+    )
+    .await
+    {
+        return RichMessage::error(format!("save failed: {e}"));
+    }
+
+    // Drop the live connection so the next message respawns with the new env
+    // (auto-resume keeps the conversation and its context).
+    let conn_id = {
+        let mut guard = bridge.lock().await;
+        let id = guard
+            .find_by_sender(channel_id, sender_id)
+            .map(|s| s.connection_id.clone());
+        if let Some(ref id) = id {
+            guard.remove(id);
+        }
+        id
+    };
+    if let Some(id) = conn_id {
+        let _ = conn_mgr.disconnect(&id).await;
+    }
+
+    RichMessage::info(format!(
+        "{} → {model}",
+        match lang {
+            Lang::ZhCn | Lang::ZhTw => "模型已更新,下一条消息生效",
+            _ => "Model updated — takes effect on your next message",
+        }
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
