@@ -978,12 +978,19 @@ mod tests {
     fn bundled_metadata_is_disjoint_from_experts() {
         // The safety mechanism: science ids must never collide with experts ids
         // (they share the central store). Curation guarantees this; assert it.
+        // MyClaw fork:两包都已清空(技能改由平台下发),所以这里不再断言非空 ——
+        // 那是在断言「我们捆绑了科研技能」,而 fork 刻意让它不成立。
+        // 保留的是机制本身:两个包共用中心库,id 不能相撞。改成直接求交集,
+        // 这样任一包将来恢复内容时,这条断言立刻重新有牙齿。
         let science_ids: std::collections::HashSet<_> =
             bundled_metadata().iter().map(|m| m.id.as_str()).collect();
-        assert!(!science_ids.is_empty(), "science bundle should be non-empty");
-        // A representative experts id must not appear among science ids.
-        assert!(!science_ids.contains("brainstorming"));
-        assert!(!science_ids.contains("writing-plans"));
+        let experts_ids: std::collections::HashSet<_> =
+            crate::commands::experts::bundled_ids().into_iter().collect();
+        let clash: Vec<_> = science_ids
+            .iter()
+            .filter(|id| experts_ids.contains(**id))
+            .collect();
+        assert!(clash.is_empty(), "science/experts id collision: {clash:?}");
     }
 
     #[test]

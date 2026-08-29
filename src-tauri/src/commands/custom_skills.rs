@@ -787,14 +787,18 @@ mod tests {
 
     #[test]
     fn reserved_ids_include_known_bundled() {
+        // MyClaw fork:experts / science 两包已清空(技能改由平台下发),所以
+        // 锚点换成 officecli —— 它是 reserved_ids() 剩下的唯一来源,而且不会
+        // 被平台下发影响。锚在具体 id 上是为了让「保留集真的接上了内置包」
+        // 这件事可被证伪;只断言非空的话,任一来源接错都测不出来。
         let reserved = reserved_ids();
-        assert!(reserved.contains("brainstorming"), "experts id missing");
+        assert!(reserved.contains("officecli-pptx"), "officecli id missing");
         assert!(!reserved.is_empty());
     }
 
     #[test]
     fn ensure_custom_id_rejects_reserved() {
-        let err = ensure_custom_id("brainstorming").unwrap_err();
+        let err = ensure_custom_id("officecli-pptx").unwrap_err();
         assert!(matches!(err, CustomSkillsError::ReservedId(_)), "{err:?}");
     }
 
@@ -972,12 +976,12 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_save_reject_reserved_ids() {
-        let created = custom_create_skill("writing-plans".into(), "x".into()).await;
+        let created = custom_create_skill("officecli-pptx".into(), "x".into()).await;
         assert!(matches!(
             created,
             Err(CustomSkillsError::ReservedId(_))
         ));
-        let saved = custom_save_skill("writing-plans".into(), "x".into()).await;
+        let saved = custom_save_skill("officecli-pptx".into(), "x".into()).await;
         assert!(matches!(saved, Err(CustomSkillsError::ReservedId(_))));
     }
 

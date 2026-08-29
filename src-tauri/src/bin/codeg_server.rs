@@ -141,6 +141,10 @@ async fn async_main() -> ExitCode {
         });
     });
 
+    // MyClaw 平台下发的技能:启动跑一次,之后每 10~15 分钟随机拉一次。
+    // 取代了原先 include_dir! 内嵌的 experts/science 两包 —— 内容改由平台维护,
+    // 改一句文案不必发版;拉取失败一律保持现状,绝不把网络问题当成删除指令。
+    codeg_lib::commands::myclaw_skills::spawn_sync_loop();
     let port: u16 = std::env::var("CODEG_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -384,46 +388,7 @@ async fn async_main() -> ExitCode {
         });
     }
 
-    // Install bundled expert skills into the central store
-    // (`~/.codeg/skills/`). Runs in the background; failures are logged
-    // but non-fatal.
-    tokio::spawn(async move {
-        let report = codeg_lib::commands::experts::ensure_central_experts_installed().await;
-        if !report.errors.is_empty() {
-            tracing::error!(
-                "[Experts] install finished with {} error(s): {:?}",
-                report.errors.len(),
-                report.errors
-            );
-        } else {
-            tracing::info!(
-                "[Experts] install ok: installed={} updated={} pending_review={}",
-                report.installed_count,
-                report.updated_count,
-                report.pending_user_review.len()
-            );
-        }
-    });
 
-    // Install bundled scientific-research skills into the same central store.
-    // Runs in the background; failures are logged but non-fatal.
-    tokio::spawn(async move {
-        let report = codeg_lib::commands::science::ensure_central_science_installed().await;
-        if !report.errors.is_empty() {
-            tracing::error!(
-                "[Science] install finished with {} error(s): {:?}",
-                report.errors.len(),
-                report.errors
-            );
-        } else {
-            tracing::info!(
-                "[Science] install ok: installed={} updated={} pending_review={}",
-                report.installed_count,
-                report.updated_count,
-                report.pending_user_review.len()
-            );
-        }
-    });
 
     // Start chat channel background tasks (event subscriber, command dispatcher, scheduler, auto-connect)
     state
