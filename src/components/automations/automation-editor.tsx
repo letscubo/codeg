@@ -296,6 +296,9 @@ export function AutomationEditor({
               config_values: automation.config?.config_values ?? {},
               label_snapshot:
                 automation.config?.label_snapshot ?? label_snapshot,
+              // Not editable here; carry it through so saving from this editor
+              // can't silently reset a continuous-thread automation.
+              reuse_session: automation?.config?.reuse_session ?? false,
             }
           : {
               action,
@@ -304,6 +307,9 @@ export function AutomationEditor({
               mode_id,
               config_values,
               label_snapshot,
+              // Same carry-through on the normal path — `automation` is null when
+              // creating, so this defaults to the per-run conversation.
+              reuse_session: automation?.config?.reuse_session ?? false,
             },
       }
       await onSubmit(draft)

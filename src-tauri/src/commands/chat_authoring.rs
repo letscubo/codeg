@@ -237,6 +237,9 @@ impl ChatAuthoringAccess for DbChatAuthoring {
             mode_id: None,
             config_values: BTreeMap::new(),
             label_snapshot: None,
+            // Chat-authored automations keep the historical per-run conversation;
+            // opting into a continuous thread is an explicit editor choice.
+            reuse_session: false,
         };
         let config = match serde_json::to_value(&config) {
             Ok(v) => v,

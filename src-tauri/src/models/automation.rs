@@ -99,4 +99,11 @@ pub struct AutomationConfig {
     pub config_values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub label_snapshot: Option<serde_json::Value>,
+    /// Append every run to the SAME conversation, resuming the agent session so
+    /// it carries context across runs (default `false` = a fresh conversation
+    /// per run, the historical behaviour). Lives in the config blob rather than
+    /// a column for the same reason as `action`: every pre-existing row
+    /// deserializes as the legacy default and nothing queries automations by it.
+    #[serde(default)]
+    pub reuse_session: bool,
 }

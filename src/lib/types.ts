@@ -1289,6 +1289,9 @@ export interface AutomationConfig {
   mode_id?: string | null
   config_values: Record<string, string>
   label_snapshot?: AutomationLabelSnapshot | null
+  /** Append every run to the same conversation, resuming the agent session so it
+   *  carries context across runs. Absent/false = a fresh conversation per run. */
+  reuse_session?: boolean
 }
 
 export interface Automation {

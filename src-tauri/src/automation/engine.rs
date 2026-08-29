@@ -446,11 +446,37 @@ impl AutomationEngine {
             emit_folder_upsert(&self.emitter, detail);
         }
 
+        // `reuse_session`: append this run to the previous run's conversation and
+        // resume its agent session, so the automation accumulates context instead
+        // of starting cold every time. `last_run_conversation_id` is denormalized
+        // when a run *settles*, so it names the previous run here, never this one.
+        // A deleted conversation (or one that never got an ACP session id) leaves
+        // this `None` and the run falls through to the fresh path below.
+        let reuse_conversation_id = if cfg.reuse_session {
+            auto.last_run_conversation_id
+        } else {
+            None
+        };
+        let resume_session_id = match reuse_conversation_id {
+            Some(conv_id) => conversation::Entity::find_by_id(conv_id)
+                .one(&self.db.conn)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|c| c.external_id),
+            None => None,
+        };
+
         // Recompute env from current settings (never snapshotted); hard-fail
         // visibly if the agent is disabled or not installed.
-        let runtime_env = build_session_runtime_env(&self.db, agent_type, None, &self.data_dir)
-            .await
-            .map_err(|e| e.to_string())?;
+        let runtime_env = build_session_runtime_env(
+            &self.db,
+            agent_type,
+            resume_session_id.as_deref(),
+            &self.data_dir,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;
@@ -478,33 +504,77 @@ impl AutomationEngine {
             return Ok(());
         }
 
-        // Fresh connection (session_id=None), owner-labelled "automation".
-        let conn_id = self
+        // Connection: resumes the previous session when `reuse_session` gave us
+        // one, otherwise fresh (session_id=None). Owner-labelled "automation".
+        let mut resumed = resume_session_id.is_some();
+        let conn_id = match self
             .manager
             .spawn_agent(
                 agent_type,
                 Some(cwd.working_dir.clone()),
-                None,
-                runtime_env,
+                resume_session_id.clone(),
+                runtime_env.clone(),
                 "automation".to_string(),
                 self.emitter.clone(),
                 cfg.mode_id.clone(),
                 cfg.config_values.clone(),
             )
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(id) => id,
+            Err(e) if resumed => {
+                // Resume failed (e.g. the agent lost the session, or the prior
+                // conversation was pruned) → fall back to a fresh session rather
+                // than failing the run. Mirrors the work-task launch path.
+                tracing::info!(
+                    "[automation] resume failed for automation {}: {e}; falling back to a fresh session",
+                    auto.id
+                );
+                resumed = false;
+                self.manager
+                    .spawn_agent(
+                        agent_type,
+                        Some(cwd.working_dir.clone()),
+                        None,
+                        runtime_env,
+                        "automation".to_string(),
+                        self.emitter.clone(),
+                        cfg.mode_id.clone(),
+                        cfg.config_values.clone(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
 
-        // Create the conversation row, then adopt it in send_prompt (Branch A).
-        // Named after the AUTOMATION, not its prompt — the same name the
-        // enqueue-a-task branch already gives the card it files, and the only
-        // label that says which automation this run belongs to. Locked right
-        // after, so the per-turn auto-title backfill can't swap it for whatever
-        // the agent's session file parses to (issue #495). A prompt-derived
-        // title was no more distinguishing anyway: the prompt is fixed, so
-        // every run of an automation carried the identical one.
-        let title = first_chars(&auto.name, 80);
-        let conversation_id =
-            match create_conversation_core(&self.db.conn, cwd.folder_id, agent_type, Some(title)).await
+        // Conversation row: reuse the previous run's when we actually resumed its
+        // session (so the thread reads as one continuous conversation), otherwise
+        // a fresh row — that covers both plain runs and resume fallbacks, whose
+        // cold session must not be appended to the old thread.
+        //
+        // Fresh rows are created then adopted in send_prompt (Branch A), and named
+        // after the AUTOMATION, not its prompt — the same name the enqueue-a-task
+        // branch already gives the card it files, and the only label that says
+        // which automation this run belongs to. Locked right after, so the
+        // per-turn auto-title backfill can't swap it for whatever the agent's
+        // session file parses to (issue #495). A prompt-derived title was no more
+        // distinguishing anyway: the prompt is fixed, so every run of an
+        // automation carried the identical one.
+        let conversation_id = if resumed {
+            // `resumed` implies the reuse lookup found a conversation with a
+            // session id, so this is Some; the title is already locked from the
+            // run that created it.
+            reuse_conversation_id.expect("resumed implies a reused conversation")
+        } else {
+            let title = first_chars(&auto.name, 80);
+            let id = match create_conversation_core(
+                &self.db.conn,
+                cwd.folder_id,
+                agent_type,
+                Some(title),
+            )
+            .await
             {
                 Ok(id) => id,
                 Err(e) => {
@@ -512,15 +582,17 @@ impl AutomationEngine {
                     return Err(e.to_string());
                 }
             };
-        // Strictly before the upsert below: that broadcast is how any client
-        // first learns this id, so locking first makes a backfill on this row
-        // impossible rather than merely unlikely. Failing to lock only costs
-        // the nice title — never the run.
-        if let Err(e) = conversation_service::lock_title(&self.db.conn, conversation_id).await {
-            tracing::warn!(
-                "[automation] run {run_id}: could not lock conversation {conversation_id} title: {e}"
-            );
-        }
+            // Strictly before the upsert below: that broadcast is how any client
+            // first learns this id, so locking first makes a backfill on this row
+            // impossible rather than merely unlikely. Failing to lock only costs
+            // the nice title — never the run.
+            if let Err(e) = conversation_service::lock_title(&self.db.conn, id).await {
+                tracing::warn!(
+                    "[automation] run {run_id}: could not lock conversation {id} title: {e}"
+                );
+            }
+            id
+        };
 
         // Surface the produced conversation in every client's sidebar the instant
         // it exists (InProgress) — independent of the implicit upsert inside
