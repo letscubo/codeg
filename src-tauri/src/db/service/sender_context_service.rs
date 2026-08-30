@@ -108,6 +108,13 @@ pub async fn clear_connection(
     Ok(active.update(conn).await?)
 }
 
+/// All sender contexts (web injection's single-sender fallback).
+pub async fn list_all(
+    conn: &DatabaseConnection,
+) -> Result<Vec<chat_channel_sender_context::Model>, DbError> {
+    Ok(chat_channel_sender_context::Entity::find().all(conn).await?)
+}
+
 /// Every sender whose CURRENT conversation is `conversation_id`. Used by the
 /// chat-channel mirror to fan a foreign-surface turn (web workspace etc.) out
 /// to the channel chats that are "on" that conversation right now.

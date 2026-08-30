@@ -294,3 +294,163 @@ pub async fn weixin_check_qrcode(
         cc_commands::weixin_check_qrcode_core(&state.db, params.channel_id, &params.qrcode).await?;
     Ok(Json(result))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectChatChannelMessageParams {
+    pub conversation_id: i32,
+    pub text: String,
+}
+
+/// Web-surface send for a CHANNEL conversation — the "one execution channel"
+/// contract: the channel connection is the only place channel conversations
+/// run; other surfaces (the web workspace) inject their text HERE instead of
+/// spawning their own connection.
+///
+/// Flow: resolve the channel chat that is "on" this conversation → post a
+/// "🌐 <text>" marker to the chat (Telegram is the source-of-truth stream, so
+/// the web-typed message must appear there too) → if a live session for that
+/// chat points at a DIFFERENT conversation, retire it (route repointed, same
+/// as a /tasks switch) → enqueue the text through the normal inbound pipeline,
+/// exactly as if the user had typed it in the channel. The reply then flows to
+/// the channel natively, and the web renders everything via sync + attach_all.
+pub async fn inject_chat_channel_message(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<InjectChatChannelMessageParams>,
+) -> Result<Json<()>, AppCommandError> {
+    use crate::chat_channel::types::{ChannelMessageTarget, ChannelSessionDefaults, IncomingCommand, RichMessage, TelegramConfig};
+    use crate::db::service::{
+        chat_channel_service, sender_context_service, thread_binding_service,
+    };
+
+    let db = &state.db.conn;
+    let manager = &state.chat_channel_manager;
+    let text = params.text.trim().to_string();
+    if text.is_empty() {
+        return Err(AppCommandError::task_execution_failed(
+            "text is empty".to_string(),
+        ));
+    }
+    if text.starts_with('/') {
+        // 注入的是对话文本,不是渠道命令 —— 防止网页输入被当成 /new 之类执行。
+        return Err(AppCommandError::task_execution_failed(
+            "commands cannot be injected".to_string(),
+        ));
+    }
+
+    // ---- 路由解析:direct-chat 优先,其次话题线程,最后"唯一发送者"兜底 ----
+    let mut route: Option<(i32, String, ChannelMessageTarget)> = None;
+    if let Ok(ctxs) =
+        sender_context_service::list_by_current_conversation(db, params.conversation_id).await
+    {
+        if let Some(ctx) = ctxs.into_iter().next() {
+            let target = ChannelMessageTarget::telegram_direct(
+                ctx.channel_id,
+                ctx.sender_id.clone(),
+                ctx.sender_id.clone(),
+            );
+            route = Some((ctx.channel_id, ctx.sender_id, target));
+        }
+    }
+    if route.is_none() {
+        if let Ok(bindings) =
+            thread_binding_service::list_by_conversation(db, params.conversation_id).await
+        {
+            if let Some(b) = bindings.into_iter().next() {
+                let target = ChannelMessageTarget::telegram_forum_topic(
+                    b.channel_id,
+                    b.chat_id.clone(),
+                    b.thread_key.clone(),
+                );
+                route = Some((b.channel_id, b.created_by_sender_id, target));
+            }
+        }
+    }
+    if route.is_none() {
+        // 会话不是任何渠道聊天的"当前会话"(用户在网页上打开了一条历史渠道
+        // 会话)。单发送者实例的合理语义:视为在渠道里 /tasks 切换到它。
+        let ctxs = sender_context_service::list_all(db).await.unwrap_or_default();
+        let mut candidates: Vec<_> = ctxs
+            .into_iter()
+            .filter(|c| c.current_conversation_id.is_some() || c.current_folder_id.is_some())
+            .collect();
+        if candidates.len() == 1 {
+            let ctx = candidates.remove(0);
+            let target = ChannelMessageTarget::telegram_direct(
+                ctx.channel_id,
+                ctx.sender_id.clone(),
+                ctx.sender_id.clone(),
+            );
+            route = Some((ctx.channel_id, ctx.sender_id, target));
+        }
+    }
+    let Some((channel_id, sender_id, target)) = route else {
+        return Err(AppCommandError::task_execution_failed(
+            "conversation is not attached to any channel chat".to_string(),
+        ));
+    };
+
+    // ---- 会话对齐:活动会话指向别的 conversation 就先退掉,并重指路由 ----
+    if let Some(bridge) = manager.session_bridge().await {
+        let stale_conn = {
+            let guard = bridge.lock().await;
+            guard
+                .find_by_sender(channel_id, &sender_id)
+                .filter(|s| s.conversation_id != params.conversation_id)
+                .map(|s| s.connection_id.clone())
+        };
+        if let Some(conn_id) = stale_conn {
+            bridge.lock().await.remove(&conn_id);
+            let _ = state.connection_manager.disconnect(&conn_id).await;
+        }
+    }
+    let _ = sender_context_service::update_session(
+        db,
+        channel_id,
+        &sender_id,
+        Some(params.conversation_id),
+        None,
+    )
+    .await;
+
+    // ---- 🌐 先落渠道流(Telegram 是事实源,网页敲的字也要在那里出现)----
+    let marker = RichMessage::info(format!("🌐 {text}"));
+    let _ = manager.send_to_target(&target, &marker).await;
+
+    // ---- defaults(新任务路径用;续聊路径忽略)----
+    let session_defaults: Option<ChannelSessionDefaults> =
+        match chat_channel_service::get_by_id(db, channel_id).await {
+            Ok(Some(row)) => serde_json::from_str::<TelegramConfig>(&row.config_json)
+                .ok()
+                .and_then(|cfg| {
+                    match (cfg.default_folder_path, cfg.default_agent_type) {
+                        (Some(f), Some(a)) if !f.trim().is_empty() && !a.trim().is_empty() => {
+                            Some(ChannelSessionDefaults {
+                                folder_path: f,
+                                agent_type: a,
+                            })
+                        }
+                        _ => None,
+                    }
+                }),
+            _ => None,
+        };
+
+    // ---- 入队:与渠道收到用户消息完全同路 ----
+    let cmd = IncomingCommand {
+        channel_id,
+        sender_id,
+        command_text: text,
+        callback_data: None,
+        target,
+        metadata: serde_json::json!({ "source": "web" }),
+        session_defaults,
+    };
+    manager
+        .command_sender()
+        .send(cmd)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(format!("enqueue failed: {e}")))?;
+
+    Ok(Json(()))
+}

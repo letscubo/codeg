@@ -26,6 +26,12 @@ struct Inner {
     command_tx: mpsc::Sender<IncomingCommand>,
     command_rx: Mutex<Option<mpsc::Receiver<IncomingCommand>>>,
     broadcaster: Mutex<Option<Arc<WebEventBroadcaster>>>,
+    /// The dispatcher/subscriber's shared live-session registry, published at
+    /// `start()`. The web injection endpoint needs it to retire a live session
+    /// that points at a DIFFERENT conversation before enqueueing (so the
+    /// injected text auto-resumes the requested conversation instead of
+    /// riding the wrong one).
+    session_bridge: Mutex<Option<Arc<Mutex<super::session_bridge::SessionBridge>>>>,
 }
 
 pub struct ChatChannelManager {
@@ -47,8 +53,16 @@ impl ChatChannelManager {
                 command_tx,
                 command_rx: Mutex::new(Some(command_rx)),
                 broadcaster: Mutex::new(None),
+                session_bridge: Mutex::new(None),
             }),
         }
+    }
+
+    /// The live-session registry, once `start()` has published it.
+    pub async fn session_bridge(
+        &self,
+    ) -> Option<Arc<Mutex<super::session_bridge::SessionBridge>>> {
+        self.inner.session_bridge.lock().await.clone()
     }
 
     /// Shallow clone sharing the same state (like ConnectionManager::clone_ref).
@@ -353,6 +367,7 @@ impl ChatChannelManager {
 
         // Create shared session bridge
         let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        *self.inner.session_bridge.lock().await = Some(bridge.clone());
 
         // Spawn event subscriber
         let manager_for_events = self.clone_ref();

@@ -1097,6 +1097,10 @@ pub fn build_router(
             post(handlers::chat_channel::list_chat_channels),
         )
         .route(
+            "/inject_chat_channel_message",
+            post(handlers::chat_channel::inject_chat_channel_message),
+        )
+        .route(
             "/create_chat_channel",
             post(handlers::chat_channel::create_chat_channel),
         )
