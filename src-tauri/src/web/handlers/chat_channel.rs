@@ -390,28 +390,42 @@ pub async fn inject_chat_channel_message(
         ));
     };
 
-    // ---- 会话对齐:活动会话指向别的 conversation 就先退掉,并重指路由 ----
+    // ---- 会话对齐 ----
+    // 三种情形,只动需要动的:
+    //   · 活会话就在目标 conversation 上 → **什么都不碰**。此前无条件把
+    //     sender_context 的 connection 绑定清空,而 followup 路径靠它定位
+    //     会话 —— 结果注入之后渠道里连用户自己发的消息都回
+    //     "No active session"(D6 2026-08-30 实锤,渠道整个卡死到连接回收)。
+    //   · 活会话指向别的 conversation → 退掉它,再把路由指向目标。
+    //   · 没有活会话 → 只把路由指向目标(下一条消息自动续聊)。
+    let mut live_on_target = false;
     if let Some(bridge) = manager.session_bridge().await {
         let stale_conn = {
             let guard = bridge.lock().await;
-            guard
-                .find_by_sender(channel_id, &sender_id)
-                .filter(|s| s.conversation_id != params.conversation_id)
-                .map(|s| s.connection_id.clone())
+            match guard.find_by_sender(channel_id, &sender_id) {
+                Some(s) if s.conversation_id == params.conversation_id => {
+                    live_on_target = true;
+                    None
+                }
+                Some(s) => Some(s.connection_id.clone()),
+                None => None,
+            }
         };
         if let Some(conn_id) = stale_conn {
             bridge.lock().await.remove(&conn_id);
             let _ = state.connection_manager.disconnect(&conn_id).await;
         }
     }
-    let _ = sender_context_service::update_session(
-        db,
-        channel_id,
-        &sender_id,
-        Some(params.conversation_id),
-        None,
-    )
-    .await;
+    if !live_on_target {
+        let _ = sender_context_service::update_session(
+            db,
+            channel_id,
+            &sender_id,
+            Some(params.conversation_id),
+            None,
+        )
+        .await;
+    }
 
     // ---- 🌐 先落渠道流(Telegram 是事实源,网页敲的字也要在那里出现)----
     let marker = RichMessage::info(format!("🌐 {text}"));
