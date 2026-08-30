@@ -324,7 +324,7 @@ async fn dispatch_command(
         // left out of /help: cancel is the only brake on a runaway turn,
         // and approve/deny answer permission cards — hiding their handlers
         // would wedge those flows.
-        "tasks" => DispatchResponse::current(
+        "tasks" => DispatchResponse::from_session_message(
             session_commands::handle_tasks(
                 db, args, channel_id, sender_id, target, manager, conn_mgr, emitter, bridge, lang,
                 prefix, data_dir,
@@ -452,9 +452,8 @@ impl DispatchResponse {
         }
     }
 
-    // Kept for the hidden picker commands (/folder /agent) — restoring one
-    // re-lights this path.
-    #[allow(dead_code)]
+    // 交互式返回的公共入口:/tasks 的会话按钮走它,隐藏的 /folder /agent picker
+    // 恢复时也是这条。
     fn from_session_message(
         message: session_commands::SessionCommandMessage,
         target: &ChannelMessageTarget,

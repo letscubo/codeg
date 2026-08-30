@@ -56,7 +56,12 @@ fn extract_working_dir(text: &str) -> Option<String> {
 }
 
 /// Strip OpenClaw user message prefix metadata.
-fn strip_openclaw_user_prefix(text: &str) -> String {
+///
+/// Also used by the chat-channel `/tasks` list: conversation titles are derived
+/// from the first user message, so they inherit whatever OpenClaw prepended
+/// (`[Working directory: ~]`, timestamps, sender blocks) and every row ends up
+/// wearing the same noise instead of what the user actually said.
+pub(crate) fn strip_openclaw_user_prefix(text: &str) -> String {
     let cleaned = sender_block_regex().replace(text, "");
     let cleaned = timestamp_prefix_regex().replace(&cleaned, "");
     let cleaned = working_dir_prefix_regex().replace(&cleaned, "");

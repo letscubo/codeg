@@ -408,6 +408,28 @@ pub async fn handle_callback(
     lang: Lang,
     prefix: &str,
 ) -> RichMessage {
+    // `/tasks` 列表里的会话按钮 —— 点一下切过去,与 `/tasks <编号>` 落到同一处
+    // (只改路由,不起进程:下一条消息自会 auto-resume,所以切换是免费的)。
+    if let Some(conv_id) = data.strip_prefix("task:") {
+        let Ok(conv_id) = conv_id.parse::<i32>() else {
+            return RichMessage::info(callback_expired_or_invalid(lang, prefix));
+        };
+        let Ok(Some(conv)) = conversation::Entity::find_by_id(conv_id).one(db).await else {
+            // 会话被删了 / id 不认识 —— 按钮是旧消息上的,按"已失效"处理
+            return RichMessage::info(callback_expired_or_invalid(lang, prefix));
+        };
+        let _ =
+            sender_context_service::update_session(db, channel_id, sender_id, Some(conv_id), None)
+                .await;
+        let raw = conv.title.as_deref().unwrap_or("");
+        let cleaned = crate::parsers::openclaw::strip_openclaw_user_prefix(raw);
+        let title = if cleaned.is_empty() { raw } else { cleaned.as_str() };
+        return RichMessage::info(format!("#{conv_id} {title}")).with_title(match lang {
+            Lang::ZhCn | Lang::ZhTw => "已切换会话",
+            _ => "Switched conversation",
+        });
+    }
+
     if let Some(folder_id) = data.strip_prefix("cfg:folder:") {
         let Ok(folder_id) = folder_id.parse::<i32>() else {
             return RichMessage::info(callback_expired_or_invalid(lang, prefix));
@@ -1934,15 +1956,15 @@ pub async fn handle_tasks(
     lang: Lang,
     prefix: &str,
     data_dir: &Path,
-) -> RichMessage {
+) -> SessionCommandMessage {
     let ctx = match sender_context_service::get_or_create(db, channel_id, sender_id).await {
         Ok(c) => c,
         Err(e) => {
-            return RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang)));
+            return SessionCommandMessage::Rich(RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang))));
         }
     };
     let Some(folder_id) = ctx.current_folder_id else {
-        return RichMessage::info(i18n::no_folder_selected(lang, prefix));
+        return SessionCommandMessage::Rich(RichMessage::info(i18n::no_folder_selected(lang, prefix)));
     };
 
     let mut convs = match conversation_service::list_by_folder(db, folder_id, None, None, None, None)
@@ -1950,31 +1972,31 @@ pub async fn handle_tasks(
     {
         Ok(c) => c,
         Err(e) => {
-            return RichMessage::error(format!("{}{e}", i18n::failed_to_list_sessions_label(lang)));
+            return SessionCommandMessage::Rich(RichMessage::error(format!("{}{e}", i18n::failed_to_list_sessions_label(lang))));
         }
     };
     convs.truncate(10);
 
     if convs.is_empty() {
-        return RichMessage::info(match lang {
+        return SessionCommandMessage::Rich(RichMessage::info(match lang {
             Lang::ZhCn | Lang::ZhTw => "还没有会话。直接发消息即可开始新会话。".to_string(),
             _ => "No conversations yet. Just send a message to start one.".to_string(),
-        });
+        }));
     }
 
     // `/tasks N` → switch to the Nth entry of the SAME list rendered below.
     if !args.is_empty() {
         let Ok(n) = args.trim().parse::<usize>() else {
-            return RichMessage::info(match lang {
+            return SessionCommandMessage::Rich(RichMessage::info(match lang {
                 Lang::ZhCn | Lang::ZhTw => format!("用法:{prefix}tasks 或 {prefix}tasks <编号>"),
                 _ => format!("Usage: {prefix}tasks or {prefix}tasks <number>"),
-            });
+            }));
         };
         let Some(conv) = convs.get(n.wrapping_sub(1)) else {
-            return RichMessage::info(match lang {
+            return SessionCommandMessage::Rich(RichMessage::info(match lang {
                 Lang::ZhCn | Lang::ZhTw => format!("编号超出范围(1-{})", convs.len()),
                 _ => format!("Number out of range (1-{})", convs.len()),
-            });
+            }));
         };
         // Point the route at the chosen conversation. No process is spawned
         // here — the next message auto-resumes it, so switching is free.
@@ -1982,34 +2004,71 @@ pub async fn handle_tasks(
             .await;
         let title = conv.title.as_deref().unwrap_or("(untitled)");
         let _ = manager; // reserved: title sync is topic-only today
-        return RichMessage::info(format!("[{}] #{} {}", conv.agent_type, conv.id, title))
+        // 标题剥掉 OpenClaw 注入的前缀 —— 用户看的是自己说过的话,不是工作目录
+        let switched_title = crate::parsers::openclaw::strip_openclaw_user_prefix(title);
+        let switched_title = if switched_title.is_empty() { title } else { switched_title.as_str() };
+        return SessionCommandMessage::Rich(RichMessage::info(format!("#{} {}", conv.id, switched_title))
             .with_title(match lang {
                 Lang::ZhCn | Lang::ZhTw => "已切换会话",
                 _ => "Switched conversation",
-            });
+            }));
     }
 
     let _ = (conn_mgr, emitter, bridge, data_dir, target); // switching spawns nothing
 
-    let mut body = String::new();
-    for (i, c) in convs.iter().enumerate() {
-        let title = c.title.as_deref().unwrap_or("(untitled)");
-        let marker = if ctx.current_conversation_id == Some(c.id) {
-            " ←"
-        } else {
-            ""
-        };
-        body.push_str(&format!("{}. [{}] {}{}\n", i + 1, c.agent_type, title, marker));
-    }
-    body.push_str(&match lang {
-        Lang::ZhCn | Lang::ZhTw => format!("\n{prefix}tasks <编号> 切换 · {prefix}new 新会话"),
-        _ => format!("\n{prefix}tasks <number> to switch · {prefix}new for a fresh one"),
-    });
-    RichMessage::info(body.trim_end()).with_title(match lang {
+    /*
+     * 会话列表出成**可点按钮**,而不是一串还要照编号打字的文本。
+     *
+     * 按钮文案只留标题 —— agent / 模型这些在列表里是噪音(每行都一样长、把真正
+     * 说过的话挤没),要看用 `/status`。标题还得剥掉 OpenClaw 注入的
+     * `[Working directory: ~]`/时间戳前缀,否则十行里八行顶着同一段开头。
+     *
+     * 编号那条老路(`/tasks 3`)照旧可用:按钮是加法,不是替换 —— 客户端渲染不了
+     * 键盘时 `to_rich_fallback()` 会把按钮摊回文本。
+     */
+    let buttons: Vec<MessageButton> = convs
+        .iter()
+        .map(|c| {
+            let raw_title = c.title.as_deref().unwrap_or("");
+            let cleaned = crate::parsers::openclaw::strip_openclaw_user_prefix(raw_title);
+            let title = if cleaned.is_empty() {
+                match lang {
+                    Lang::ZhCn | Lang::ZhTw => "(未命名)".to_string(),
+                    _ => "(untitled)".to_string(),
+                }
+            } else {
+                cleaned
+            };
+            // 按钮文字过长会被 Telegram 挤成一坨,截短到能一眼扫完
+            // 复用既有的按钮文案截断(picker 那边同一套观感)
+            let label = truncate_button_label(&title, 28);
+            MessageButton {
+                id: format!("task:{}", c.id),
+                label: if ctx.current_conversation_id == Some(c.id) {
+                    format!("✓ {label}")
+                } else {
+                    label
+                },
+                style: ButtonStyle::Default,
+            }
+        })
+        .collect();
+
+    let hint = match lang {
+        Lang::ZhCn | Lang::ZhTw => format!("点按切换 · {prefix}new 新会话"),
+        _ => format!("Tap to switch · {prefix}new for a fresh one"),
+    };
+    let base = RichMessage::info(hint).with_title(match lang {
         Lang::ZhCn | Lang::ZhTw => "会话列表",
         _ => "Conversations",
+    });
+    SessionCommandMessage::Interactive(InteractiveMessage {
+        base,
+        buttons,
+        callback_context: serde_json::json!({}),
     })
 }
+
 
 /// `/status` — the sender's current conversation, agent, model and whether a
 /// live process is attached right now (a reclaimed one auto-revives on the
