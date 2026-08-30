@@ -141,10 +141,6 @@ async fn async_main() -> ExitCode {
         });
     });
 
-    // MyClaw 平台下发的技能:启动跑一次,之后每 10~15 分钟随机拉一次。
-    // 取代了原先 include_dir! 内嵌的 experts/science 两包 —— 内容改由平台维护,
-    // 改一句文案不必发版;拉取失败一律保持现状,绝不把网络问题当成删除指令。
-    codeg_lib::commands::myclaw_skills::spawn_sync_loop();
     let port: u16 = std::env::var("CODEG_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -196,6 +192,15 @@ async fn async_main() -> ExitCode {
     let db = codeg_lib::db::init_database(&data_dir, app_version)
         .await
         .expect("Failed to initialize database");
+
+    // MyClaw 平台下发的技能:启动跑一次,之后每 10~15 分钟随机拉一次。取代了原先
+    // include_dir! 内嵌的 experts/science 两包 —— 内容改由平台维护,改一句文案不必
+    // 发版;拉取失败一律保持现状,绝不把网络问题当成删除指令。
+    //
+    // 必须放在 db 之后:平台地址取自本机已配置的出站 webhook,而那份配置存在 db 里。
+    codeg_lib::commands::myclaw_skills::spawn_sync_loop(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    });
 
     // Logging phase 2: override the default level from the persisted
     // `logging.level` now that the DB is open. Phase 3 (wiring the emitter)

@@ -48,6 +48,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::commands::experts::{central_experts_dir, create_link_raw, path_is_symlink};
+use crate::chat_channel::webhook::WebhookConfig;
+use crate::db::AppDatabase;
 use crate::models::agent::{AgentType, BUILTIN_AGENT_TYPES};
 use crate::commands::acp::preferred_scope_skill_dir;
 use crate::acp::types::AgentSkillScope;
@@ -61,8 +63,17 @@ const SYNC_MAX_SECS: u64 = 900;
 
 /// 平台地址与凭证由 agent 在 CREATE 时写进 `~/.myclaw/codeg.env`,
 /// codeg 启动时 source 它 —— 与 webhook 地址同一次写入、同一个 origin。
-const ENV_URL: &str = "MYCLAW_SYNC_URL";
-const ENV_SECRET: &str = "MYCLAW_SYNC_SECRET";
+/// 平台地址的**唯一来源**是 codeg 自己已配置的出站 webhook —— 开通流程配的那条
+/// `{origin}/api/codeg/events?vmId=…&s=…`,origin / vmId / secret 三样都在里面。
+///
+/// 刻意不再引入 MYCLAW_SYNC_URL / MYCLAW_SYNC_SECRET 这类专用 env:那等于给一份
+/// 已经存在的配置再造一份副本,两份还会各自漂移;而且存量实例的 webhook 早就配好,
+/// 走这条路它们**升级后立刻可用**,不必逐台补 env。
+///
+/// 代价:同步能力与 webhook 配置绑定 —— webhook 被清空或改地址,同步跟着失效或
+/// 跟着走。这是「统一逻辑」的必然结果,已接受。
+const EVENTS_PATH: &str = "/api/codeg/events";
+const SKILLS_PATH: &str = "/api/codeg/skills";
 
 /// 同一时刻只允许一个同步在跑(启动那次与定时那次可能撞上)。
 fn sync_lock() -> &'static Mutex<()> {
@@ -234,27 +245,41 @@ fn link_everywhere(slug: &str, report: &mut SyncReport) {
     }
 }
 
-/// 从 env 读平台地址与凭证;任一缺失则本功能整体关闭(返回 None)。
-fn sync_config() -> Option<(String, String)> {
-    let url = std::env::var(ENV_URL).ok().filter(|s| !s.trim().is_empty())?;
-    let secret = std::env::var(ENV_SECRET).ok().filter(|s| !s.trim().is_empty())?;
-    Some((url, secret))
+/// 从已配置的 webhook 列表里推导出技能清单端点。没有匹配的 webhook = 这台实例
+/// 不参与平台下发(返回 None)。
+///
+/// 只换 path、**query 原样保留** —— `vmId` 和 `s` 本来就在里面,逐个解析再重拼
+/// 只会多出几处可能写错的地方。
+///
+/// 按 path 精确匹配而不是取列表第一条:用户可能自己加了别的 webhook,取第一条
+/// 会把技能清单请求发到不相干的地址去。
+fn skills_endpoint(hooks: &[WebhookConfig]) -> Option<String> {
+    hooks
+        .iter()
+        .filter(|w| w.enabled)
+        .find(|w| w.url.contains(EVENTS_PATH))
+        .map(|w| w.url.replacen(EVENTS_PATH, SKILLS_PATH, 1))
+}
+
+/// 读回本机已配置的 webhook 并推导端点。db 出错时返回 None(保持现状,不动磁盘)。
+async fn sync_config(db: &AppDatabase) -> Option<String> {
+    let hooks = crate::commands::chat_channel::get_chat_event_webhooks_core(db)
+        .await
+        .ok()?;
+    skills_endpoint(&hooks)
 }
 
 /// 拉一次并同步。**任何拉取失败都保持现状**,只有平台明确返回 200 才会动磁盘。
-pub async fn sync_once() -> SyncReport {
+pub async fn sync_once(db: &AppDatabase) -> SyncReport {
     let _guard = sync_lock().lock().await;
     let mut report = SyncReport::default();
 
-    let Some((url, secret)) = sync_config() else {
-        return report; // 未配置 = 这台实例不参与平台下发,静默跳过
+    let Some(endpoint) = sync_config(db).await else {
+        return report; // 没有可用 webhook = 这台实例不参与平台下发,静默跳过
     };
 
-    // 不要硬假设 url 里已经有 `?`。agent 目前写的是 `…/api/codeg/skills?vmId=<id>`,
-    // 但那行哪天改成不带 query,`{}&s=` 会拼出 `…/skills&s=xxx` 这种无效路径 ——
-    // 而且是静默失败:平台回 400,这里只往 report 里记一笔就保持现状,没人看得见。
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let endpoint = format!("{}{}s={}", url, sep, urlencoding::encode(&secret));
+    // endpoint 由 webhook URL 换 path 得来,`vmId` 与 `s` 原样带着,这里不再拼接
+    // 任何 query —— 少一处拼接就少一处能拼错的地方。
     let resp = match reqwest::Client::new()
         .get(&endpoint)
         .timeout(Duration::from_secs(30))
@@ -368,14 +393,17 @@ pub async fn sync_once() -> SyncReport {
 }
 
 /// 启动时跑一次,之后每 10~15 分钟一次(随机,避免全网对齐成尖峰)。
-pub fn spawn_sync_loop() {
-    if sync_config().is_none() {
-        tracing::info!("[MyclawSkills] {ENV_URL}/{ENV_SECRET} not set — platform skill sync disabled");
-        return;
-    }
+pub fn spawn_sync_loop(db: AppDatabase) {
     tokio::spawn(async move {
+        // 配置检查放进循环体而不是启动时一次性判断:webhook 是开通流程写的,
+        // 容器可能先于它启动;一次性判断会让这台实例直到下次重启都不参与下发。
+        if sync_config(&db).await.is_none() {
+            tracing::info!(
+                "[MyclawSkills] no enabled webhook pointing at {EVENTS_PATH} — platform skill sync idle until one is configured"
+            );
+        }
         loop {
-            let r = sync_once().await;
+            let r = sync_once(&db).await;
             if r.installed + r.updated + r.removed > 0 || !r.errors.is_empty() {
                 tracing::info!(
                     "[MyclawSkills] sync: installed={} updated={} removed={} backed_up={:?} errors={:?}",
@@ -389,4 +417,67 @@ pub fn spawn_sync_loop() {
             tokio::time::sleep(Duration::from_secs(secs)).await;
         }
     });
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hook(url: &str, enabled: bool) -> WebhookConfig {
+        WebhookConfig { url: url.into(), enabled }
+    }
+
+    #[test]
+    fn derives_skills_endpoint_keeping_query() {
+        // vmId 与 s 必须原样带过来 —— 平台就靠这两个参数认实例和鉴权
+        let hooks = vec![hook(
+            "https://myclaw.ai/api/codeg/events?vmId=abc-123&s=sekret",
+            true,
+        )];
+        assert_eq!(
+            skills_endpoint(&hooks).as_deref(),
+            Some("https://myclaw.ai/api/codeg/skills?vmId=abc-123&s=sekret")
+        );
+    }
+
+    #[test]
+    fn ignores_disabled_hooks() {
+        let hooks = vec![hook("https://myclaw.ai/api/codeg/events?vmId=a&s=b", false)];
+        assert!(skills_endpoint(&hooks).is_none());
+    }
+
+    #[test]
+    fn picks_by_path_not_by_position() {
+        // 用户自己加的 webhook 排在前面时,不能把技能清单请求发到他那儿去
+        let hooks = vec![
+            hook("https://hooks.example.com/whatever", true),
+            hook("https://myclaw.ai/api/codeg/events?vmId=a&s=b", true),
+        ];
+        assert_eq!(
+            skills_endpoint(&hooks).as_deref(),
+            Some("https://myclaw.ai/api/codeg/skills?vmId=a&s=b")
+        );
+    }
+
+    #[test]
+    fn no_matching_hook_means_not_participating() {
+        let hooks = vec![hook("https://hooks.example.com/whatever", true)];
+        assert!(skills_endpoint(&hooks).is_none());
+        assert!(skills_endpoint(&[]).is_none());
+    }
+
+    #[test]
+    fn replaces_only_the_first_occurrence() {
+        // 目录名里再出现一次同样的字串时,只换 path 那一处
+        let hooks = vec![hook(
+            "https://myclaw.ai/api/codeg/events?redirect=/api/codeg/events",
+            true,
+        )];
+        assert_eq!(
+            skills_endpoint(&hooks).as_deref(),
+            Some("https://myclaw.ai/api/codeg/skills?redirect=/api/codeg/events")
+        );
+    }
 }

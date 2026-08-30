@@ -399,7 +399,9 @@ mod tauri_app {
                 // 取代了原先 include_dir! 内嵌的 experts/science 两包 —— 内容改由
                 // 平台维护,改一句文案不必发版;拉取失败一律保持现状,绝不把网络
                 // 问题当成删除指令。
-                crate::commands::myclaw_skills::spawn_sync_loop();
+                crate::commands::myclaw_skills::spawn_sync_loop(db::AppDatabase {
+                    conn: app.state::<db::AppDatabase>().conn.clone(),
+                });
 
 
 
