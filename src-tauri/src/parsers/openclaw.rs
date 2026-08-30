@@ -32,6 +32,17 @@ fn working_dir_prefix_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\[Working directory:[^\]]*\]\s*").unwrap())
 }
 
+/// 被**截断**的工作目录前缀:`[Working directory: …` 后面再没有闭合的 `]`。
+///
+/// 标题是按长度截出来的,工作目录一长(如 `~/.myclaw/sessions/<uuid>`)右括号就被
+/// 截掉了 —— 上面那条要求闭合 `]` 的正则匹配不上,前缀原样留在标题里
+/// (2026-08-30 D6 实测 conv57:`[Working directory: ~/.myclaw/sessions/e0973921-…`)。
+/// 这种行里剩下的全是前缀残骸,没有用户说的话可留,整条丢弃。
+fn truncated_working_dir_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\[Working directory:[^\]]*$").unwrap())
+}
+
 /// Regex to extract the working directory path from a user message prefix.
 fn working_dir_extract_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -65,6 +76,8 @@ pub(crate) fn strip_openclaw_user_prefix(text: &str) -> String {
     let cleaned = sender_block_regex().replace(text, "");
     let cleaned = timestamp_prefix_regex().replace(&cleaned, "");
     let cleaned = working_dir_prefix_regex().replace(&cleaned, "");
+    // 闭合的剥完了还整条以 `[Working directory:` 开头 = 右括号被标题截断吃掉了
+    let cleaned = truncated_working_dir_regex().replace(&cleaned, "");
     cleaned.trim().to_string()
 }
 
@@ -1212,6 +1225,22 @@ mod tests {
         let input = "[Tue 2026-03-17 12:58 GMT+8] [Working directory: ~/projects/test]\n\nHello";
         let result = strip_openclaw_user_prefix(input);
         assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn strips_a_working_dir_prefix_whose_bracket_got_truncated() {
+        // 会话标题是按长度截的:工作目录一长,右括号就被截掉,要求闭合 `]` 的那条
+        // 正则便匹配不上,前缀原样留在 `/tasks` 的按钮上
+        // (2026-08-30 D6 conv57 实测形状)。
+        let input = "[Working directory: ~/.myclaw/sessions/e0973921-d9dd-4b0d-b…";
+        assert_eq!(strip_openclaw_user_prefix(input), "");
+    }
+
+    #[test]
+    fn a_truncated_prefix_never_eats_a_normal_title() {
+        // 兜底只认「整条都是前缀残骸」;正常标题里出现方括号不受影响
+        assert_eq!(strip_openclaw_user_prefix("[Working directory: ~] 你好"), "你好");
+        assert_eq!(strip_openclaw_user_prefix("修一下 [Working directory: x"), "修一下 [Working directory: x");
     }
 
     #[test]
