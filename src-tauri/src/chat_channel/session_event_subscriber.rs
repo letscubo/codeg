@@ -597,8 +597,57 @@ async fn handle_acp_envelope(
             }
         }
 
-        AcpEvent::TurnComplete { stop_reason, .. } => {
+        AcpEvent::UserMessage { blocks, .. } => {
+            // 渠道自己的轮:用户消息本来就是在渠道里敲的,不用回显。只镜像
+            // **外部入口**(网页工作台等)在渠道用户当前会话上发起的提问。
+            if bridge.lock().await.get(connection_id).is_some() {
+                return;
+            }
+            let text: String = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    crate::acp::types::UserMessageBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if text.trim().is_empty() {
+                return;
+            }
+            let targets = mirror_targets_for_connection(db, conn_mgr, connection_id, None).await;
+            if targets.is_empty() {
+                return;
+            }
+            // 🌐 标记"来自另一块屏幕的你" —— 与渠道本地消息区分开。
+            let msg = RichMessage::info(format!("🌐 {}", truncate_str(&text, 1500)));
+            for target in targets {
+                let _ = manager.send_to_target(&target, &msg).await;
+            }
+        }
+
+        AcpEvent::TurnComplete {
+            stop_reason,
+            session_id: turn_session_id,
+            ..
+        } => {
             let mut guard = bridge.lock().await;
+            if guard.get(connection_id).is_none() {
+                // 渠道不拥有这条连接(网页工作台等其它入口发起的轮)。若这条
+                // conversation 正是某个渠道用户的**当前会话**,把回复镜像过去
+                // —— 双端聊天流对齐,而不是"上下文共享但渠道看不见"。
+                drop(guard);
+                if stop_reason == "end_turn" {
+                    mirror_foreign_turn_reply(
+                        db,
+                        conn_mgr,
+                        manager,
+                        connection_id,
+                        turn_session_id,
+                    )
+                    .await;
+                }
+                return;
+            }
             if let Some(session) = guard.get_mut(connection_id) {
                 let target = session.target.clone();
                 let conv_id = session.conversation_id;
@@ -789,6 +838,98 @@ async fn flush_progress(
 
     for (target, text) in updates {
         let msg = RichMessage::info(text);
+        let _ = manager.send_to_target(&target, &msg).await;
+    }
+}
+
+/// 解析"这条外部连接的轮该镜像到哪些渠道 target"。
+///
+/// conversation 定位:优先连接状态上的 `conversation_id`(send_prompt_linked
+/// 写入);缺了按 ACP session id 反查 conversation 行。路由 = ①以它为当前会话
+/// 的 direct-chat 发送者(sender_context)+ ②绑定它的话题线程(thread_binding)。
+/// 渠道自己的连接(bridge 在册)不会走到这里 —— 调用方已过滤。
+async fn mirror_targets_for_connection(
+    db: &DatabaseConnection,
+    conn_mgr: &ConnectionManager,
+    connection_id: &str,
+    session_id_hint: Option<&str>,
+) -> Vec<ChannelMessageTarget> {
+    let state = conn_mgr.get_state(connection_id).await;
+    let (state_conv, state_ext) = match state {
+        Some(s) => {
+            let g = s.read().await;
+            (g.conversation_id, g.external_id.clone())
+        }
+        None => (None, None),
+    };
+    let conv_id = match state_conv {
+        Some(id) => Some(id),
+        None => {
+            let sid = session_id_hint
+                .map(|s| s.to_string())
+                .or(state_ext);
+            match sid {
+                Some(sid) => crate::db::service::conversation_service::get_by_external_id(db, &sid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.id),
+                None => None,
+            }
+        }
+    };
+    let Some(conv_id) = conv_id else {
+        return Vec::new();
+    };
+
+    let mut targets = Vec::new();
+    if let Ok(ctxs) =
+        crate::db::service::sender_context_service::list_by_current_conversation(db, conv_id).await
+    {
+        for ctx in ctxs {
+            // 私聊里 chat_id == sender_id(Telegram 用户 id)。
+            targets.push(ChannelMessageTarget::telegram_direct(
+                ctx.channel_id,
+                ctx.sender_id.clone(),
+                ctx.sender_id,
+            ));
+        }
+    }
+    if let Ok(bindings) = thread_binding_service::list_by_conversation(db, conv_id).await {
+        for b in bindings {
+            targets.push(ChannelMessageTarget::telegram_forum_topic(
+                b.channel_id,
+                b.chat_id,
+                b.thread_key,
+            ));
+        }
+    }
+    targets
+}
+
+/// 外部入口的轮完成:把回复正文镜像到该 conversation 的渠道路由。
+async fn mirror_foreign_turn_reply(
+    db: &DatabaseConnection,
+    conn_mgr: &ConnectionManager,
+    manager: &ChatChannelManager,
+    connection_id: &str,
+    session_id: &str,
+) {
+    let targets =
+        mirror_targets_for_connection(db, conn_mgr, connection_id, Some(session_id)).await;
+    if targets.is_empty() {
+        return;
+    }
+    let reply = match conn_mgr.get_state(connection_id).await {
+        Some(s) => s.read().await.last_assistant_text.clone(),
+        None => None,
+    };
+    let Some(reply) = reply.filter(|r| !r.trim().is_empty()) else {
+        return;
+    };
+    let lang = get_lang(db).await;
+    let msg = RichMessage::info(format_completion(&reply, 0, lang));
+    for target in targets {
         let _ = manager.send_to_target(&target, &msg).await;
     }
 }

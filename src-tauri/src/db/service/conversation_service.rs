@@ -124,6 +124,22 @@ async fn create_inner(
     Ok(model.insert(conn).await?)
 }
 
+/// Look up the (non-deleted) conversation currently bound to an ACP session
+/// id. Used by the chat-channel mirror: a turn that ran on a connection the
+/// channel doesn't own (e.g. the web workspace) only carries its ACP
+/// session_id — this maps it back to the conversation so the channel route
+/// can be resolved.
+pub async fn get_by_external_id(
+    conn: &DatabaseConnection,
+    external_id: &str,
+) -> Result<Option<conversation::Model>, DbError> {
+    Ok(conversation::Entity::find()
+        .filter(conversation::Column::ExternalId.eq(external_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?)
+}
+
 pub async fn update_status(
     conn: &DatabaseConnection,
     conversation_id: i32,

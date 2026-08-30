@@ -108,6 +108,19 @@ pub async fn clear_connection(
     Ok(active.update(conn).await?)
 }
 
+/// Every sender whose CURRENT conversation is `conversation_id`. Used by the
+/// chat-channel mirror to fan a foreign-surface turn (web workspace etc.) out
+/// to the channel chats that are "on" that conversation right now.
+pub async fn list_by_current_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Vec<chat_channel_sender_context::Model>, DbError> {
+    Ok(chat_channel_sender_context::Entity::find()
+        .filter(chat_channel_sender_context::Column::CurrentConversationId.eq(conversation_id))
+        .all(conn)
+        .await?)
+}
+
 pub async fn update_auto_approve(
     conn: &DatabaseConnection,
     channel_id: i32,
