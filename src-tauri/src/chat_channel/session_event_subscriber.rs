@@ -53,6 +53,13 @@ pub fn spawn_session_event_subscriber(
     tokio::spawn(async move {
         let mut last_heartbeat = Instant::now();
         let mut lag_throttle = LagLogThrottle::new(LAG_LOG_WINDOW);
+        // 外部连接(网页工作台等)的"本轮用户消息"暂存:UserMessage 时刻只存
+        // 文本(不做路由查询 —— 那一瞬 conversation 绑定可能尚未落到 state,
+        // 查了也常常扑空,2026-08-30 D6 实锤:回复镜像到了、🌐 用户消息丢了);
+        // TurnComplete 时刻取出,与回复一起镜像 —— 路由在那时稳定可解析,
+        // 且天然保证 🌐 消息排在回复之前。
+        let mut foreign_prompts: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         loop {
             tokio::select! {
@@ -82,6 +89,7 @@ pub fn spawn_session_event_subscriber(
                         &conn_mgr,
                         &db_conn,
                         &emitter,
+                        &mut foreign_prompts,
                     )
                     .await;
                 }
@@ -124,6 +132,7 @@ async fn handle_acp_envelope(
     conn_mgr: &ConnectionManager,
     db: &DatabaseConnection,
     emitter: &EventEmitter,
+    foreign_prompts: &mut std::collections::HashMap<String, String>,
 ) {
     let connection_id = envelope.connection_id.as_str();
 
@@ -598,8 +607,9 @@ async fn handle_acp_envelope(
         }
 
         AcpEvent::UserMessage { blocks, .. } => {
-            // 渠道自己的轮:用户消息本来就是在渠道里敲的,不用回显。只镜像
-            // **外部入口**(网页工作台等)在渠道用户当前会话上发起的提问。
+            // 渠道自己的轮:用户消息本来就是在渠道里敲的,不用回显。外部入口
+            // (网页工作台等)的提问先暂存,TurnComplete 时与回复一起镜像 ——
+            // 此刻做路由查询会撞上会话绑定的竞态(见 foreign_prompts 注释)。
             if bridge.lock().await.get(connection_id).is_some() {
                 return;
             }
@@ -614,15 +624,7 @@ async fn handle_acp_envelope(
             if text.trim().is_empty() {
                 return;
             }
-            let targets = mirror_targets_for_connection(db, conn_mgr, connection_id, None).await;
-            if targets.is_empty() {
-                return;
-            }
-            // 🌐 标记"来自另一块屏幕的你" —— 与渠道本地消息区分开。
-            let msg = RichMessage::info(format!("🌐 {}", truncate_str(&text, 1500)));
-            for target in targets {
-                let _ = manager.send_to_target(&target, &msg).await;
-            }
+            foreign_prompts.insert(connection_id.to_string(), text);
         }
 
         AcpEvent::TurnComplete {
@@ -633,16 +635,18 @@ async fn handle_acp_envelope(
             let mut guard = bridge.lock().await;
             if guard.get(connection_id).is_none() {
                 // 渠道不拥有这条连接(网页工作台等其它入口发起的轮)。若这条
-                // conversation 正是某个渠道用户的**当前会话**,把回复镜像过去
-                // —— 双端聊天流对齐,而不是"上下文共享但渠道看不见"。
+                // conversation 正是某个渠道用户的**当前会话**,把这一轮(🌐
+                // 用户消息 + 回复)镜像过去 —— 双端聊天流对齐。
                 drop(guard);
+                let prompt_text = foreign_prompts.remove(connection_id);
                 if stop_reason == "end_turn" {
-                    mirror_foreign_turn_reply(
+                    mirror_foreign_turn(
                         db,
                         conn_mgr,
                         manager,
                         connection_id,
                         turn_session_id,
+                        prompt_text.as_deref(),
                     )
                     .await;
                 }
@@ -907,13 +911,16 @@ async fn mirror_targets_for_connection(
     targets
 }
 
-/// 外部入口的轮完成:把回复正文镜像到该 conversation 的渠道路由。
-async fn mirror_foreign_turn_reply(
+/// 外部入口的轮完成:把这一轮(🌐 用户消息 + 回复正文)镜像到该 conversation
+/// 的渠道路由。用户消息由 UserMessage 时刻暂存传入 —— 两条在同一时刻按序发送,
+/// 🌐 恒在回复之前。
+async fn mirror_foreign_turn(
     db: &DatabaseConnection,
     conn_mgr: &ConnectionManager,
     manager: &ChatChannelManager,
     connection_id: &str,
     session_id: &str,
+    prompt_text: Option<&str>,
 ) {
     let targets =
         mirror_targets_for_connection(db, conn_mgr, connection_id, Some(session_id)).await;
@@ -924,14 +931,29 @@ async fn mirror_foreign_turn_reply(
         Some(s) => s.read().await.last_assistant_text.clone(),
         None => None,
     };
-    let Some(reply) = reply.filter(|r| !r.trim().is_empty()) else {
-        return;
-    };
     let lang = get_lang(db).await;
-    let msg = RichMessage::info(format_completion(&reply, 0, lang));
-    for target in targets {
-        let _ = manager.send_to_target(&target, &msg).await;
+    let prompt_msg = prompt_text
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| RichMessage::info(format!("🌐 {}", truncate_str(t, 1500))));
+    let reply_msg = reply
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| RichMessage::info(format_completion(&r, 0, lang)));
+    if prompt_msg.is_none() && reply_msg.is_none() {
+        return;
     }
+    for target in targets {
+        if let Some(ref m) = prompt_msg {
+            let _ = manager.send_to_target(target_ref(&target), m).await;
+        }
+        if let Some(ref m) = reply_msg {
+            let _ = manager.send_to_target(target_ref(&target), m).await;
+        }
+    }
+}
+
+/// 单纯的引用透传(让上面的循环里两次借用同一个 target 读起来清爽)。
+fn target_ref(t: &ChannelMessageTarget) -> &ChannelMessageTarget {
+    t
 }
 
 async fn clear_session_route(
@@ -1579,8 +1601,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 1, "exactly one line, got {msgs:?}");
@@ -1595,7 +1616,8 @@ mod async_relay_dedup_tests {
         let (bridge, chat, rec) = harness().await;
         let conn = ConnectionManager::new();
         let db = test_helpers::fresh_in_memory_db().await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
         // The later terminal update carries raw_input (re-creating the old
         // input-map token) AND terminal output.
         handle_acp_envelope(
@@ -1604,8 +1626,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(
@@ -1629,10 +1650,10 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 2, "ack + result, got {msgs:?}");
         assert!(msgs[0].contains("running in background"));
@@ -1646,7 +1667,8 @@ mod async_relay_dedup_tests {
         let (bridge, chat, rec) = harness().await;
         let conn = ConnectionManager::new();
         let db = test_helpers::fresh_in_memory_db().await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
         // Host re-emits the running ack after completion, with raw_input.
         handle_acp_envelope(
             &completed_update(ACK, true),
@@ -1654,8 +1676,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 1, "no stale ack after the result, got {msgs:?}");
@@ -1676,8 +1697,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 1, "one failure line, got {msgs:?}");
@@ -1719,7 +1739,8 @@ mod async_relay_dedup_tests {
                 session_id: "S1".into(),
             },
         };
-        handle_acp_envelope(&started, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&started, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
 
         assert_eq!(
             bridge
@@ -1760,7 +1781,8 @@ mod async_relay_dedup_tests {
                 agent_type: "claude".into(),
             },
         };
-        handle_acp_envelope(&complete, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&complete, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
 
         assert!(
             bridge
@@ -1898,7 +1920,8 @@ mod error_terminal_gate_tests {
                 session_id: "S2".to_string(),
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &emitter).await;
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &emitter, &mut std::collections::HashMap::new())
+        .await;
 
         // The bound row advanced; the old session kept a row of its own.
         let rows = conversation::Entity::find()
@@ -2017,8 +2040,7 @@ mod error_terminal_gate_tests {
             &ChatChannelManager::new(),
             &conn_mgr,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
 
         assert!(
@@ -2054,8 +2076,7 @@ mod error_terminal_gate_tests {
             &ChatChannelManager::new(),
             &conn_mgr,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
         assert!(
             !matches!(cmd_rx.try_recv(), Ok(ConnectionCommand::Prompt { .. })),
@@ -2146,8 +2167,7 @@ mod error_terminal_gate_tests {
             &ChatChannelManager::new(),
             &conn_mgr,
             &db.conn,
-            &EventEmitter::Noop,
-        )
+            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
         .await;
 
         assert!(
@@ -2188,7 +2208,8 @@ mod error_terminal_gate_tests {
                 terminal: false,
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
 
         // Session bridge entry is preserved — the next user message on the
         // same connection can still flow through it.
@@ -2221,7 +2242,8 @@ mod error_terminal_gate_tests {
                 terminal: true,
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &EventEmitter::Noop).await;
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        .await;
 
         assert!(
             bridge.lock().await.get("c-term").is_none(),
