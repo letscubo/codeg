@@ -9659,10 +9659,12 @@ pub(crate) async fn build_session_runtime_env(
 /// Per-launch env keys that vary by session/run but don't represent user
 /// config, so they're excluded from the config fingerprint. Without this, a
 /// session-id-derived value would flip the fingerprint the moment a real
-/// session id is assigned and make every session look "stale". Currently only
-/// OpenClaw's reset flag (set iff `session_id` is None at spawn).
+/// session id is assigned and make every session look "stale". OpenClaw's
+/// reset flag (set iff `session_id` is None at spawn) and its per-connection
+/// gateway session key (pinned per conversation via `acp_connect`'s
+/// runtime_env overlay) both qualify.
 fn is_volatile_fingerprint_key(key: &str) -> bool {
-    key == "OPENCLAW_RESET_SESSION"
+    key == "OPENCLAW_RESET_SESSION" || key == "OPENCLAW_SESSION_KEY"
 }
 
 /// Fingerprint the effective config a spawned agent process is locked to: the

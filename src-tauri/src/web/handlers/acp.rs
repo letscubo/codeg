@@ -72,6 +72,18 @@ pub struct AcpConnectParams {
     pub preferred_mode_id: Option<String>,
     #[serde(default)]
     pub preferred_config_values: Option<BTreeMap<String, String>>,
+    /// Per-CONNECTION env overlay, merged over the agent-setting env after
+    /// `build_session_runtime_env`. For values that belong to one launch —
+    /// e.g. `OPENCLAW_SESSION_KEY` pinning one conversation to one gateway
+    /// session. Writing such per-conversation values into the GLOBAL
+    /// agent-setting env (the previous workaround, MyClaw web's agent/open)
+    /// bled across surfaces: every openclaw spawn — Telegram channel bridges
+    /// included — attached the same gateway session, and each new
+    /// conversation's `--reset-session` wiped the shared context for
+    /// everyone (D6, 2026-08-30: 7h-old telegram conversation resumed with
+    /// total amnesia).
+    #[serde(default)]
+    pub runtime_env: Option<BTreeMap<String, String>>,
 }
 
 pub async fn acp_connect(
@@ -81,7 +93,7 @@ pub async fn acp_connect(
     let db = &state.db;
     let manager = &state.connection_manager;
 
-    let runtime_env = acp_commands::build_session_runtime_env(
+    let mut runtime_env = acp_commands::build_session_runtime_env(
         db,
         params.agent_type,
         params.session_id.as_deref(),
@@ -89,6 +101,15 @@ pub async fn acp_connect(
     )
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    // Per-connection overlay wins over the agent-setting env (see
+    // AcpConnectParams::runtime_env). Keys like OPENCLAW_SESSION_KEY are
+    // per-launch by nature and excluded from the config fingerprint, so an
+    // overlay can't make sessions look stale after a settings save.
+    if let Some(extra) = params.runtime_env {
+        for (k, v) in extra {
+            runtime_env.insert(k, v);
+        }
+    }
 
     // Guard: the session page must never trigger a download or install.
     // If the agent isn't ready, return SdkNotInstalled here so the frontend
