@@ -268,6 +268,46 @@ pub async fn seed_auto_title_if_empty(
     Ok(res.rows_affected > 0)
 }
 
+/// Write the session's `model` ONLY when the row still has none. The sibling
+/// of [`seed_auto_title_if_empty`], and for the same reason: a conversation
+/// row is inserted before the agent has named a model, so the column is NULL
+/// for every session started in-app and only the transcript knows the answer.
+/// Without this the sidebar — which reads the row, not the transcript — could
+/// only show a model for imported sessions.
+///
+/// First value wins. The detail view re-reads the transcript on every open and
+/// stays exact, so the stored value is a cheap projection for the list rather
+/// than a second source of truth; re-writing it on every model switch would
+/// buy a row write per switch for a chip nobody reads mid-turn.
+///
+/// Returns `true` when a row was written so the caller can broadcast a sidebar
+/// upsert. Does not bump `updated_at` — the sidebar sorts on it, and merely
+/// opening a conversation must not float it to the top of Recent (same
+/// reasoning as [`update_pin`]).
+pub async fn seed_model_if_empty(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    model: &str,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(false);
+    }
+    let res = conversation::Entity::update_many()
+        .col_expr(conversation::Column::Model, Expr::value(model))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(
+            sea_orm::Condition::any()
+                .add(conversation::Column::Model.is_null())
+                .add(conversation::Column::Model.eq("")),
+        )
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
 /// Lock a row's title WITHOUT rewriting it. For a conversation whose name was
 /// typed by the user somewhere else — a work task's title, an automation's name
 /// — the seed passed to [`create`] already IS the name; all that's missing is
@@ -775,6 +815,13 @@ pub async fn bind_external_id(
                 // Release S1 first — the unique index leaves no other order.
                 let mut active: conversation::ActiveModel = current.into();
                 active.external_id = Set(Some(external_id.clone()));
+                // The model described the session being released, and `carried`
+                // has already taken it for the row that keeps S1's history. Left
+                // in place it would name S1's model on a row that is now S2 —
+                // and `seed_model_if_empty` only fills an EMPTY column, so
+                // nothing would ever correct it. Cleared, S2 seeds itself on its
+                // next open.
+                active.model = Set(None);
                 active.updated_at = Set(now);
                 active.update(txn).await?;
 
@@ -1010,6 +1057,64 @@ pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Res
     active.deleted_at = Set(Some(Utc::now()));
     active.update(conn).await?;
     Ok(())
+}
+
+/// Undo [`soft_delete`] for a conversation the user re-selected in the
+/// import picker. Returns `true` when this call is the one that brought the row
+/// back, `false` when it was already live (or is a delegation child, which is
+/// never a sidebar row) — so a caller can count restores without double-
+/// counting a concurrent one.
+///
+/// Deleting a conversation in codeg never touches the agent's own session file
+/// and never removes the row: it only stamps `deleted_at`. Everything needed to
+/// bring it back is therefore still on both sides, which is what makes restore
+/// a single conditional UPDATE rather than a re-insert — the conversation keeps
+/// its id, so bound tabs, token-usage rows and delegation children all still
+/// point at it.
+///
+/// Three columns move, and only these:
+/// * `deleted_at → NULL` — the restore itself.
+/// * `folder_id → folder_id` — the folder the import is landing this session's
+///   group in, which `add_folder` has just made live AND open. The row's own
+///   `folder_id` is deliberately NOT preserved: it may point at a folder the
+///   user has since removed or closed, and restoring into an invisible folder
+///   looks exactly like a restore that did not work. This is also the folder
+///   header the user checked the row under in the picker. (Live rows are still
+///   never moved — see `import_service::refresh_existing`; this applies only to
+///   a row being brought back.)
+/// * `status → pending_review` — the same status a fresh import lands on, and
+///   for the same reason: the sidebar's "show completed" filter defaults OFF,
+///   so a conversation restored as `completed` would come back invisible.
+///
+/// `updated_at` is deliberately left alone: a restore is not activity, and the
+/// caller's `refresh_external_activity` pass adopts the transcript's real
+/// last-activity time right after, so the row sorts where it belongs.
+///
+/// The `deleted_at IS NOT NULL` guard is re-evaluated by the database at write
+/// time, so a row that was un-deleted between the caller's read and this write
+/// is not clobbered back to `pending_review`.
+pub async fn restore_soft_deleted(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    folder_id: i32,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    let res = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::DeletedAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
+        .col_expr(conversation::Column::FolderId, Expr::value(folder_id))
+        .col_expr(
+            conversation::Column::Status,
+            Expr::value(conversation::ConversationStatus::PendingReview),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_not_null())
+        .filter(conversation::Column::ParentId.is_null())
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected > 0)
 }
 
 fn parse_agent_type(s: &str) -> AgentType {
@@ -1501,6 +1606,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_model_fills_an_empty_column_once_without_bumping_updated_at() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-seed-model").await;
+        let conv = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("c".into()),
+            None,
+        )
+        .await
+        .expect("create");
+
+        // The gap this closes: a row created in-app carries no model at all,
+        // which is why the sidebar could only ever show one for imported
+        // sessions.
+        let before = get_by_id(&db.conn, conv.id).await.expect("get before");
+        assert!(before.model.is_none(), "a new row names no model");
+        let updated_at_before = before.updated_at;
+
+        assert!(
+            seed_model_if_empty(&db.conn, conv.id, "  gpt-5-codex  ")
+                .await
+                .expect("seed"),
+            "an empty column must be filled, and report that it was so the \
+             caller knows to broadcast"
+        );
+        let seeded = get_by_id(&db.conn, conv.id).await.expect("get seeded");
+        assert_eq!(seeded.model.as_deref(), Some("gpt-5-codex"), "trimmed");
+        assert_eq!(
+            seeded.updated_at, updated_at_before,
+            "seeding must not bump updated_at: the sidebar sorts on it, and \
+             merely opening a conversation must not float it to the top"
+        );
+
+        // First value wins. The detail view re-reads the transcript and stays
+        // exact; the column is a projection for the list, not a second source
+        // of truth that fights the parse.
+        assert!(
+            !seed_model_if_empty(&db.conn, conv.id, "gpt-5.2")
+                .await
+                .expect("second seed"),
+            "a populated column must be left alone, and say nothing was written"
+        );
+        assert_eq!(
+            get_by_id(&db.conn, conv.id)
+                .await
+                .expect("get after")
+                .model
+                .as_deref(),
+            Some("gpt-5-codex")
+        );
+
+        // A transcript that names no model asks for no write at all.
+        assert!(
+            !seed_model_if_empty(&db.conn, conv.id, "   ")
+                .await
+                .expect("blank seed")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_model_skips_a_soft_deleted_row() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-seed-model-deleted").await;
+        let conv = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("c".into()),
+            None,
+        )
+        .await
+        .expect("create");
+        soft_delete(&db.conn, conv.id).await.expect("delete");
+
+        assert!(
+            !seed_model_if_empty(&db.conn, conv.id, "gpt-5-codex")
+                .await
+                .expect("seed"),
+            "a deleted conversation is not something an open can resurrect a \
+             column on"
+        );
+    }
+
+    #[tokio::test]
     async fn update_pin_sets_and_clears_without_bumping_updated_at() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-update-pin").await;
@@ -1639,6 +1830,9 @@ mod tests {
         bind_external_id(&db.conn, row.id, "S1", &[])
             .await
             .expect("first bind");
+        seed_model_if_empty(&db.conn, row.id, "gpt-5-codex")
+            .await
+            .expect("seed S1's model");
         let before = raw_row(&db.conn, row.id).await;
 
         let preserved_id = bind_external_id(&db.conn, row.id, "S2", &[])
@@ -1652,6 +1846,12 @@ mod tests {
             Some("S2"),
             "the live row advances to the new session"
         );
+        assert!(
+            current.model.is_none(),
+            "the model described S1; left behind it would name S1's model on a \
+             row that is now S2, and `seed_model_if_empty` only fills an EMPTY \
+             column, so nothing would ever correct it"
+        );
 
         let preserved = raw_row(&db.conn, preserved_id).await;
         assert_eq!(preserved.external_id.as_deref(), Some("S1"));
@@ -1663,6 +1863,11 @@ mod tests {
         assert_eq!(preserved.folder_id, before.folder_id);
         assert_eq!(preserved.agent_type, before.agent_type);
         assert_eq!(preserved.git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            preserved.model.as_deref(),
+            Some("gpt-5-codex"),
+            "the model belongs to S1, and this row is what S1 becomes"
+        );
         assert_eq!(
             preserved.created_at, before.created_at,
             "created_at is carried, not stamped now — the preserved row IS the \

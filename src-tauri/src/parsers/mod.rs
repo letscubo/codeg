@@ -31,6 +31,17 @@ pub struct ExternalSource {
     /// Live source path (a directory, or a single file when `is_file`).
     pub root: PathBuf,
     pub is_file: bool,
+    /// This source's `.db` files are SQLite databases owned by the agent CLI.
+    ///
+    /// Backup then snapshots each one with a read-only page copy — never
+    /// `VACUUM` (it renumbers implicit rowids, and we cannot audit a
+    /// third-party schema for tables that treat rowid as a key) and never a
+    /// read-write open (that runs WAL recovery inside someone else's live
+    /// store). Exactly one self-contained file per database enters the
+    /// archive, never a `-wal`/`-shm`; restore deletes the live sidecars
+    /// before the rename so a stale WAL can never be replayed onto a database
+    /// it does not belong to. See `commands::backup::external`.
+    pub sqlite: bool,
     /// When `Some`, only entries whose first path component (relative to
     /// `root`) is in this allowlist are archived. Used to keep the backup to
     /// transcript/session data and exclude sibling credential/config/cache
@@ -63,12 +74,14 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "claude",
             root: claude::resolve_claude_config_dir().join("projects"),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
             agent: "codex",
             root: codex::resolve_codex_home_dir().join("sessions"),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
@@ -77,30 +90,33 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "gemini",
             root: gemini::resolve_gemini_base_dir(),
             is_file: false,
+            sqlite: false,
             include_top: Some(&["tmp", "history", "projects.json"]),
         },
         ExternalSource {
             agent: "cline",
             root: cline::cline_data_dir(),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
             agent: "opencode",
             root: opencode::resolve_opencode_base_dir().join("opencode.db"),
             is_file: true,
+            sqlite: true,
             include_top: None,
         },
         ExternalSource {
             // Hermes self-manages its session store at `~/.hermes/state.db`.
-            // WAL caveat: `is_file` archives only the main DB file, not the
-            // `-wal`/`-shm` sidecars, so a cold backup taken mid-write can miss
-            // the newest un-checkpointed frames (same known limitation as
-            // OpenCode). This does NOT affect live reads — the parser's `mode=ro`
-            // connection sees committed WAL frames.
+            // `sqlite: true` is what makes the backup carry the frames that
+            // only exist in the WAL: the store is page-copied through a
+            // read-only connection into one self-contained archive entry,
+            // rather than the raw main file being copied and its WAL dropped.
             agent: "hermes",
             root: hermes::resolve_hermes_home_dir().join("state.db"),
             is_file: true,
+            sqlite: true,
             include_top: None,
         },
         ExternalSource {
@@ -110,6 +126,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "codebuddy",
             root: codebuddy::resolve_codebuddy_config_dir().join("projects"),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
@@ -121,6 +138,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "kimi-code",
             root: kimi_code::resolve_kimi_code_home_dir(),
             is_file: false,
+            sqlite: false,
             include_top: Some(&["sessions", "session_index.jsonl"]),
         },
         ExternalSource {
@@ -132,6 +150,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "grok",
             root: grok::resolve_grok_home_dir().join("sessions"),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
@@ -144,6 +163,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "cursor",
             root: cursor::resolve_cursor_config_dir(),
             is_file: false,
+            sqlite: true,
             include_top: Some(&["chats", "acp-sessions"]),
         },
         ExternalSource {
@@ -155,6 +175,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "pi",
             root: pi::resolve_pi_sessions_dir(),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
@@ -166,6 +187,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "deepseek",
             root: deepseek::resolve_deepseek_sessions_root(),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
@@ -192,6 +214,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "deepseek-attachments",
             root: deepseek::resolve_deepseek_attachments_root(),
             is_file: false,
+            sqlite: false,
             include_top: Some(&["objects"]),
         },
         ExternalSource {
@@ -203,6 +226,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "qoder",
             root: qoder::resolve_qoder_config_dir().join("projects"),
             is_file: false,
+            sqlite: false,
             include_top: None,
         },
         ExternalSource {
@@ -215,6 +239,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "antigravity",
             root: antigravity::resolve_antigravity_sessions_dir(),
             is_file: false,
+            sqlite: true,
             include_top: None,
         },
     ];
@@ -223,6 +248,7 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "openclaw",
             root: home.join(".openclaw").join("agents"),
             is_file: false,
+            sqlite: false,
             include_top: None,
         });
     }
@@ -233,8 +259,8 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 
 use crate::models::{
-    ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, SessionStats, TurnRole,
-    TurnUsage,
+    AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, SessionStats,
+    TurnRole, TurnUsage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +280,141 @@ pub enum ParseError {
 pub trait AgentParser {
     fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError>;
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError>;
+}
+
+/// The ONE place a history parser is constructed.
+///
+/// Every caller goes through here so the internal `@agent` routing frame is
+/// stripped from every agent's history — not just the one agent whose parser
+/// happens to know about it. `codeg-mcp` is injected into every MCP-capable
+/// agent, so the frame lands in each of their native transcripts; a per-parser
+/// fix would silently miss whichever parser was written next.
+pub fn build_agent_parser(agent_type: AgentType) -> Box<dyn AgentParser> {
+    let inner: Box<dyn AgentParser> = match agent_type {
+        AgentType::ClaudeCode => Box::new(claude::ClaudeParser::new()),
+        AgentType::Codex => Box::new(codex::CodexParser::new()),
+        AgentType::OpenCode => Box::new(opencode::OpenCodeParser::new()),
+        AgentType::Gemini => Box::new(gemini::GeminiParser::new()),
+        AgentType::OpenClaw => Box::new(openclaw::OpenClawParser::new()),
+        AgentType::Cline => Box::new(cline::ClineParser::new()),
+        AgentType::Hermes => Box::new(hermes::HermesParser::new()),
+        AgentType::CodeBuddy => Box::new(codebuddy::CodeBuddyParser::new()),
+        AgentType::KimiCode => Box::new(kimi_code::KimiCodeParser::new()),
+        AgentType::Pi => Box::new(pi::PiParser::new()),
+        AgentType::Grok => Box::new(grok::GrokParser::new()),
+        AgentType::Cursor => Box::new(cursor::CursorParser::new()),
+        AgentType::DeepSeek => Box::new(deepseek::DeepSeekParser::new()),
+        AgentType::Qoder => Box::new(qoder::QoderParser::new()),
+        AgentType::Antigravity => Box::new(antigravity::AntigravityParser::new()),
+        // Custom ACP agents have no native store to reverse-engineer; their
+        // history is codeg's own ACP transcript.
+        AgentType::Custom(_) => Box::new(acp_native::AcpNativeParser::new(agent_type)),
+    };
+    Box::new(RouteSanitized(inner))
+}
+
+/// Removes Codeg's internal `@agent` routing frame from whatever a parser read
+/// back out of an agent's own transcript.
+///
+/// Only complete frames that re-render byte-for-byte are touched (see
+/// [`crate::acp::agent_mentions::strip_internal_agent_routes`]), and the
+/// separator that opens one is scrubbed from every prompt at ingress, so
+/// look-alike user prose is never eligible. A BLOCK left with no content after
+/// stripping carried nothing but the frame and is dropped; a user turn left
+/// with no content at all was a transport-only record and is dropped rather
+/// than rendered as a phantom turn.
+///
+/// Not every agent hands the frame back the way it was sent: Antigravity's ACP
+/// server joins the prompt's text blocks with a space and replaces each
+/// separator with one, so its trajectory holds the frame's body with the
+/// separators gone. That form is matched on the body alone and removed here
+/// too — which is also why the [`sanitize_text`] trim below is not optional for
+/// those agents, since the spaces that replaced the separators survive the
+/// strip.
+///
+/// Dropping the emptied block — not just emptying it — is what keeps an
+/// `@`-mention turn from growing a blank band when it is reopened from history.
+/// `append_agent_routes` appends the frame as its OWN prompt block, and the
+/// parsers that keep one block per recorded text item (claude's
+/// `extract_user_content`, `acp_native`'s `prompt_blocks`) therefore hand back
+/// `[Text(prose), Text(frame)]`. Emptying the second in place left a zero-height
+/// text part that still takes a `space-y-4` gap in the bubble.
+///
+/// The Codex parser additionally handles route-only records STRUCTURALLY
+/// (canonical-channel coverage is positional and cannot be repaired after the
+/// fact); this pass is idempotent on top of that.
+struct RouteSanitized(Box<dyn AgentParser>);
+
+impl AgentParser for RouteSanitized {
+    fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
+        let mut summaries = self.0.list_conversations()?;
+        for summary in &mut summaries {
+            sanitize_summary(summary);
+        }
+        Ok(summaries)
+    }
+
+    fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
+        let mut detail = self.0.get_conversation(conversation_id)?;
+        let before = detail.turns.len();
+        detail.turns.retain_mut(|turn| {
+            if !matches!(turn.role, TurnRole::User) {
+                return true;
+            }
+            turn.blocks.retain_mut(|block| {
+                let ContentBlock::Text { text } = block else {
+                    return true;
+                };
+                // Only a block that actually HELD a frame is eligible to go: an
+                // empty text block a parser produced for some other reason is
+                // left exactly as it was found.
+                !(sanitize_text(text) && text.trim().is_empty())
+            });
+            // A turn whose ONLY content was the frame carried no user message.
+            !turn.blocks.iter().all(|block| match block {
+                ContentBlock::Text { text } => text.trim().is_empty(),
+                _ => false,
+            })
+        });
+        // Keep the count the sidebar shows in step with the turns actually
+        // rendered; the summary rides along inside the detail.
+        let dropped = (before - detail.turns.len()) as u32;
+        detail.summary.message_count = detail.summary.message_count.saturating_sub(dropped);
+        sanitize_summary(&mut detail.summary);
+        Ok(detail)
+    }
+}
+
+fn sanitize_summary(summary: &mut ConversationSummary) {
+    if let Some(title) = summary.title.as_mut() {
+        sanitize_text(title);
+        // Titles are capped by their parser BEFORE reaching here, so a frame can
+        // straddle the cut and survive `sanitize_text`, which only removes whole
+        // frames. Anything from a leftover marker on is truncated frame.
+        crate::acp::agent_mentions::cut_at_route_frame_marker(title);
+        if title.trim().is_empty() {
+            summary.title = None;
+        }
+    }
+}
+
+/// Strip every complete frame from `text`, reporting whether one was there.
+///
+/// The trailing trim only runs when a frame WAS removed, and it is load-bearing
+/// for the agents that join a prompt's text blocks into one record with a blank
+/// line: `strip_internal_agent_routes` absorbs a single newline adjacent to the
+/// frame, so `"prose\n\n<frame>"` comes back as `"prose\n"` — which
+/// `whitespace-pre-wrap` paints as an extra blank line under the message. Text
+/// with no frame in it is never touched.
+fn sanitize_text(text: &mut String) -> bool {
+    // Single scan short-circuit: history with no frame pays one memchr per
+    // string, not a parse attempt.
+    if !crate::acp::agent_mentions::contains_internal_agent_routes(text) {
+        return false;
+    }
+    *text = crate::acp::agent_mentions::strip_internal_agent_routes(text);
+    text.truncate(text.trim_end().len());
+    true
 }
 
 /// Expand a leading `~` in a relocation env var, for the agents whose OWN
@@ -740,7 +901,13 @@ pub fn infer_context_window_max_tokens(model: Option<&str>) -> Option<u64> {
         "gpt-4" => Some(8_192),
         "o3" | "o3-mini" | "o1" => Some(200_000),
         _ => {
-            if normalized.starts_with("gpt-5") {
+            // 258K is the *effective* window OpenAI's own catalog advertises for
+            // this whole generation: `context_window: 272000` with
+            // `effective_context_window_percent: 95`. gpt-6 shares that profile
+            // byte for byte (see `resources/codex/bundled-catalog.json`), so it
+            // rides the same lane rather than falling through to `None` and
+            // leaving those sessions with no context meter at all.
+            if normalized.starts_with("gpt-5") || normalized.starts_with("gpt-6") {
                 Some(258_000)
             } else if normalized.starts_with("gpt-4o")
                 || normalized.starts_with("gpt-4.1")
@@ -1299,6 +1466,370 @@ pub fn path_eq_for_matching(left: &str, right: &str) -> bool {
 }
 
 #[cfg(test)]
+mod route_sanitizer_tests {
+
+    use super::{AgentParser, ParseError, RouteSanitized};
+    use crate::acp::agent_mentions::append_agent_routes;
+    use crate::acp::types::PromptInputBlock;
+    use crate::models::{
+        AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, TurnRole,
+    };
+
+    /// The exact bytes `append_agent_routes` puts on the wire — the same thing
+    /// every MCP-capable agent then persists into its own transcript.
+    fn routing_frame(agent_wire: &str) -> String {
+        let mut blocks = vec![PromptInputBlock::Text {
+            text: format!("ask [@A](codeg://agent/{agent_wire}) to help"),
+        }];
+        append_agent_routes(&mut blocks, true);
+        match &blocks[1] {
+            PromptInputBlock::Text { text } => text.clone(),
+            _ => unreachable!("the routing block is text"),
+        }
+    }
+
+    fn turn(role: TurnRole, text: &str) -> MessageTurn {
+        MessageTurn {
+            id: format!("{role:?}-{}", text.len()),
+            role,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: "2026-03-01T10:00:00Z".parse().expect("valid timestamp"),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        agent_message_id: None,
+        }
+    }
+
+    fn summary(title: Option<&str>, message_count: u32) -> ConversationSummary {
+        ConversationSummary {
+            id: "conv-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            folder_path: None,
+            folder_name: None,
+            title: title.map(str::to_string),
+            started_at: "2026-03-01T10:00:00Z".parse().expect("valid timestamp"),
+            ended_at: None,
+            message_count,
+            model: None,
+            git_branch: None,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
+        }
+    }
+
+    struct Fixture {
+        summary: ConversationSummary,
+        turns: Vec<MessageTurn>,
+    }
+
+    impl AgentParser for Fixture {
+        fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
+            Ok(vec![self.summary.clone()])
+        }
+        fn get_conversation(&self, _id: &str) -> Result<ConversationDetail, ParseError> {
+            Ok(ConversationDetail {
+                summary: self.summary.clone(),
+                turns: self.turns.clone(),
+                session_stats: None,
+                transcript_watermark: None,
+            })
+        }
+    }
+
+    fn sanitized(fixture: Fixture) -> ConversationDetail {
+        RouteSanitized(Box::new(fixture))
+            .get_conversation("conv-1")
+            .expect("fixture parses")
+    }
+
+    /// A title is capped by its parser BEFORE it reaches the decorator, and the
+    /// cap has no idea where the frame starts. A short first prompt puts the cut
+    /// inside the frame, leaving an opening separator and half a descriptor with
+    /// no closing one — which the whole-frame strip pass will not touch.
+    #[test]
+    fn a_title_truncated_mid_frame_leaks_no_route_metadata() {
+        let frame = routing_frame("antigravity");
+        // Exactly what `acp_native::first_prompt_title` builds: the prompt's
+        // text blocks joined with no separator, then capped at 80.
+        let truncated = super::truncate_str(format!("hi{frame}").trim(), 80);
+        assert!(
+            truncated.contains('\u{001e}')
+                && !crate::acp::agent_mentions::contains_internal_agent_routes(&truncated),
+            "fixture must straddle the frame, or it proves nothing"
+        );
+
+        let fixture = || Fixture {
+            summary: summary(Some(&truncated), 1),
+            turns: vec![turn(TurnRole::User, &format!("hi\n{frame}"))],
+        };
+        assert_eq!(sanitized(fixture()).summary.title.as_deref(), Some("hi"));
+        // The sidebar reads the list path, which never sees the turns.
+        let listed = RouteSanitized(Box::new(fixture()))
+            .list_conversations()
+            .expect("fixture parses");
+        assert_eq!(listed[0].title.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn frames_are_stripped_from_any_agents_history_not_just_codex() {
+        // The whole point of the shared decorator: this fixture stands in for
+        // claude / gemini / opencode / … , none of which know about the frame.
+        let frame = routing_frame("antigravity");
+        let visible = "ask [@A](codeg://agent/antigravity) to help";
+        let detail = sanitized(Fixture {
+            summary: summary(Some(&format!("{visible}\n{frame}")), 2),
+            turns: vec![
+                turn(TurnRole::User, &format!("{visible}\n{frame}")),
+                turn(TurnRole::Assistant, "on it"),
+            ],
+        });
+
+        assert_eq!(detail.summary.title.as_deref(), Some(visible));
+        assert_eq!(detail.turns.len(), 2);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+        assert_eq!(detail.summary.message_count, 2);
+    }
+
+    /// The shape `append_agent_routes` ACTUALLY produces: the frame is its own
+    /// prompt block, so every parser that keeps one block per recorded text item
+    /// (claude's `extract_user_content`, `acp_native`'s `prompt_blocks`) hands
+    /// back two. Emptying the second in place used to leave a zero-height text
+    /// part that the transcript's `space-y-4` stack still gave a full gap — the
+    /// blank band under an `@`-mention bubble reopened from history.
+    #[test]
+    fn a_frame_in_its_own_block_leaves_no_empty_block_behind() {
+        let visible = "ask [@A](codeg://agent/claude_code) to help";
+        let mut user = turn(TurnRole::User, visible);
+        user.blocks.push(ContentBlock::Text {
+            text: routing_frame("claude_code"),
+        });
+        let detail = sanitized(Fixture {
+            summary: summary(Some(visible), 2),
+            turns: vec![user, turn(TurnRole::Assistant, "on it")],
+        });
+
+        assert_eq!(detail.turns.len(), 2);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+        assert_eq!(detail.summary.message_count, 2);
+    }
+
+    /// An agent that joins the prompt's text blocks with a BLANK line leaves the
+    /// strip one newline to spare (it absorbs a single adjacent one), and
+    /// `whitespace-pre-wrap` paints the survivor as an empty line under the
+    /// message — same symptom, different transcript shape.
+    #[test]
+    fn a_blank_line_before_the_frame_is_not_left_behind() {
+        let visible = "ask [@A](codeg://agent/codex) to help";
+        let frame = routing_frame("codex");
+        let detail = sanitized(Fixture {
+            summary: summary(Some(visible), 1),
+            turns: vec![turn(TurnRole::User, &format!("{visible}\n\n{frame}"))],
+        });
+
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+    }
+
+    /// Antigravity does not persist the prompt verbatim: its ACP server joins
+    /// the text blocks with a space and replaces each separator with one, so the
+    /// trajectory holds ONE block of prose with the frame trailing it and no
+    /// separator anywhere. The whole frame used to render inside the user's
+    /// bubble when such a session was reopened — and, sliced by the title cap,
+    /// inside the sidebar title as well.
+    #[test]
+    fn a_frame_an_agent_stored_without_separators_leaves_neither_prose_nor_title() {
+        let visible = "ask [@A](codeg://agent/antigravity) to help";
+        let frame = routing_frame("antigravity");
+        // ` ` block join + each separator rewritten to ` `.
+        let persisted = format!("{visible} {}", frame.replace('\u{001e}', " "));
+        assert!(!persisted.contains('\u{001e}'), "fixture must lose its separators");
+
+        // The title the parser hands over: folded, then capped mid-frame — the
+        // cap is 100 chars and the body alone runs past 500.
+        let capped = super::title_from_user_text(&persisted);
+        assert!(
+            capped.contains("codeg_internal_agent_routes"),
+            "fixture must straddle the frame, or the cut proves nothing"
+        );
+        let detail = sanitized(Fixture {
+            summary: summary(Some(&capped), 1),
+            turns: vec![turn(TurnRole::User, &persisted)],
+        });
+
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+        assert_eq!(detail.summary.title.as_deref(), Some("ask @A to help"));
+    }
+
+    /// The 100-char cap can land INSIDE the descriptor prefix rather than
+    /// before it, for any first prompt whose prose length falls in a 37-wide
+    /// band. A separator can never be halved that way, so this shape only
+    /// exists for the agents that rewrite the separators away.
+    #[test]
+    fn a_title_capped_halfway_through_the_marker_still_leaks_nothing() {
+        let prose = format!("{} ask [@A](codeg://agent/antigravity) to help", "x".repeat(66));
+        let frame = routing_frame("antigravity");
+        let persisted = format!("{prose} {}", frame.replace('\u{001e}', " "));
+
+        let capped = super::title_from_user_text(&persisted);
+        let marker = "{\"kind\":\"codeg_internal_agent_routes\"";
+        assert!(
+            capped.contains("{\"kind\":\"codeg") && !capped.contains(marker),
+            "the cap must land INSIDE the marker, or this repeats the previous \
+             test — got {capped:?}"
+        );
+
+        let detail = sanitized(Fixture {
+            summary: summary(Some(&capped), 1),
+            turns: vec![turn(TurnRole::User, &persisted)],
+        });
+        assert_eq!(
+            detail.summary.title.as_deref(),
+            Some(format!("{} ask @A to help", "x".repeat(66)).as_str())
+        );
+    }
+
+    #[test]
+    fn an_empty_block_the_parser_produced_itself_is_left_in_place() {
+        // The drop is scoped to blocks that HELD a frame. An empty text block
+        // from anywhere else is the parser's business, not this decorator's, and
+        // silently pruning it would hide a bug rather than fix one.
+        let mut user = turn(TurnRole::User, "real prompt");
+        user.blocks.push(ContentBlock::Text {
+            text: String::new(),
+        });
+        let detail = sanitized(Fixture {
+            summary: summary(Some("real prompt"), 1),
+            turns: vec![user],
+        });
+
+        assert_eq!(detail.turns[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn a_turn_whose_only_prose_was_the_frame_keeps_its_image() {
+        // Dropping the emptied block must not take the turn with it: an image
+        // pasted alongside an `@`-mention is the whole message.
+        let mut user = turn(TurnRole::User, &routing_frame("codex"));
+        user.blocks.push(ContentBlock::Image {
+            data: "QUJD".into(),
+            mime_type: "image/png".into(),
+            uri: None,
+        });
+        let detail = sanitized(Fixture {
+            summary: summary(None, 1),
+            turns: vec![user],
+        });
+
+        assert_eq!(detail.turns.len(), 1);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Image { .. }]
+        ));
+        assert_eq!(detail.summary.message_count, 1);
+    }
+
+    #[test]
+    fn a_route_only_user_turn_is_dropped_and_uncounted() {
+        // Some adapters persist each ACP text block as its own record; the
+        // transport-only one must not render as a phantom turn.
+        let detail = sanitized(Fixture {
+            summary: summary(Some("real prompt"), 3),
+            turns: vec![
+                turn(TurnRole::User, "real prompt"),
+                turn(TurnRole::User, &routing_frame("codex")),
+                turn(TurnRole::Assistant, "done"),
+            ],
+        });
+
+        assert_eq!(detail.turns.len(), 2);
+        assert_eq!(detail.summary.message_count, 2);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "real prompt"
+        ));
+    }
+
+    #[test]
+    fn assistant_turns_and_look_alike_user_prose_are_left_alone() {
+        // Only a complete frame that re-renders byte-for-byte is removed, so
+        // prose that merely resembles one stays verbatim, on both roles. The
+        // separator is scrubbed from every prompt at ingress, so prose a user
+        // can actually type is the tag text WITHOUT it.
+        let look_alike =
+            "see <codeg_internal_agent_routes version=\"2\">note</codeg_internal_agent_routes>";
+        // Each frame carries its own nonce, so capture ONE and compare to it.
+        let echoed = routing_frame("codex");
+        let detail = sanitized(Fixture {
+            summary: summary(Some(look_alike), 2),
+            turns: vec![
+                turn(TurnRole::User, look_alike),
+                turn(TurnRole::Assistant, &echoed),
+            ],
+        });
+
+        assert_eq!(detail.summary.title.as_deref(), Some(look_alike));
+        assert_eq!(detail.turns.len(), 2);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == look_alike
+        ));
+        assert!(matches!(
+            detail.turns[1].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == &echoed
+        ));
+    }
+
+    /// The cut is deliberately asymmetric, so pin both halves.
+    #[test]
+    fn only_a_title_is_cut_at_a_dangling_separator() {
+        // A parser caps a title but never a turn's text, so a lone separator is
+        // evidence of a sliced frame in the first case and not in the second.
+        let dangling = "see \u{001e}<codeg_internal_agent_routes version=\"2\">no";
+        let detail = sanitized(Fixture {
+            summary: summary(Some(dangling), 1),
+            turns: vec![turn(TurnRole::User, dangling)],
+        });
+
+        assert_eq!(detail.summary.title.as_deref(), Some("see"));
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == dangling
+        ));
+    }
+
+    #[test]
+    fn a_title_that_was_only_a_frame_falls_back_to_none() {
+        let detail = sanitized(Fixture {
+            summary: summary(Some(&routing_frame("codex")), 1),
+            turns: vec![turn(TurnRole::Assistant, "hi")],
+        });
+        assert_eq!(detail.summary.title, None);
+
+        let listed = RouteSanitized(Box::new(Fixture {
+            summary: summary(Some(&routing_frame("codex")), 1),
+            turns: Vec::new(),
+        }))
+        .list_conversations()
+        .expect("fixture lists");
+        assert_eq!(listed[0].title, None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use chrono::Utc;
 
@@ -1324,6 +1855,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: Some(base + chrono::Duration::seconds(end_s)),
+        agent_message_id: None,
         }
     }
 
@@ -1597,6 +2129,16 @@ mod tests {
             infer_context_window_max_tokens(Some("grok-7-experimental")),
             Some(256_000)
         );
+        // gpt-6 shares gpt-5's 272K/95% profile, so it takes the same effective
+        // window instead of falling through to `None`.
+        assert_eq!(
+            infer_context_window_max_tokens(Some("gpt-6-astra")),
+            Some(258_000)
+        );
+        assert_eq!(
+            infer_context_window_max_tokens(Some("gpt-5.6-sol")),
+            Some(258_000)
+        );
         assert_eq!(infer_context_window_max_tokens(Some("unknown-model")), None);
     }
 
@@ -1618,6 +2160,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+            agent_message_id: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -1633,6 +2176,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+            agent_message_id: None,
             },
         ];
 

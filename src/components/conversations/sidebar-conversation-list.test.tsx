@@ -52,7 +52,7 @@ const stableWorkspaceFns = vi.hoisted(() => ({
   refreshConversations: async () => {},
   updateConversationLocal: () => {},
   removeFolderFromWorkspace: async () => {},
-  reorderFolders: vi.fn(() => Promise.resolve()),
+  applySidebarLayout: vi.fn(() => Promise.resolve()),
   openFolder: async () => ({}) as FolderDetail,
   refreshFolder: async () => {},
 }))
@@ -183,7 +183,9 @@ vi.mock("next-themes", () => ({
 
 vi.mock("@/hooks/use-appearance", () => ({
   useThemeColor: () => ({ themeColor: "blue" }),
-  useZoomLevel: () => {},
+  // 100% — the folder-drag row height reads this, so the drag cases below
+  // measure against the same 32px row the real hook yields at that zoom.
+  useZoomLevel: () => ({ zoomLevel: 100, setZoomLevel: () => {} }),
 }))
 
 vi.mock("@/hooks/use-sorted-available-agents", () => ({
@@ -487,7 +489,7 @@ describe("SidebarConversationList — folder drag gesture", () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ now: FIXED })
-    stableWorkspaceFns.reorderFolders.mockClear()
+    stableWorkspaceFns.applySidebarLayout.mockClear()
     const folders = [folder(1, "F1"), folder(2, "F2"), folder(3, "F3")]
     useAppWorkspaceStore.setState({
       folders,
@@ -548,10 +550,37 @@ describe("SidebarConversationList — folder drag gesture", () => {
     await act(async () => {
       firePointer(window, "pointerup", { clientY: 40 })
     })
-    expect(stableWorkspaceFns.reorderFolders).toHaveBeenCalledTimes(1)
+    expect(stableWorkspaceFns.applySidebarLayout).toHaveBeenCalledTimes(1)
     // A middle slot — not the last — so this can only pass with correct
-    // surface-relative targeting, not the old bottom-clamp behavior.
-    expect(stableWorkspaceFns.reorderFolders).toHaveBeenCalledWith([2, 1, 3])
+    // surface-relative targeting, not the old bottom-clamp behavior. The wire
+    // format is the full layout: with no groups, three top-level folders.
+    expect(stableWorkspaceFns.applySidebarLayout).toHaveBeenCalledWith([
+      { kind: "folder", id: 2, groupId: null },
+      { kind: "folder", id: 1, groupId: null },
+      { kind: "folder", id: 3, groupId: null },
+    ])
+  })
+
+  it("reconciles the drop against a folder closed after the last pointer move", async () => {
+    render(tree())
+    dragFolderOneToSlotOne()
+    // Another window removes folder 3 from the workspace in the window between
+    // the last pointermove and the release. The RENDERED layout reconciles on
+    // every render, but the drop persists a snapshot taken at that last move —
+    // and `apply_sidebar_layout` is authoritative for every row it names, so
+    // writing the pre-removal view would silently undo the other window's
+    // change. The user's own move must still survive the reconcile.
+    act(() => {
+      const folders = [folder(1, "F1"), folder(2, "F2")]
+      useAppWorkspaceStore.setState({ folders, allFolders: folders })
+    })
+    await act(async () => {
+      firePointer(window, "pointerup", { clientY: 40 })
+    })
+    expect(stableWorkspaceFns.applySidebarLayout).toHaveBeenCalledWith([
+      { kind: "folder", id: 2, groupId: null },
+      { kind: "folder", id: 1, groupId: null },
+    ])
   })
 
   it("does not reorder when released right after crossing the threshold (before the surface can retarget)", async () => {
@@ -564,14 +593,14 @@ describe("SidebarConversationList — folder drag gesture", () => {
     await act(async () => {
       firePointer(window, "pointerup", { clientY: 200 })
     })
-    expect(stableWorkspaceFns.reorderFolders).not.toHaveBeenCalled()
+    expect(stableWorkspaceFns.applySidebarLayout).not.toHaveBeenCalled()
   })
 
   it("aborts without persisting on pointercancel", () => {
     render(tree())
     dragFolderOneToSlotOne()
     act(() => firePointer(window, "pointercancel", { clientY: 40 }))
-    expect(stableWorkspaceFns.reorderFolders).not.toHaveBeenCalled()
+    expect(stableWorkspaceFns.applySidebarLayout).not.toHaveBeenCalled()
   })
 
   it("aborts without persisting on Escape", () => {
@@ -582,7 +611,7 @@ describe("SidebarConversationList — folder drag gesture", () => {
         new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
       )
     })
-    expect(stableWorkspaceFns.reorderFolders).not.toHaveBeenCalled()
+    expect(stableWorkspaceFns.applySidebarLayout).not.toHaveBeenCalled()
   })
 
   it("does nothing when the press never crosses the drag threshold", async () => {
@@ -592,7 +621,7 @@ describe("SidebarConversationList — folder drag gesture", () => {
     await act(async () => {
       firePointer(window, "pointerup", { clientY: 103 })
     })
-    expect(stableWorkspaceFns.reorderFolders).not.toHaveBeenCalled()
+    expect(stableWorkspaceFns.applySidebarLayout).not.toHaveBeenCalled()
   })
 })
 
@@ -854,6 +883,22 @@ describe("SidebarConversationList — worktree grouping (Show worktrees)", () =>
       folders,
       allFolders: folders,
       conversations: [conv(11, 1), conv(12, 1), conv(21, 2)],
+      // The container's live HEAD, which labels its "root" sub-group. `gitHeads`
+      // has to be seeded too: it — not `branches` — is what makes the list's
+      // `ensureGitHead` call short-circuit, and without it every render here
+      // would fire a real transport read.
+      branches: new Map([[1, "main"]]),
+      gitHeads: new Map([
+        [
+          1,
+          {
+            is_repo: true,
+            branch: "main",
+            detached: false,
+            short_sha: "abc1234",
+          },
+        ],
+      ]),
     })
   })
 
@@ -891,6 +936,31 @@ describe("SidebarConversationList — worktree grouping (Show worktrees)", () =>
     expect(iWtConv).toBeGreaterThan(iBranch)
     // Exactly one container header (FolderOpen) + one root sub-group (FolderRoot).
     expect(probes.folder).toBe(1)
+    expect(probes.root).toBe(1)
+  })
+
+  it("labels the root sub-group with the container's live branch", () => {
+    render(wtTree(true))
+    // The main worktree's branch, in the same `branch [ name ]` shape the
+    // worktree sibling below it uses — so the subtree reads as one column of
+    // branches rather than one anonymous "root" above a list of them.
+    expect(document.body.textContent).toContain("main [ root ]")
+  })
+
+  it("falls back to a bare 'root' when the container's HEAD is unknown", () => {
+    // Detached HEAD, a non-repo, or simply not resolved yet. The label degrades
+    // to the plain word rather than rendering empty brackets.
+    useAppWorkspaceStore.setState({
+      branches: new Map([[1, null]]),
+      gitHeads: new Map([
+        [1, { is_repo: true, branch: null, detached: true, short_sha: "abc" }],
+      ]),
+    })
+    render(wtTree(true))
+    const text = document.body.textContent ?? ""
+    expect(text).not.toContain("[ root ]")
+    // Still present as its own sub-group — this is a label fallback, not a
+    // missing row (the glyph probe is the unambiguous check).
     expect(probes.root).toBe(1)
   })
 
@@ -1092,6 +1162,141 @@ describe("SidebarConversationList — Recent section", () => {
       Array.from(document.querySelectorAll("[data-conversation-id]"))
     ).toHaveLength(2)
   })
+
+  describe("paging", () => {
+    // `recentLimit` starts at RECENT_PAGE_SIZE and only ever grew, so a list
+    // expanded a few pages deep stayed that way for the rest of the session.
+    // These cover the way back out.
+    const PAGE = 15
+    const TOTAL = PAGE + 4
+
+    // Recent duplicates every canonical row, so total cards = canonical + recent
+    // slice. Counting the Recent slice alone keeps the assertions readable.
+    const recentRowCount = () =>
+      Array.from(document.querySelectorAll("[data-conversation-id]")).length -
+      TOTAL
+
+    const buttonWithText = (text: string) =>
+      Array.from(document.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes(text)
+      )
+    const resetButton = () =>
+      Array.from(document.querySelectorAll("button")).find(
+        (b) => b.getAttribute("aria-label") === resetLabel
+      )
+
+    const showMoreLabel = (count: number) =>
+      enMessages.Folder.sidebar.showMoreRecent.replace("{count}", String(count))
+    const resetLabel = enMessages.Folder.sidebar.resetRecentLimit.replace(
+      "{count}",
+      String(PAGE)
+    )
+
+    beforeEach(() => {
+      // The collapse test above persists `{recent: true}` into
+      // `workspace:sidebar-section-collapsed`, and the list hydrates from it —
+      // leave it and this whole section renders collapsed (zero rows).
+      localStorage.clear()
+      const folders = [folder(1, "Repo")]
+      useAppWorkspaceStore.setState({
+        folders,
+        allFolders: folders,
+        conversations: Array.from({ length: TOTAL }, (_, i) => conv(i + 1, 1)),
+      })
+    })
+
+    it("folds a multi-page list back to the first page", () => {
+      render(recentTree(true))
+      expect(recentRowCount()).toBe(PAGE)
+      // No reset on an untouched first page — there is nothing to fold back.
+      expect(resetButton()).toBeUndefined()
+
+      act(() => {
+        fireEvent.click(buttonWithText(showMoreLabel(TOTAL - PAGE))!)
+      })
+      expect(recentRowCount()).toBe(TOTAL)
+
+      // Everything is out, so the footer survives as a reset-only row: the
+      // "show more" label is gone but the row itself is still the way back.
+      expect(buttonWithText(showMoreLabel(0))).toBeUndefined()
+      act(() => {
+        fireEvent.click(buttonWithText(resetLabel)!)
+      })
+      expect(recentRowCount()).toBe(PAGE)
+    })
+
+    it("offers the reset at the row's right edge while pages remain", () => {
+      // 3 pages' worth, so one "show more" click still leaves a remainder and
+      // the footer keeps both affordances at once.
+      const conversations = Array.from({ length: PAGE * 3 }, (_, i) =>
+        conv(i + 1, 1)
+      )
+      useAppWorkspaceStore.setState({ conversations })
+      render(recentTree(true))
+
+      act(() => {
+        fireEvent.click(buttonWithText(showMoreLabel(PAGE * 2))!)
+      })
+      const recentRows = () =>
+        Array.from(document.querySelectorAll("[data-conversation-id]")).length -
+        conversations.length
+      expect(recentRows()).toBe(PAGE * 2)
+      // Still more to reveal…
+      expect(buttonWithText(showMoreLabel(PAGE))).toBeDefined()
+      // …and the icon-only reset is a SIBLING of the row button, not nested
+      // (buttons cannot nest) — so it is reachable on its own.
+      const reset = resetButton()
+      expect(reset).toBeDefined()
+      expect(reset!.querySelector("button")).toBeNull()
+
+      act(() => {
+        fireEvent.click(reset!)
+      })
+      expect(recentRows()).toBe(PAGE)
+    })
+
+    it("keeps keyboard focus on the footer through a reset", () => {
+      // The icon reset unmounts itself on activation, so without an explicit
+      // hand-off focus falls to <body> — a keyboard user lands back at the top
+      // of the document. Covers both variants: the icon (which disappears) and
+      // the reset-only row (whose button survives as "show more").
+      useAppWorkspaceStore.setState({
+        conversations: Array.from({ length: PAGE * 3 }, (_, i) =>
+          conv(i + 1, 1)
+        ),
+      })
+      render(recentTree(true))
+      act(() => {
+        fireEvent.click(buttonWithText(showMoreLabel(PAGE * 2))!)
+      })
+
+      const icon = resetButton()!
+      act(() => {
+        icon.focus()
+        fireEvent.click(icon)
+      })
+      expect(document.activeElement).not.toBe(document.body)
+      const footer = buttonWithText(showMoreLabel(PAGE * 2))!
+      expect(document.activeElement).toBe(footer)
+
+      // Now the reset-only variant: reveal everything, then reset from the row.
+      act(() => {
+        fireEvent.click(buttonWithText(showMoreLabel(PAGE * 2))!)
+      })
+      act(() => {
+        fireEvent.click(buttonWithText(showMoreLabel(PAGE))!)
+      })
+      const rowReset = buttonWithText(resetLabel)!
+      act(() => {
+        rowReset.focus()
+        fireEvent.click(rowReset)
+      })
+      expect(document.activeElement).not.toBe(document.body)
+      expect(document.activeElement).toBe(
+        buttonWithText(showMoreLabel(PAGE * 2))
+      )
+    })
+  })
 })
 
 describe("SidebarConversationList — expand / collapse all", () => {
@@ -1203,5 +1408,179 @@ describe("SidebarConversationList — expand / collapse all", () => {
 
     expect(localStorage.getItem(SECTION_COLLAPSED_KEY)).toBe(afterFirst)
     for (const label of ALL_SECTIONS) expect(expandedOf(label)).toBe("false")
+  })
+})
+
+describe("SidebarConversationList — folder groups", () => {
+  function group(
+    id: number,
+    name: string,
+    sortOrder: number,
+    color = "inherit"
+  ) {
+    return { id, name, color, sort_order: sortOrder }
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: FIXED })
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("renders a group heading and nests its member folder under it", () => {
+    // sort_order 1/2/3 across the shared top-level space: loose folder, then
+    // the group, then another loose folder — the interleaving the feature is for.
+    const folders = [
+      { ...folder(1, "Loose A"), sort_order: 1, group_id: null },
+      { ...folder(5, "Member"), sort_order: 1, group_id: 7 },
+      { ...folder(9, "Loose B"), sort_order: 3, group_id: null },
+    ] as FolderDetail[]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      folderGroups: [group(7, "Work", 2)],
+      conversations: [],
+    })
+    const { getByText, container } = render(tree())
+
+    expect(getByText("Work")).not.toBeNull()
+    // Rendered order follows the shared sort_order space, not "groups last".
+    const labels = Array.from(
+      container.querySelectorAll("[data-folder-id], [data-folder-group-id]")
+    ).map((el) =>
+      el.getAttribute("data-folder-group-id")
+        ? `group:${el.getAttribute("data-folder-group-id")}`
+        : `folder:${el.getAttribute("data-folder-id")}`
+    )
+    expect(labels).toEqual(["folder:1", "group:7", "folder:5", "folder:9"])
+  })
+
+  it("shows the empty hint for a group with no folders", () => {
+    useAppWorkspaceStore.setState({
+      folders: [],
+      allFolders: [],
+      folderGroups: [group(7, "Work", 1)],
+      conversations: [conv(11, 1)],
+    })
+    const { getByText } = render(tree())
+    // A freshly created group is empty and must still render something to
+    // drag into.
+    expect(getByText("No folders in this group")).not.toBeNull()
+  })
+
+  it("collapsing a group hides its members and persists the state", () => {
+    const folders = [
+      { ...folder(5, "Member"), sort_order: 1, group_id: 7 },
+    ] as FolderDetail[]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      folderGroups: [group(7, "Work", 1)],
+      conversations: [],
+    })
+    const { container, getByText } = render(tree())
+    expect(container.querySelector('[data-folder-id="5"]')).not.toBeNull()
+
+    act(() => {
+      fireEvent.click(getByText("Work"))
+    })
+    expect(container.querySelector('[data-folder-id="5"]')).toBeNull()
+    expect(
+      JSON.parse(
+        localStorage.getItem("workspace:sidebar-folder-group-expanded") ?? "{}"
+      )
+    ).toEqual({ 7: false })
+  })
+
+  // The heading's badge counts RUNNING sessions across the whole group (the
+  // folder header's badge, one level up) — not how many folders it holds.
+  function groupWith(
+    members: number[],
+    conversations: DbConversationSummary[],
+    groupColor = "inherit"
+  ) {
+    // The collapse test above persists `{7: false}` and nothing clears
+    // localStorage between tests, so a group seeded here would start collapsed
+    // (members hidden) purely because of test order.
+    localStorage.removeItem("workspace:sidebar-folder-group-expanded")
+    const folders = members.map(
+      (id, i) =>
+        ({
+          ...folder(id, `Member ${id}`),
+          sort_order: i + 1,
+          group_id: 7,
+        }) as FolderDetail
+    )
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      folderGroups: [group(7, "Work", 1, groupColor)],
+      conversations,
+    })
+  }
+
+  it("badges the group with the running sessions of ALL its folders", () => {
+    groupWith(
+      [5, 6],
+      [
+        conv(11, 5, { status: "in_progress" }),
+        conv(12, 5, { status: "done" }),
+        conv(13, 6, { status: "in_progress" }),
+      ]
+    )
+    const { container } = render(tree())
+
+    const heading = container.querySelector('[data-folder-group-id="7"]')
+    expect(heading?.textContent).toContain("2")
+    // Same label the folder headers use, so the two badges read as one signal.
+    expect(
+      heading?.querySelector('[title="2 sessions running"]')
+    ).not.toBeNull()
+  })
+
+  it("renders no group badge when nothing in it is running", () => {
+    groupWith([5], [conv(11, 5, { status: "done" })])
+    const { container } = render(tree())
+
+    const heading = container.querySelector('[data-folder-group-id="7"]')
+    expect(heading?.textContent).toBe("Work")
+  })
+
+  // A folder / group colour is a label for the ROW, not a skin for the sessions
+  // under it: the list must not wrap anything in a `data-theme` scope any more.
+  it("never re-themes conversation cards with the folder colour", () => {
+    groupWith([5], [conv(11, 5)])
+    const { container } = render(tree())
+
+    expect(container.querySelector("[data-conversation-id]")).not.toBeNull()
+    expect(container.querySelectorAll("[data-theme]")).toHaveLength(0)
+  })
+
+  // The colour lands on the title text of both row kinds, through the same
+  // mechanism, so a group and a folder tint identically.
+  it("tints the group and folder titles with the chosen colour", () => {
+    groupWith([5], [], "red")
+    const { getByText } = render(tree())
+
+    // `folder()` seeds every folder as "blue".
+    for (const title of [getByText("Member 5"), getByText("Work")]) {
+      expect(title.className).toContain("folder-title-tint")
+      expect(title.className).not.toContain("text-sidebar-foreground/")
+      const style = title.getAttribute("style") ?? ""
+      expect(style).toContain("--folder-title-light")
+      expect(style).toContain("--folder-title-dark")
+    }
+  })
+
+  // `inherit` is the default, and it must stay on the plain sidebar colour —
+  // the same one a folder title falls back to — rather than pick a tint.
+  it("leaves an uncoloured group title on the default sidebar colour", () => {
+    groupWith([5], [])
+    const title = render(tree()).getByText("Work")
+
+    expect(title.className).toContain("text-sidebar-foreground/75")
+    expect(title.className).not.toContain("folder-title-tint")
+    expect(title.getAttribute("style")).toBeNull()
   })
 })

@@ -190,6 +190,57 @@ fn apply_custom_version_to_url(url: &str, registry_version: &str, custom_version
     url.replace(registry_version, custom_version)
 }
 
+/// Per-agent `env_json` key that opts an npx agent into installing the
+/// package's `latest` npm dist-tag instead of the reviewed registry pin.
+/// Owned by the "Adapter version" control in Agent Settings, riding the same
+/// per-agent env store as pi's `PI_ACP_PI_COMMAND` runtime override and the
+/// host-tools knob. Consulted at install/upgrade time ONLY: a launch always
+/// runs whatever is installed, and nothing polls npm in the background.
+///
+/// Exactly the value `latest` opts in; absence or any other value stays on the
+/// pin. Unlike `CODEG_ACP_HOST_TOOLS` there is no process-env second layer to
+/// make "absent" ambiguous, so the settings control may delete the key for the
+/// pinned default — both readers (this one and `adapterChannelFromEnvText` in
+/// acp-agent-settings.tsx) treat absent as pinned.
+pub(crate) const ADAPTER_CHANNEL_ENV: &str = "CODEG_ADAPTER_CHANNEL";
+const ADAPTER_CHANNEL_LATEST: &str = "latest";
+
+/// Whether a resolved per-agent env opts into the `latest` adapter channel.
+/// Takes the MERGED env (`build_runtime_env_from_setting`) rather than raw
+/// `env_json`, so it reads the same layers the launch path and the settings
+/// page display — a value set through the agent's local config file counts too.
+fn adapter_channel_is_latest(env: &BTreeMap<String, String>) -> bool {
+    env.get(ADAPTER_CHANNEL_ENV)
+        .is_some_and(|value| value.trim() == ADAPTER_CHANNEL_LATEST)
+}
+
+/// The npm install spec(s) one prepare call will attempt, in order: the spec to
+/// try first, plus the fallback to retry on failure (at most one).
+///
+/// An explicit `version_override` (the Custom install dialog) always wins and
+/// never falls back — the user asked for that exact version, and quietly
+/// installing a different one would relabel their choice. With no override, a
+/// latest-channel agent tries the `latest` dist-tag first and keeps the pinned
+/// registry spec as the fallback, so npm being unreachable (or a mirror not
+/// yet carrying the tag's target) degrades to the reviewed pin instead of a
+/// failed install. The default stays byte-identical to `build_npm_install_spec`.
+fn npm_install_attempts(
+    package: &str,
+    version_override: Option<&str>,
+    latest_channel: bool,
+) -> Result<(String, Option<String>), AcpError> {
+    let pinned = build_npm_install_spec(package, version_override)?;
+    let overridden = version_override.is_some_and(|raw| !raw.trim().is_empty());
+    if latest_channel && !overridden {
+        let latest = format!(
+            "{}@{ADAPTER_CHANNEL_LATEST}",
+            package_name_from_spec(package)
+        );
+        return Ok((latest, Some(pinned)));
+    }
+    Ok((pinned, None))
+}
+
 /// Check whether an NPX agent command is spawnable.
 /// Uses PATH first, then falls back to the current npm global prefix to handle
 /// GUI environments that don't inherit the user's shell PATH.
@@ -3068,7 +3119,7 @@ fn import_existing_codex_catalog_source(codex_home: &Path) -> Option<String> {
     let root_model = toml_value.get("model").and_then(toml::Value::as_str);
     let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
     let config = crate::acp::codex_model_catalog::import_catalog(&catalog, root_model, &snapshot);
-    if crate::acp::codex_model_catalog::is_empty(&config) {
+    if crate::acp::codex_model_catalog::is_effectively_empty(&config, &snapshot) {
         return None;
     }
     serde_json::to_string(&config).ok()
@@ -3576,6 +3627,59 @@ fn is_absolute_config_path(value: &str) -> bool {
     }
 }
 
+/// Whether a `model_catalog_json` value points at the file codeg generates.
+/// Anything else is the user's OWN catalog — hand-written, or authored in the
+/// advanced config.toml editor — and codeg must never delete it. Resolved the
+/// way codex resolves the key, so an absolute path to codeg's own file counts
+/// as codeg-owned too. Unresolvable/foreign values answer `false`, which is the
+/// safe direction (leave the key alone).
+fn is_codeg_owned_catalog_ref(value: &str, codex_home: &Path) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    resolve_codex_home_relative(value, codex_home)
+        == codex_home.join(crate::acp::codex_model_catalog::CATALOG_REL)
+}
+
+/// Remove the root `model_catalog_json` key from codex's config.toml, keeping
+/// comments and every other key byte-identical. Returns `None` (no write) when
+/// the key is absent **or** points at a catalog codeg does not own, so this is
+/// safe to call on every save.
+///
+/// Pairs with [`crate::acp::codex_model_catalog::write_catalog_files`] returning
+/// `None`: codeg's generated files and the reference to them must appear and
+/// vanish together — codex refuses to start on a dangling `model_catalog_json`.
+fn remove_codex_catalog_key(
+    base_toml: &str,
+    codex_home: &Path,
+) -> Result<Option<String>, AcpError> {
+    let mut doc = base_toml
+        .parse::<toml_edit::Document>()
+        .map_err(|e| AcpError::protocol(format!("invalid codex config.toml: {e}")))?;
+    let owned = doc
+        .get("model_catalog_json")
+        .and_then(|v| v.as_str())
+        .map(|v| is_codeg_owned_catalog_ref(v, codex_home))
+        .unwrap_or(false);
+    if !owned {
+        return Ok(None);
+    }
+    doc.as_table_mut().remove("model_catalog_json");
+    Ok(Some(doc.to_string()))
+}
+
+/// Drop codeg's own `model_catalog_json` reference from the config.toml on disk,
+/// if it carries one. Reads fresh so it also cleans up a key written by an
+/// earlier codeg version or by another window since the panel opened.
+fn drop_codex_catalog_reference() -> Result<(), AcpError> {
+    let base = read_codex_config_or_empty()?;
+    if let Some(next) = remove_codex_catalog_key(&base, &codex_home_dir())? {
+        persist_codex_native_config_files(None, Some(&next))?;
+    }
+    Ok(())
+}
+
 /// Apply the Codex panel's sandbox / approval PATCH to the raw config.toml text,
 /// format-preservingly (comments and unmanaged keys are kept). Values are
 /// validated against the upstream vocabularies first, so a UI bug can never
@@ -3927,6 +4031,24 @@ pub(crate) fn grok_launch_permission_mode() -> Option<String> {
 /// launch-time channel that makes the user's own config mean anything, exactly
 /// like [`grok_launch_permission_mode`] above.
 ///
+/// ## What the three presets mean (codex-acp ≥1.7.0)
+///
+/// | preset | sandbox | approvals reviewer |
+/// |---|---|---|
+/// | `read-only` ("Ask for approval") | workspace-write | `user` |
+/// | `agent` ("Approve for me", DEFAULT) | workspace-write | `auto_review` |
+/// | `agent-full-access` ("Full access") | danger-full-access | policy `never` |
+///
+/// 1.7.0 redefined these. `read-only` used to carry a genuinely read-only
+/// sandbox; it now carries `workspaceWrite` like `agent`, and the two are
+/// separated by a new `approvalsReviewer` axis instead — `user` routes every
+/// escalation to the person, `auto_review` puts codex's Guardian model in front
+/// of it and only forwards what that judges unsafe (verified in the `@openai/
+/// codex` 0.148 binary: an `ApprovalsReviewer` enum plus a `guardian_*`
+/// telemetry surface carrying `risk_level` / `user_authorization`; codex's own
+/// `AskForApproval` vocabulary lists `on_request` and `on_request_auto_review`
+/// as DISTINCT policies).
+///
 /// ## Why it keys off the sandbox
 ///
 /// The sandbox is the only axis where guessing wrong ENLARGES access, so it
@@ -3936,6 +4058,33 @@ pub(crate) fn grok_launch_permission_mode() -> Option<String> {
 /// 1. never widen the sandbox — the result is identical or tighter;
 /// 2. never select `never` (no approvals at all) unless the config already says
 ///    exactly that.
+///
+/// ## Why the reviewer axis is NOT used to select
+///
+/// It is tempting to answer 1.7.0's redefinition by injecting `read-only` (the
+/// only user-reviewed preset) whenever the config asks to be consulted. That is
+/// wrong for two independent reasons:
+///
+/// - **It breaks older adapters.** `supports_custom_version()` is true for npx
+///   agents, so a user may pin codex-acp ≤1.6.2, where `read-only` is still a
+///   genuinely READ-ONLY sandbox. Injecting it for a `workspace-write` config
+///   would leave that agent unable to write any file — a silent, hard break.
+///   No preset injection is version-stable across the 1.6/1.7 boundary
+///   (`read-only` changed sandbox, `agent` changed reviewer), and
+///   `INITIAL_AGENT_MODE` is decided BEFORE launch, so the adapter's real
+///   version is not knowable here without an `npm list -g` spawn on the connect
+///   path.
+/// - **It could not help the majority anyway.** This mapping only fires when
+///   the user wrote a `sandbox_mode`. Everyone else gets no injection and so
+///   lands on the adapter's default `agent` — i.e. `auto_review` — regardless.
+///   Overriding the vendor's consent default for the minority who happened to
+///   write a sandbox key, while breaking their older pins, is not a coherent
+///   trade.
+///
+/// So the reviewer change is treated as what it is: an upstream default that
+/// every ACP client now inherits. codeg DISCLOSES it in the Codex panel, and the
+/// composer's approval-preset selector ("Ask for approval") remains the
+/// first-class, per-session control for a user who wants to adjudicate directly.
 ///
 /// ## What is deliberately NOT preserved
 ///
@@ -3948,6 +4097,14 @@ pub(crate) fn grok_launch_permission_mode() -> Option<String> {
 /// `on-request` PLUS a widened sandbox. Mapping is therefore strictly better on
 /// the sandbox axis and neutral on the approval axis; the panel discloses the
 /// approval loss to the user rather than pretending it away.
+///
+/// **The read-only sandbox, on codex-acp ≥1.7.0.** No preset carries one any
+/// more, and the adapter re-sends the selected preset's `sandboxPolicy` on every
+/// `runTurn`, so neither `config.toml` nor the `CODEX_CONFIG` session-config
+/// channel can put it back. `read-only` is still the right target for a
+/// read-only config — it is the tightest preset on both adapter generations —
+/// but on ≥1.7.0 the session really is workspace-writable, which the panel says
+/// out loud rather than papering over.
 fn codex_initial_agent_mode(settings: &CodexSandboxSettings) -> Option<&'static str> {
     // `default_permissions` makes codex resolve everything through that named
     // profile and IGNORE the root sandbox/approval keys entirely (the panel
@@ -3973,6 +4130,9 @@ fn codex_initial_agent_mode(settings: &CodexSandboxSettings) -> Option<&'static 
     // `on-request` and dropped anything outside `CODEX_APPROVAL_POLICIES`.
     let never = settings.approval_policy.as_deref() == Some("never");
     match settings.sandbox_mode.as_deref() {
+        // The tightest preset on BOTH adapter generations: a real read-only
+        // sandbox on ≤1.6.2, and workspace-write with user-adjudicated
+        // approvals on ≥1.7.0 (see the note above on what 1.7.0 removed).
         Some("read-only") => Some("read-only"),
         Some("workspace-write") => Some("agent"),
         // Full access is the one preset that removes approvals entirely, so it
@@ -4287,7 +4447,9 @@ fn persist_opencode_auth_json(raw_auth: &str) -> Result<(), AcpError> {
 // Kimi Code config helpers
 //
 // IMPORTANT — how `kimi acp` actually authenticates (reverse-engineered &
-// empirically verified against @moonshot-ai/kimi-code 0.19.1):
+// empirically verified against @moonshot-ai/kimi-code 0.19.1; still the exact
+// behaviour on 0.39.0, where the managed block + seeded token below were driven
+// through a real `session/new` + `session/prompt` again):
 //
 // `kimi acp` gates EVERY `session/new` on an OAuth-style token: it calls
 // `harnessIsAuthed`, which is true iff `~/.kimi-code/credentials/kimi-code.json`
@@ -5541,24 +5703,58 @@ pub(crate) fn pi_project_trust_launch_block(
 pub(crate) async fn acp_sync_antigravity_settings_core(
     db: &AppDatabase,
 ) -> Result<crate::acp::connection::AntigravitySyncReport, AcpError> {
-    // The read error is PROPAGATED, unlike the `.ok().flatten()` the pi trust
-    // path uses. This function's whole job is to report on the stored row, and
-    // treating a failed read as "no row" would not merely lose the method — it
-    // would hand the sync an empty environment, which on a machine with no
-    // settings.json yet writes `oauth-personal` and reports success for a
-    // choice the user did not make.
+    let runtime_env = antigravity_runtime_env(db).await?;
+    Ok(crate::acp::connection::sync_antigravity_settings_for_env(
+        &runtime_env,
+    ))
+}
+
+/// The environment a real Antigravity launch would compose from the STORED row.
+///
+/// The read error is PROPAGATED, unlike the `.ok().flatten()` the pi trust path
+/// uses. Treating a failed read as "no row" would not merely lose the method —
+/// it would hand the caller an empty environment, which on a machine with no
+/// settings.json yet writes `oauth-personal` and reports success for a choice
+/// the user did not make, and which points the browser-free sign-in at the
+/// default `~/.gemini` rather than the relocated `GEMINI_HOME` a session uses.
+async fn antigravity_runtime_env(db: &AppDatabase) -> Result<BTreeMap<String, String>, AcpError> {
     let setting = agent_setting_service::get_by_agent_type(&db.conn, AgentType::Antigravity)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
     let local_config_json = load_agent_local_config_json(AgentType::Antigravity);
-    let runtime_env = build_runtime_env_from_setting(
+    Ok(build_runtime_env_from_setting(
         AgentType::Antigravity,
         setting.as_ref(),
         local_config_json.as_deref(),
-    );
-    Ok(crate::acp::connection::sync_antigravity_settings_for_env(
-        &runtime_env,
     ))
+}
+
+/// Start a browser-free Antigravity sign-in and hand back the link to open.
+///
+/// For headless deployments (codeg on a Linux server, no desktop), where the
+/// agent's own loopback browser flow cannot complete: it opens a browser that
+/// does not exist and then blocks for five minutes inside `session/new`. See
+/// [`crate::acp::antigravity_login`].
+pub(crate) async fn acp_antigravity_login_start_core(
+    db: &AppDatabase,
+    method_id: String,
+) -> Result<crate::acp::antigravity_login::AntigravityLoginStart, AcpError> {
+    let runtime_env = antigravity_runtime_env(db).await?;
+    crate::acp::antigravity_login::start(&runtime_env, method_id.trim()).await
+}
+
+/// Deliver the redirect the user's browser could not reach, completing the
+/// sign-in started by [`acp_antigravity_login_start_core`].
+pub(crate) async fn acp_antigravity_login_finish_core(
+    handle: String,
+    redirect: String,
+) -> Result<crate::acp::antigravity_login::AntigravityLoginOutcome, AcpError> {
+    crate::acp::antigravity_login::finish(handle.trim(), &redirect).await
+}
+
+/// Abandon a pending browser-free sign-in and stop its agent process.
+pub(crate) async fn acp_antigravity_login_cancel_core(handle: String) -> Result<(), AcpError> {
+    crate::acp::antigravity_login::cancel(handle.trim()).await
 }
 
 pub(crate) async fn acp_pi_project_trust_state_core(
@@ -6906,7 +7102,7 @@ async fn hermes_setup_argvs() -> (Vec<String>, Vec<String>) {
         // Unreachable: Hermes is always an Npx distribution. Fall through to
         // the npx guidance with the same pinned spec so a future match-arm
         // change can't resurrect a stale recipe.
-        _ => "hermes-agent@0.20.5",
+        _ => "hermes-agent@0.21.0",
     };
     let build = |tail: &[&str]| -> Vec<String> {
         let mut argv = vec![
@@ -9984,12 +10180,34 @@ pub async fn acp_fork(
     connection_id: String,
     conversation_id: Option<i32>,
     folder_id: Option<i32>,
+    // "Fork from here": the rendered turn to fork at. `None` = fork at the
+    // tail, the composer's fork-send behaviour.
+    fork_from_turn_id: Option<String>,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<ForkResultInfo, AcpError> {
     manager
-        .fork_session(&db, &connection_id, conversation_id, folder_id)
+        .fork_session(
+            &db,
+            &connection_id,
+            conversation_id,
+            folder_id,
+            fork_from_turn_id,
+        )
         .await
+}
+
+/// Stop one AIR async task. `Ok(false)` = the adapter declined (unknown,
+/// already terminal, or a stop already in flight) — a real answer, not a
+/// failure.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_stop_async_task(
+    connection_id: String,
+    task_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<bool, AcpError> {
+    manager.stop_async_task(&connection_id, &task_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -11003,12 +11221,22 @@ pub(crate) async fn acp_update_agent_config_core(
         // the backend only (re)writes the generated catalog *files* here.
         if let Some(raw) = codex_model_catalog.as_deref() {
             let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
-            if let Err(e) = crate::acp::codex_model_catalog::write_catalog_files(
+            match crate::acp::codex_model_catalog::write_catalog_files(
                 raw,
                 &codex_home_dir(),
                 &snapshot,
             ) {
-                tracing::error!("[acp_update_agent_config] write codex catalog failed: {e}");
+                // Catalog files gone (nothing deviates from codex's own list any
+                // more) — the reference must go with them, or codex fails to
+                // start on a `model_catalog_json` pointing at a missing file.
+                // The frontend only patches that key when the user *edits* the
+                // model editor, so a save that merely lets a stale removal
+                // dissolve would otherwise leave the two out of sync.
+                Ok(None) => drop_codex_catalog_reference()?,
+                Ok(Some(_)) => {}
+                Err(e) => {
+                    tracing::error!("[acp_update_agent_config] write codex catalog failed: {e}")
+                }
             }
         }
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
@@ -11351,6 +11579,34 @@ pub async fn acp_sync_antigravity_settings(
     db: tauri::State<'_, AppDatabase>,
 ) -> Result<crate::acp::connection::AntigravitySyncReport, AcpError> {
     acp_sync_antigravity_settings_core(&db).await
+}
+
+/// Start a browser-free Antigravity sign-in for a machine with no desktop.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_antigravity_login_start(
+    db: tauri::State<'_, AppDatabase>,
+    method_id: String,
+) -> Result<crate::acp::antigravity_login::AntigravityLoginStart, AcpError> {
+    acp_antigravity_login_start_core(&db, method_id).await
+}
+
+/// Complete a browser-free Antigravity sign-in from the address the user's
+/// browser was redirected to.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_antigravity_login_finish(
+    handle: String,
+    redirect: String,
+) -> Result<crate::acp::antigravity_login::AntigravityLoginOutcome, AcpError> {
+    acp_antigravity_login_finish_core(handle, redirect).await
+}
+
+/// Abandon a pending browser-free Antigravity sign-in.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_antigravity_login_cancel(handle: String) -> Result<(), AcpError> {
+    acp_antigravity_login_cancel_core(handle).await
 }
 
 /// Record (or clear, with `trusted: null`) an explicit project-trust decision in
@@ -11788,10 +12044,6 @@ pub(crate) async fn acp_prepare_npx_agent_core(
     let meta = registry::get_agent_meta(agent_type);
     let result = match meta.distribution {
         registry::AgentDistribution::Npx { package, cmd, .. } => {
-            // `version_override` of None/empty keeps the registry-pinned spec;
-            // a custom version installs `<name>@<version>` instead.
-            let install_spec = build_npm_install_spec(package, version_override.as_deref())?;
-
             let default = agent_setting_service::AgentDefaultInput {
                 agent_type,
                 registry_id: registry::registry_id_for(agent_type).to_string(),
@@ -11801,11 +12053,25 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 .await
                 .map_err(|e| AcpError::protocol(e.to_string()))?;
 
-            let existing = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
+            let setting = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
                 .await
                 .ok()
-                .flatten()
-                .and_then(|m| m.installed_version);
+                .flatten();
+            let existing = setting.as_ref().and_then(|m| m.installed_version.clone());
+            // The latest-channel opt-in reads the same merged env layers the
+            // launch and the settings page resolve, so the control can never
+            // show one channel while the install applies another.
+            let latest_channel = adapter_channel_is_latest(&build_runtime_env_from_setting(
+                agent_type,
+                setting.as_ref(),
+                load_agent_local_config_json(agent_type).as_deref(),
+            ));
+            // `version_override` of None/empty keeps the channel's spec (the
+            // registry pin, or `<name>@latest` for a latest-channel agent); a
+            // custom version installs `<name>@<version>` instead, on either
+            // channel.
+            let (first_spec, fallback_spec) =
+                npm_install_attempts(package, version_override.as_deref(), latest_channel)?;
 
             // Best-effort uninstall before reinstall. Forces npm to re-resolve
             // the dependency graph from scratch, which is required for
@@ -11835,11 +12101,58 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 emitter,
                 &task_id,
                 AgentInstallEventKind::Log,
-                format!("Installing {} ({install_spec})", meta.name),
+                format!("Installing {} ({first_spec})", meta.name),
             );
-            install_npm_global_package_streaming(&install_spec, &task_id, emitter)
-                .await
-                .map_err(|e| annotate_npm_bootstrap_failure(&install_spec, e))?;
+            let install_spec = match install_npm_global_package_streaming(
+                &first_spec,
+                &task_id,
+                emitter,
+            )
+            .await
+            {
+                Ok(()) => first_spec,
+                Err(err) => {
+                    // FAIL SAFE TO THE PIN. A latest-channel install can die on
+                    // things the pin does not (npm unreachable, a mirror not yet
+                    // carrying the tag's target, a yanked release), and the user
+                    // asked for "newest when possible", not "nothing unless
+                    // newest". Retry the reviewed pinned spec, saying so in the
+                    // same install log — and let the recorded installed version
+                    // report what actually landed.
+                    let Some(pinned_spec) = fallback_spec else {
+                        return Err(annotate_npm_bootstrap_failure(&first_spec, err));
+                    };
+                    let err = annotate_npm_bootstrap_failure(&first_spec, err);
+                    tracing::warn!(
+                        "[acp] latest install {first_spec} failed ({err}); \
+                         falling back to pinned {pinned_spec}"
+                    );
+                    emit_agent_install_event(
+                        emitter,
+                        &task_id,
+                        AgentInstallEventKind::Log,
+                        format!("ERROR: installing {first_spec} failed: {err}"),
+                    );
+                    emit_agent_install_event(
+                        emitter,
+                        &task_id,
+                        AgentInstallEventKind::Log,
+                        format!(
+                            "Falling back to the pinned version ({pinned_spec})..."
+                        ),
+                    );
+                    emit_agent_install_event(
+                        emitter,
+                        &task_id,
+                        AgentInstallEventKind::Log,
+                        format!("Installing {} ({pinned_spec})", meta.name),
+                    );
+                    install_npm_global_package_streaming(&pinned_spec, &task_id, emitter)
+                        .await
+                        .map_err(|e| annotate_npm_bootstrap_failure(&pinned_spec, e))?;
+                    pinned_spec
+                }
+            };
 
             // For a bootstrap-wrapper package (hermes-agent), npm metadata
             // existing does NOT mean the agent can run: a skipped or broken
@@ -13002,6 +13315,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_initial_agent_mode_keeps_a_writable_config_writable_on_every_adapter() {
+        // Regression guard for a fix that looks right and is not. codex-acp
+        // 1.7.0 turned `read-only` into a workspace-write preset whose
+        // approvals are user-adjudicated, which invites mapping EVERY
+        // approval-wanting config onto it. But `supports_custom_version()` is
+        // true for npx agents, and on a user-pinned ≤1.6.2 that preset is still
+        // a genuinely READ-ONLY sandbox — the agent would silently be unable to
+        // write a single file. `INITIAL_AGENT_MODE` is chosen before launch, so
+        // the running adapter's version is not knowable here; the mapping must
+        // therefore stay keyed on the sandbox, which is the axis whose meaning
+        // did not move. See the "Why the reviewer axis is NOT used" note above.
+        for policy in [
+            "",
+            "approval_policy = \"on-request\"\n",
+            "approval_policy = \"on-failure\"\n",
+            "approval_policy = \"untrusted\"\n",
+        ] {
+            let toml = format!("{policy}sandbox_mode = \"workspace-write\"\n");
+            assert_eq!(
+                initial_mode_for(&toml),
+                Some("agent"),
+                "a writable config must never be handed the read-only preset ({policy:?})"
+            );
+        }
+    }
+
+    #[test]
     fn codex_initial_agent_mode_only_grants_full_access_on_an_exact_match() {
         // `agent-full-access` is the one preset with approvalPolicy `never`, so
         // it must never be inferred — both halves have to already say so.
@@ -13250,6 +13590,71 @@ mod tests {
         assert!(back.granular.is_some());
         assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
         assert!(back.workspace_write.network_access);
+    }
+
+    fn config_with_catalog_ref(value: &str) -> String {
+        format!(
+            "\
+# my codex config
+model = \"gw/x\"           # the model
+model_catalog_json = \"{value}\"
+model_provider = \"codeg\"
+
+[model_providers.codeg]
+base_url = \"https://example.test/v1\"
+"
+        )
+    }
+
+    #[test]
+    fn remove_codex_catalog_key_is_format_preserving_and_no_op_when_absent() {
+        let home = Path::new("/tmp/codeg-test-codex-home");
+        let base = config_with_catalog_ref("codeg-model-catalog.json");
+        let next = remove_codex_catalog_key(&base, home)
+            .unwrap()
+            .expect("codeg-owned key was present");
+        assert!(!next.contains("model_catalog_json"));
+        // Comments and every unmanaged key survive verbatim.
+        assert!(next.contains("# my codex config"));
+        assert!(next.contains("model = \"gw/x\"           # the model"));
+        assert!(next.contains("[model_providers.codeg]"));
+        assert!(next.contains("base_url = \"https://example.test/v1\""));
+        // No key → no rewrite at all (callers skip the disk write).
+        assert!(remove_codex_catalog_key(&next, home).unwrap().is_none());
+        assert!(remove_codex_catalog_key("", home).unwrap().is_none());
+    }
+
+    /// The cleanup must only ever reclaim codeg's OWN generated file. A catalog
+    /// the user wrote by hand (or typed into the advanced config.toml editor)
+    /// reaches this path on every panel save — deleting its reference would
+    /// silently orphan the user's models.
+    #[test]
+    fn remove_codex_catalog_key_preserves_user_owned_references() {
+        let home = Path::new("/tmp/codeg-test-codex-home");
+        for foreign in [
+            "manual.json",
+            "/abs/path/to/manual.json",
+            "~/my-catalog.json",
+            "nested/codeg-model-catalog.json",
+            "  ",
+        ] {
+            let base = config_with_catalog_ref(foreign);
+            assert!(
+                remove_codex_catalog_key(&base, home).unwrap().is_none(),
+                "must not touch a user-owned reference: {foreign}"
+            );
+        }
+        // An absolute path naming codeg's own file IS codeg-owned.
+        let abs = home
+            .join(crate::acp::codex_model_catalog::CATALOG_REL)
+            .to_string_lossy()
+            .into_owned();
+        assert!(is_codeg_owned_catalog_ref(&abs, home));
+        assert!(is_codeg_owned_catalog_ref(
+            crate::acp::codex_model_catalog::CATALOG_REL,
+            home
+        ));
+        assert!(!is_codeg_owned_catalog_ref("manual.json", home));
     }
 
     #[test]
@@ -15667,6 +16072,91 @@ wire_api = "chat"
         assert!(build_npm_install_spec("cline@3.0.9", Some("latest")).is_err());
     }
 
+    // The pinned default is byte-identical to what `build_npm_install_spec`
+    // produced before the channel existed, with no fallback attempt.
+    #[test]
+    fn npm_install_attempts_defaults_to_the_pinned_spec() {
+        assert_eq!(
+            npm_install_attempts("@google/gemini-cli@0.44.1", None, false).unwrap(),
+            ("@google/gemini-cli@0.44.1".to_string(), None)
+        );
+        assert_eq!(
+            npm_install_attempts("@google/gemini-cli@0.44.1", Some("  "), false).unwrap(),
+            ("@google/gemini-cli@0.44.1".to_string(), None)
+        );
+    }
+
+    // The latest channel tries the `latest` dist-tag first and keeps the
+    // registry pin as the fallback, so a failed latest install degrades to the
+    // reviewed version instead of no install at all.
+    #[test]
+    fn npm_install_attempts_maps_latest_channel_onto_the_dist_tag() {
+        assert_eq!(
+            npm_install_attempts("@google/gemini-cli@0.44.1", None, true).unwrap(),
+            (
+                "@google/gemini-cli@latest".to_string(),
+                Some("@google/gemini-cli@0.44.1".to_string())
+            )
+        );
+        // A blank override is the same as none.
+        assert_eq!(
+            npm_install_attempts("cline@3.0.9", Some(" "), true).unwrap(),
+            ("cline@latest".to_string(), Some("cline@3.0.9".to_string()))
+        );
+    }
+
+    // An explicit custom version wins on either channel and never falls back:
+    // the user asked for that exact version, and quietly installing another
+    // would relabel their choice.
+    #[test]
+    fn npm_install_attempts_lets_an_explicit_override_win() {
+        assert_eq!(
+            npm_install_attempts("cline@3.0.9", Some("2.0.0"), true).unwrap(),
+            ("cline@2.0.0".to_string(), None)
+        );
+        assert!(npm_install_attempts("cline@3.0.9", Some("nightly"), true).is_err());
+    }
+
+    // The latest channel introduces a NEW SPEC SHAPE (`<name>@latest`), and the
+    // spec — not the agent type — is what every downstream step keys off.
+    // `npm_package_requires_scripts` is the one that bites: hermes-agent's
+    // postinstall bootstraps its runtime, and it is the only package codeg
+    // force-enables lifecycle scripts for. A spec shape that hid the package
+    // name from it would install a shim that only fails later, at connect,
+    // with "runtime is not ready". Both attempts must be recognized, since
+    // either one can be the spec that actually lands.
+    #[test]
+    fn the_latest_spec_still_names_the_package_downstream_readers_key_off() {
+        let (latest, pinned) = npm_install_attempts("hermes-agent@0.21.0", None, true).unwrap();
+        assert_eq!(latest, "hermes-agent@latest");
+        assert!(npm_package_requires_scripts(&latest));
+        assert!(npm_package_requires_scripts(&pinned.unwrap()));
+        // And the `@latest` tag is never mistaken for a version number, so a
+        // successful latest install falls through to the real post-install
+        // probe instead of recording "latest" as the installed version.
+        assert_eq!(version_from_package_spec(&latest), None);
+    }
+
+    // Only the exact (trimmed) sentinel opts into the latest channel; absence
+    // and every other value stay on the pin, matching the frontend reader.
+    #[test]
+    fn adapter_channel_reads_only_the_exact_latest_sentinel() {
+        let env = |value: Option<&str>| {
+            let mut map = BTreeMap::new();
+            map.insert("XAI_API_KEY".to_string(), "abc".to_string());
+            if let Some(value) = value {
+                map.insert(ADAPTER_CHANNEL_ENV.to_string(), value.to_string());
+            }
+            map
+        };
+        assert!(!adapter_channel_is_latest(&env(None)));
+        assert!(adapter_channel_is_latest(&env(Some("latest"))));
+        assert!(adapter_channel_is_latest(&env(Some(" latest "))));
+        assert!(!adapter_channel_is_latest(&env(Some("pinned"))));
+        assert!(!adapter_channel_is_latest(&env(Some("Latest"))));
+        assert!(!adapter_channel_is_latest(&env(Some(""))));
+    }
+
     #[test]
     fn apply_custom_version_to_url_substitutes_all_occurrences() {
         // Codex URL embeds the version twice (path tag + asset filename).
@@ -17105,7 +17595,7 @@ wire_api = "chat"
                     .expect("npx recipe must pin via --package");
                 assert_eq!(
                     argv.get(pkg_idx + 1).map(String::as_str),
-                    Some("hermes-agent@0.20.5")
+                    Some("hermes-agent@0.21.0")
                 );
                 assert_eq!(argv.get(pkg_idx + 2).map(String::as_str), Some("hermes"));
             } else {
@@ -17717,7 +18207,7 @@ model = "gpt"
             )
         };
 
-        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.20.5", download());
+        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.21.0", download());
         let text = annotated.to_string();
         assert!(text.contains("fetch failed"), "keeps the original error");
         assert!(text.contains("HTTP(S)_PROXY"), "adds the proxy hint");
@@ -17729,7 +18219,7 @@ model = "gpt"
 
         // A hermes failure that isn't a download stays untouched.
         let permissions = annotate_npm_bootstrap_failure(
-            "hermes-agent@0.20.5",
+            "hermes-agent@0.21.0",
             AcpError::Protocol("failed to install npm package globally: EACCES".to_string()),
         );
         assert!(!permissions.to_string().contains("HTTP(S)_PROXY"));

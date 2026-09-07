@@ -29,9 +29,13 @@
 //!     batch wait wakes as soon as ANY requested task reaches a terminal state.
 //!   * `cancel_task` — [`BrokerCancelTaskRequest`] for `cancel_delegation`;
 //!     returns a task report.
+//!   * `resume_task` — [`BrokerResumeTaskRequest`] for `resume_delegation`;
+//!     returns a task report (a `Running` ack under the unchanged task id, or
+//!     a refusal).
 //!   * `cancel` — fire-and-forget [`BrokerCancelRequest`] from MCP
 //!     `notifications/cancelled`, targeting an in-flight `delegate_to_agent`
-//!     call by `external_handle`; gets a `Value::Null` ack.
+//!     or `resume_delegation` call by `external_handle`; gets a `Value::Null`
+//!     ack.
 //!
 //! All arms are authenticated by the same per-launch `token`.
 //!
@@ -130,6 +134,23 @@ pub struct BrokerStatusRequest {
 pub struct BrokerCancelTaskRequest {
     pub token: String,
     pub task_id: String,
+}
+
+/// Resume a previously-canceled / interrupted delegation task by its broker
+/// `task_id`. Backs the `resume_delegation` MCP tool. Carries NO task text —
+/// the tool continues the ORIGINAL task in the child's resumed session; the
+/// optional `reason` is bounded interruption context, never new instructions.
+/// `external_handle` mirrors [`BrokerRequest::external_handle`]: a
+/// `notifications/cancelled` during resume setup must tear the re-spawned
+/// child back down.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerResumeTaskRequest {
+    pub token: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_handle: Option<String>,
 }
 
 /// Pull the pending live-feedback notes for the parent session. Backs the
@@ -233,6 +254,7 @@ pub enum BrokerMessage {
     Cancel(BrokerCancelRequest),
     Status(BrokerStatusRequest),
     CancelTask(BrokerCancelTaskRequest),
+    ResumeTask(BrokerResumeTaskRequest),
     Feedback(BrokerFeedbackRequest),
     CommitFeedback(BrokerCommitFeedbackRequest),
     Ask(BrokerAskRequest),
@@ -241,6 +263,15 @@ pub enum BrokerMessage {
     TaskComplete(BrokerTaskCompleteRequest),
     CreateAutomation(BrokerCreateAutomationRequest),
     CreateWorkTask(BrokerCreateWorkTaskRequest),
+    /// Liveness probe. Unlike every other variant this one is NOT sent by a
+    /// companion — it comes from codeg's own service-status check
+    /// (`acp::delegation::service`), which is why it carries no `token`: a
+    /// `{"ok": true}` answer reveals nothing beyond "the socket is being
+    /// served", which the connect itself already proved. Answering it end to
+    /// end (accept → decode → dispatch → encode → write) is the point: it
+    /// distinguishes a live accept loop from a stale socket file left behind
+    /// by a dead one, which a bare `connect()` cannot.
+    Ping,
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -346,6 +377,15 @@ pub async fn client_cancel_task_round_trip(
     message_round_trip(socket_path, &BrokerMessage::CancelTask(req.clone())).await
 }
 
+/// Dispatch a `resume_delegation` request and read back the task report (a
+/// `Running` ack when the resume took, or a refusal / setup-failure report).
+pub async fn client_resume_task_round_trip(
+    socket_path: &str,
+    req: &BrokerResumeTaskRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::ResumeTask(req.clone())).await
+}
+
 /// Dispatch a `check_user_feedback` query and read back the
 /// `{ "feedback": [..], "count": N }` envelope (the pending notes drained for
 /// the parent session, possibly empty).
@@ -422,6 +462,15 @@ pub async fn client_create_work_task_round_trip(
     req: &BrokerCreateWorkTaskRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::CreateWorkTask(req.clone())).await
+}
+
+/// Probe the listener: write a [`BrokerMessage::Ping`] and read the
+/// `{"ok": true}` answer back. Used by the codeg-mcp service-status indicator
+/// to tell "listening" from "socket file exists but nobody is accepting".
+/// Callers should wrap this in their own timeout — a socket whose peer accepts
+/// but never answers would otherwise park here.
+pub async fn client_ping(socket_path: &str) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::Ping).await
 }
 
 /// Total budget for `open()` retries on Windows named pipes. Has to be
@@ -545,6 +594,28 @@ mod tests {
                 assert_eq!(req.max_messages, Some(20));
             }
             other => panic!("expected SessionInfo variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_task_message_round_trip_in_memory() {
+        let (mut a, mut b) = duplex(8 * 1024);
+        let msg = BrokerMessage::ResumeTask(BrokerResumeTaskRequest {
+            token: "tok".into(),
+            task_id: "task-1".into(),
+            reason: Some("app crashed".into()),
+            external_handle: Some("h1".into()),
+        });
+        write_frame(&mut a, &msg).await.unwrap();
+        let got: BrokerMessage = read_frame(&mut b).await.unwrap();
+        match got {
+            BrokerMessage::ResumeTask(req) => {
+                assert_eq!(req.token, "tok");
+                assert_eq!(req.task_id, "task-1");
+                assert_eq!(req.reason.as_deref(), Some("app crashed"));
+                assert_eq!(req.external_handle.as_deref(), Some("h1"));
+            }
+            other => panic!("expected ResumeTask variant, got {other:?}"),
         }
     }
 

@@ -207,7 +207,7 @@ describe("Sidebar — View options grouping", () => {
     // control on the right is the proof this is about the two inventories and
     // not the menu failing to render.
     expect(
-      screen.queryByRole("menuitemcheckbox", { name: "Show worktree folders" })
+      screen.queryByRole("menuitemcheckbox", { name: "Show worktree branches" })
     ).toBeNull()
     expect(
       screen.queryByRole("menuitemcheckbox", { name: "Automations" })
@@ -248,14 +248,14 @@ describe("Sidebar — View options grouping", () => {
   })
 })
 
-describe("Sidebar — Show worktree folders toggle", () => {
+describe("Sidebar — Show worktree branches toggle", () => {
   beforeEach(() => {
     localStorage.clear()
     spies.listProps = null
     mockState.activeFolder = { id: 7, path: "/x" }
   })
 
-  it("defaults Show worktree folders on and threads it to the conversation list", () => {
+  it("defaults Show worktree branches on and threads it to the conversation list", () => {
     renderSidebar()
     expect(spies.listProps?.showWorktrees).toBe(true)
   })
@@ -275,7 +275,7 @@ describe("Sidebar — Show worktree folders toggle", () => {
 
     await openViewOptionsGroup("Conversation list")
     await userEvent.click(
-      screen.getByRole("menuitemcheckbox", { name: "Show worktree folders" })
+      screen.getByRole("menuitemcheckbox", { name: "Show worktree branches" })
     )
 
     expect(localStorage.getItem("workspace:sidebar-show-worktrees")).toBe(
@@ -348,11 +348,10 @@ describe("Sidebar — Navigation item visibility", () => {
   })
 
   // The nav rows are `button`s; the menu's toggles are `menuitemcheckbox`es, so
-  // the two never collide even while the menu is open. The Forge row's name
-  // carries its Beta badge (deliberately not aria-hidden), unlike its toggle.
+  // the two never collide even while the menu is open.
   const navRow = (name: string | RegExp) =>
     screen.queryByRole("button", { name })
-  const FORGE_ROW = /^Repository panel/
+  const FORGE_ROW = "Repository panel"
 
   it("shows every route row by default", () => {
     renderSidebar()

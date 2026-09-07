@@ -25,6 +25,7 @@ import { Streamdown, defaultRemarkPlugins } from "streamdown"
 
 import { Shimmer } from "./shimmer"
 import { markdownLinkComponents } from "./markdown-link"
+import { mermaidComponents } from "./mermaid-block"
 import { normalizeMathDelimiters } from "./message"
 import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
@@ -236,8 +237,19 @@ const remarkPlugins = [
   remarkTrimCjkAutolinkTail,
 ]
 
+const reasoningComponents = { ...markdownLinkComponents, ...mermaidComponents }
+
 export const ReasoningContent = memo(
   ({ className, children, ...props }: ReasoningContentProps) => {
+    // Reasoning is a LIVE surface — `Reasoning` auto-opens this panel the
+    // moment streaming starts, so it re-renders on every delta of a block that
+    // routinely runs into the thousands of tokens. `mode="static"` re-parses
+    // the whole text each time (streaming splits it into blocks and re-parses
+    // only the tail), which measured ~2.9x slower over a 120-delta stream and
+    // gets worse the longer the block runs. So track the turn, exactly like the
+    // reply prose does: remend while the text is still growing, static — and
+    // therefore free of remend's leftover `*` / `_` — once it has settled.
+    const { isStreaming } = useReasoning()
     const normalized = useMemo(
       () => normalizeMathDelimiters(children),
       [children]
@@ -257,8 +269,10 @@ export const ReasoningContent = memo(
           plugins={plugins}
           remarkPlugins={remarkPlugins}
           {...props}
+          mode={isStreaming ? "streaming" : "static"}
+          parseIncompleteMarkdown={isStreaming}
           // Enforce the link icon + safety override after spreading props.
-          components={markdownLinkComponents}
+          components={reasoningComponents}
         >
           {normalized}
         </Streamdown>

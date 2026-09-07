@@ -10,7 +10,7 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { useOpenFileTarget } from "@/hooks/use-open-file-target"
 import {
   CommitFileAdditions,
   CommitFileDeletions,
@@ -68,7 +68,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   const t = useTranslations("Folder.chat.replyArtifacts")
   const tCommon = useTranslations("Folder.common")
   const { activeFolder: folder } = useActiveFolder()
-  const { openFilePreview, openSessionFileDiff } = useWorkspaceActions()
+  const openFileTarget = useOpenFileTarget()
   const [newFilesOpen, setNewFilesOpen] = useState(true)
   const [changedOpen, setChangedOpen] = useState(false)
 
@@ -100,10 +100,10 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   const folderPath = folder?.path
 
   const openInTabs = (file: FileChangeStat) => {
-    // openFilePreview accepts absolute paths (any location) and paths
-    // relative to the active folder — agent-reported paths are one of the
-    // two, so hand them over as-is.
-    void openFilePreview(normalizeSlashPath(file.path))
+    // The opener accepts absolute paths (any location) and paths relative to
+    // the active folder — agent-reported paths are one of the two, so hand
+    // them over as-is.
+    void openFileTarget(normalizeSlashPath(file.path))
   }
 
   const revealInFolder = (file: FileChangeStat) => {
@@ -111,17 +111,21 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
     if (absolute) void revealItemInDir(absolute)
   }
 
-  // Open the file's unified diff in an editor tab. Keyed by the reply's first
-  // turn id so the same file changed by two different replies opens as two
-  // distinct diff tabs instead of colliding into one. Works in web too (unlike
-  // reveal), so it stays ungated by `isLocalDesktop()`.
+  // Open the file's unified diff. Keyed by the reply's first turn id so the
+  // same file changed by two different replies opens as two distinct diff tabs
+  // instead of colliding into one. Works in web too (unlike reveal), so it
+  // stays ungated by `isLocalDesktop()`. Routed through the same opener as
+  // `openInTabs` above — the two sit in one action row, and sending only one of
+  // them to the side panel would leave this one silently opening a diff tab
+  // behind whichever full-page route is covering the workspace.
   const replyDiffKey = sourceTurns[0]?.id ?? "reply"
   const viewDiff = (file: FileChangeStat) => {
-    openSessionFileDiff(
-      file.path,
-      file.diff ?? t("noDiffDataAvailable", { filePath: file.path }),
-      replyDiffKey
-    )
+    void openFileTarget(file.path, {
+      diff: {
+        content: file.diff ?? t("noDiffDataAvailable", { filePath: file.path }),
+        groupLabel: replyDiffKey,
+      },
+    })
   }
 
   const totalAdditions = changedFiles.reduce((sum, f) => sum + f.additions, 0)
@@ -141,7 +145,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
             <span className="text-xs font-medium text-foreground">
               {t("newFilesTitle")}
             </span>
-            <span className="rounded-md border border-border bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            <span className="rounded-md border border-border bg-muted/40 px-1.5 py-0.5 text-3xs text-muted-foreground">
               {t("fileCount", { count: addedFiles.length })}
             </span>
             <ChevronRight
@@ -192,7 +196,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                                   {name}
                                 </span>
                                 {dir && (
-                                  <span className="truncate text-[10px] text-muted-foreground">
+                                  <span className="truncate text-3xs text-muted-foreground">
                                     {dir}
                                   </span>
                                 )}
@@ -200,7 +204,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                               {file.additions > 0 && (
                                 <CommitFileAdditions
                                   count={file.additions}
-                                  className="shrink-0 font-mono text-[10px]"
+                                  className="shrink-0 font-mono text-3xs"
                                 />
                               )}
                             </button>
@@ -249,12 +253,12 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
             <span className="text-xs font-medium text-foreground">
               {t("title")}
             </span>
-            <span className="rounded-md border border-border bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            <span className="rounded-md border border-border bg-muted/40 px-1.5 py-0.5 text-3xs text-muted-foreground">
               {t("fileCount", { count: changedFiles.length })}
             </span>
             {/* Always render BOTH counts (incl. zeros) so a one-sided reply
                 still shows its +N and -N. */}
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px]">
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-3xs">
               <span className="text-green-600 dark:text-green-400">
                 +{totalAdditions}
               </span>
@@ -305,12 +309,12 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                               {name}
                             </span>
                             {dir && (
-                              <span className="truncate text-[10px] text-muted-foreground">
+                              <span className="truncate text-3xs text-muted-foreground">
                                 {dir}
                               </span>
                             )}
                           </span>
-                          <span className="inline-flex shrink-0 items-center rounded-md border border-destructive/30 bg-destructive/10 px-1.5 py-0.5 font-mono text-[10px] text-destructive">
+                          <span className="inline-flex shrink-0 items-center rounded-md border border-destructive/30 bg-destructive/10 px-1.5 py-0.5 font-mono text-3xs text-destructive">
                             {t("remove")}
                           </span>
                         </div>
@@ -339,19 +343,19 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                                   {name}
                                 </span>
                                 {dir && (
-                                  <span className="truncate text-[10px] text-muted-foreground">
+                                  <span className="truncate text-3xs text-muted-foreground">
                                     {dir}
                                   </span>
                                 )}
                               </span>
-                              <span className="inline-flex shrink-0 items-center gap-1 font-mono text-[10px]">
+                              <span className="inline-flex shrink-0 items-center gap-1 font-mono text-3xs">
                                 <CommitFileAdditions
                                   count={file.additions}
-                                  className="text-[10px]"
+                                  className="text-3xs"
                                 />
                                 <CommitFileDeletions
                                   count={file.deletions}
-                                  className="text-[10px]"
+                                  className="text-3xs"
                                 />
                               </span>
                             </button>

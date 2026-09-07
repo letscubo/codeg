@@ -9,6 +9,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type HTMLAttributes,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react"
@@ -32,6 +33,8 @@ import { findOwningFolder } from "@/lib/file-open-target"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
 import { WorkspaceDegradedBanner } from "@/components/layout/workspace-degraded-banner"
 import { WorkspaceUploadDialog } from "@/components/layout/workspace-upload-dialog"
+import { OpenInSubContent } from "@/components/layout/open-in-menu"
+import { RowMoreButton } from "@/components/layout/row-more-button"
 import {
   createFileTreeEntry,
   deleteFileTreeEntry,
@@ -46,6 +49,7 @@ import {
   moveFileTreeEntry,
   readFilePreview,
   openCommitWindow,
+  openInCode,
   renameFileTreeEntry,
   WORKSPACE_DOWNLOAD_CANCELLED,
 } from "@/lib/api"
@@ -562,20 +566,27 @@ function RootDropFolder({
   name,
   dnd,
   children,
+  ...props
 }: {
   name: string
   dnd: TreeDndHandlers
   children: ReactNode
-}) {
+} & HTMLAttributes<HTMLDivElement>) {
   const [dropActive, setDropActive] = useState(false)
   // On desktop the DOM dragover never reaches this row, so also honor the
   // native-drag highlight broadcast for the workspace root ("").
   const desktopDropActive = useContext(DesktopDropDirContext) === ""
   return (
     <FileTreeFolder
+      // Forwarded first so the row's own props win, but forwarded at all: this
+      // is the `asChild` target of the workspace-root ContextMenuTrigger, and a
+      // component that swallows the props it is handed leaves the trigger with
+      // no element to listen on (see the trigger's comment below).
+      {...props}
       path={FILE_TREE_ROOT_PATH}
       name={name}
-      className="font-medium"
+      className={cn("font-medium", props.className)}
+      actions={<RowMoreButton />}
       dropActive={dropActive || desktopDropActive}
       dropTargetDir=""
       depth={0}
@@ -722,9 +733,27 @@ function RenderNode({
       }
     }
 
+    const handleOpenInCode = async () => {
+      try {
+        await openInCode(absolutePath)
+      } catch (error) {
+        toast.error(t("toasts.openInCodeFailed"), {
+          description: toErrorMessage(error),
+        })
+      }
+    }
+
     return (
       <ContextMenu>
-        <ContextMenuTrigger>
+        {/*
+          asChild merges the Radix trigger's pointerdown / contextmenu handlers
+          and its `WebkitTouchCallout: none` style onto the row's own div
+          instead of wrapping it in a <span> whose inline box breaks the row's
+          `w-max min-w-full` sizing. Matches every other ContextMenuTrigger in
+          the codebase; see the RootDropFolder wrapper below for the one rule
+          asChild imposes on the child.
+        */}
+        <ContextMenuTrigger asChild>
           <FileTreeFile
             path={node.path}
             name={node.name}
@@ -745,6 +774,7 @@ function RenderNode({
               setDragging(false)
               dnd.onEntryDragEnd()
             }}
+            actions={<RowMoreButton />}
           />
         </ContextMenuTrigger>
         <ContextMenuContent>
@@ -821,18 +851,16 @@ function RenderNode({
           </ContextMenuItem>
           <ContextMenuSub>
             <ContextMenuSubTrigger>{t("openIn")}</ContextMenuSubTrigger>
-            <ContextMenuSubContent>
-              <ContextMenuItem
-                onSelect={() => void handleOpenInSystemExplorer()}
-              >
-                {systemExplorerLabel}
-              </ContextMenuItem>
-              <ContextMenuItem
-                onSelect={() => void onOpenDirInTerminal(dirPath, node.name)}
-              >
-                {t("openInTerminal")}
-              </ContextMenuItem>
-            </ContextMenuSubContent>
+            <OpenInSubContent
+              explorerLabel={systemExplorerLabel}
+              terminalLabel={t("openInTerminal")}
+              codeLabel={t("openInCode")}
+              onOpenExplorer={() => void handleOpenInSystemExplorer()}
+              onOpenTerminal={() =>
+                void onOpenDirInTerminal(dirPath, node.name)
+              }
+              onOpenCode={() => void handleOpenInCode()}
+            />
           </ContextMenuSub>
           <ContextMenuItem
             onSelect={() =>
@@ -893,12 +921,28 @@ function RenderNode({
     }
   }
 
+  const handleOpenInCode = async () => {
+    try {
+      await openInCode(absolutePath)
+    } catch (error) {
+      toast.error(t("toasts.openInCodeFailed"), {
+        description: toErrorMessage(error),
+      })
+    }
+  }
+
   return (
     <ContextMenu>
-      <ContextMenuTrigger>
+      {/*
+        asChild merges the Radix trigger's pointerdown / contextmenu handlers
+        and its `WebkitTouchCallout: none` style onto the FileTreeFolder's own
+        div — same reasoning as the FileTreeFile wrapper above.
+      */}
+      <ContextMenuTrigger asChild>
         <FileTreeFolder
           path={node.path}
           name={node.name}
+          actions={<RowMoreButton />}
           suffix={
             isLinkedDir ? (
               <Link2
@@ -1057,18 +1101,16 @@ function RenderNode({
         </ContextMenuItem>
         <ContextMenuSub>
           <ContextMenuSubTrigger>{t("openIn")}</ContextMenuSubTrigger>
-          <ContextMenuSubContent>
-            <ContextMenuItem
-              onSelect={() => void handleOpenDirInSystemExplorer()}
-            >
-              {systemExplorerLabel}
-            </ContextMenuItem>
-            <ContextMenuItem
-              onSelect={() => void onOpenDirInTerminal(absolutePath, node.name)}
-            >
-              {t("openInTerminal")}
-            </ContextMenuItem>
-          </ContextMenuSubContent>
+          <OpenInSubContent
+            explorerLabel={systemExplorerLabel}
+            terminalLabel={t("openInTerminal")}
+            codeLabel={t("openInCode")}
+            onOpenExplorer={() => void handleOpenDirInSystemExplorer()}
+            onOpenTerminal={() =>
+              void onOpenDirInTerminal(absolutePath, node.name)
+            }
+            onOpenCode={() => void handleOpenInCode()}
+          />
         </ContextMenuSub>
         <ContextMenuItem
           onSelect={() =>
@@ -2626,7 +2668,7 @@ export function FileTreeTab() {
           >
             {node.name}
           </button>
-          <span className="w-8 shrink-0 text-right text-[10px] font-medium text-muted-foreground">
+          <span className="w-8 shrink-0 text-right text-3xs font-medium text-muted-foreground">
             {node.status}
           </span>
         </FileTreeFile>
@@ -2874,9 +2916,23 @@ export function FileTreeTab() {
               onSelect={handleTreeSelect}
             >
               {folder?.path && (
-                <ContextMenu>
-                  <ContextMenuTrigger>
-                    <DesktopDropDirContext.Provider value={desktopDropDir}>
+                <DesktopDropDirContext.Provider value={desktopDropDir}>
+                  <ContextMenu>
+                    {/*
+                      asChild merges the Radix trigger's pointerdown /
+                      contextmenu handlers and its `WebkitTouchCallout: none`
+                      style onto the row itself instead of a wrapper <span>,
+                      matching every other ContextMenuTrigger in the codebase.
+
+                      The child MUST be a component that forwards the props it
+                      is handed down to a real DOM element. Radix's Slot only
+                      clones the child element — hand it a Context.Provider (or
+                      any component that drops unknown props) and the trigger
+                      renders NOTHING: no listener, no menu, on right-click or
+                      long-press or the ⋯ button. Hence the provider sits
+                      outside, and RootDropFolder spreads `...props`.
+                    */}
+                    <ContextMenuTrigger asChild>
                       <RootDropFolder name={rootNodeName} dnd={treeDndValue}>
                         {nodes.map((node) => (
                           <RenderNode
@@ -2928,127 +2984,131 @@ export function FileTreeTab() {
                           />
                         ))}
                       </RootDropFolder>
-                    </DesktopDropDirContext.Provider>
-                  </ContextMenuTrigger>
-                  <ContextMenuContent>
-                    <ContextMenuSub>
-                      <ContextMenuSubTrigger>{t("new")}</ContextMenuSubTrigger>
-                      <ContextMenuSubContent>
-                        <ContextMenuItem
-                          onSelect={() => handleRequestCreate("", "file")}
-                        >
-                          {t("newFile")}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onSelect={() => handleRequestCreate("", "dir")}
-                        >
-                          {t("newDirectory")}
-                        </ContextMenuItem>
-                      </ContextMenuSubContent>
-                    </ContextMenuSub>
-                    <ContextMenuSub>
-                      <ContextMenuSubTrigger disabled={!gitEnabled}>
-                        {t("git")}
-                      </ContextMenuSubTrigger>
-                      <ContextMenuSubContent>
-                        <ContextMenuItem
-                          onSelect={() => handleOpenCommitWindow()}
-                          disabled={!gitEnabled}
-                        >
-                          {t("actions.commitCode")}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onSelect={() => void handleAddToVcs(rootTarget)}
-                          disabled={!gitEnabled}
-                        >
-                          {t("actions.addToVcs")}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onSelect={() =>
-                            void openWorkingTreeDiff(".", {
-                              mode: "overview",
-                            })
-                          }
-                          disabled={!gitEnabled}
-                        >
-                          {tCommon("viewDiff")}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onSelect={() =>
-                            handleRequestCompareWithBranch(rootTarget)
-                          }
-                          disabled={!gitEnabled}
-                        >
-                          {t("compareWithBranch")}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          variant="destructive"
-                          onSelect={() => handleRequestRollback(rootTarget)}
-                          disabled={!gitEnabled}
-                        >
-                          {t("actions.rollback")}
-                        </ContextMenuItem>
-                      </ContextMenuSubContent>
-                    </ContextMenuSub>
-                    <ContextMenuItem
-                      onSelect={() => {
-                        void fetchTree()
-                      }}
-                    >
-                      {t("reloadFromDisk")}
-                    </ContextMenuItem>
-                    <ContextMenuSub>
-                      <ContextMenuSubTrigger>
-                        {t("openIn")}
-                      </ContextMenuSubTrigger>
-                      <ContextMenuSubContent>
-                        <ContextMenuItem
-                          onSelect={() => {
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuSub>
+                        <ContextMenuSubTrigger>
+                          {t("new")}
+                        </ContextMenuSubTrigger>
+                        <ContextMenuSubContent>
+                          <ContextMenuItem
+                            onSelect={() => handleRequestCreate("", "file")}
+                          >
+                            {t("newFile")}
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onSelect={() => handleRequestCreate("", "dir")}
+                          >
+                            {t("newDirectory")}
+                          </ContextMenuItem>
+                        </ContextMenuSubContent>
+                      </ContextMenuSub>
+                      <ContextMenuSub>
+                        <ContextMenuSubTrigger disabled={!gitEnabled}>
+                          {t("git")}
+                        </ContextMenuSubTrigger>
+                        <ContextMenuSubContent>
+                          <ContextMenuItem
+                            onSelect={() => handleOpenCommitWindow()}
+                            disabled={!gitEnabled}
+                          >
+                            {t("actions.commitCode")}
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onSelect={() => void handleAddToVcs(rootTarget)}
+                            disabled={!gitEnabled}
+                          >
+                            {t("actions.addToVcs")}
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onSelect={() =>
+                              void openWorkingTreeDiff(".", {
+                                mode: "overview",
+                              })
+                            }
+                            disabled={!gitEnabled}
+                          >
+                            {tCommon("viewDiff")}
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onSelect={() =>
+                              handleRequestCompareWithBranch(rootTarget)
+                            }
+                            disabled={!gitEnabled}
+                          >
+                            {t("compareWithBranch")}
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            variant="destructive"
+                            onSelect={() => handleRequestRollback(rootTarget)}
+                            disabled={!gitEnabled}
+                          >
+                            {t("actions.rollback")}
+                          </ContextMenuItem>
+                        </ContextMenuSubContent>
+                      </ContextMenuSub>
+                      <ContextMenuItem
+                        onSelect={() => {
+                          void fetchTree()
+                        }}
+                      >
+                        {t("reloadFromDisk")}
+                      </ContextMenuItem>
+                      <ContextMenuSub>
+                        <ContextMenuSubTrigger>
+                          {t("openIn")}
+                        </ContextMenuSubTrigger>
+                        <OpenInSubContent
+                          explorerLabel={systemExplorerLabel}
+                          terminalLabel={t("openInTerminal")}
+                          codeLabel={t("openInCode")}
+                          onOpenExplorer={() => {
                             void revealItemInDir(folder.path)
                           }}
-                        >
-                          {systemExplorerLabel}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onSelect={() => {
+                          onOpenTerminal={() => {
                             void handleOpenDirInTerminal(
                               folder.path,
                               rootNodeName
                             )
                           }}
-                        >
-                          {t("openInTerminal")}
-                        </ContextMenuItem>
-                      </ContextMenuSubContent>
-                    </ContextMenuSub>
-                    <ContextMenuItem
-                      onSelect={() =>
-                        void copyPathToClipboard(folder.path, {
-                          success: t("toasts.pathCopied"),
-                          failure: t("toasts.copyPathFailed"),
-                        })
-                      }
-                    >
-                      {t("copyPath")}
-                    </ContextMenuItem>
-                    {webMode && (
-                      <>
-                        <ContextMenuItem
-                          onSelect={() => handleRequestUpload("")}
-                        >
-                          {t("upload")}
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onSelect={() =>
-                            void handleRequestDownloadDir(rootTarget)
-                          }
-                        >
-                          {t("downloadAsZip")}
-                        </ContextMenuItem>
-                      </>
-                    )}
-                  </ContextMenuContent>
-                </ContextMenu>
+                          onOpenCode={() => {
+                            void openInCode(folder.path).catch((error) => {
+                              toast.error(t("toasts.openInCodeFailed"), {
+                                description: toErrorMessage(error),
+                              })
+                            })
+                          }}
+                        />
+                      </ContextMenuSub>
+                      <ContextMenuItem
+                        onSelect={() =>
+                          void copyPathToClipboard(folder.path, {
+                            success: t("toasts.pathCopied"),
+                            failure: t("toasts.copyPathFailed"),
+                          })
+                        }
+                      >
+                        {t("copyPath")}
+                      </ContextMenuItem>
+                      {webMode && (
+                        <>
+                          <ContextMenuItem
+                            onSelect={() => handleRequestUpload("")}
+                          >
+                            {t("upload")}
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onSelect={() =>
+                              void handleRequestDownloadDir(rootTarget)
+                            }
+                          >
+                            {t("downloadAsZip")}
+                          </ContextMenuItem>
+                        </>
+                      )}
+                    </ContextMenuContent>
+                  </ContextMenu>
+                </DesktopDropDirContext.Provider>
               )}
             </FileTree>
           </ScrollArea>

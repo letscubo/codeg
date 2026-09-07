@@ -8,7 +8,7 @@ import {
   Coins,
   CopyIcon,
   ListTodo,
-  Timer,
+  Split,
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
 import {
@@ -19,7 +19,6 @@ import {
 } from "@/components/ui/tooltip"
 import { useMessageScroll } from "@/components/message/message-scroll-context"
 import { useCreateTaskFromMessage } from "./use-create-task-from-message"
-import { formatElapsedLabel } from "@/lib/format-elapsed"
 import { formatTokenCount } from "@/lib/token-format"
 import { cn, copyTextToClipboard } from "@/lib/utils"
 import type { TurnUsage } from "@/lib/types"
@@ -34,6 +33,18 @@ interface TurnStatsProps {
   copyText?: string
   /** ISO timestamp marking when the assistant reply finished. */
   completedAt?: string | null
+  /** Fork the session at THIS reply. Undefined hides the affordance — the
+   * session has no live connection, the agent has no `session/fork`, or this
+   * surface doesn't own the conversation. */
+  onForkFromHere?: () => void
+  /** Forking is possible here but not right now. The button stays in place,
+   * greyed out, and says why on hover — it used to vanish for the length of
+   * every reply, which moved the whole icon row. */
+  forkDisabled?: boolean
+  /** Why it is greyed out: a turn is in flight (`busy`), or this reply has no
+   * name the backend can resolve yet (`unnamed` — the post-turn reparse fills
+   * it in a moment later). Only read while `forkDisabled`. */
+  forkDisabledReason?: "busy" | "unnamed"
 }
 
 const iconButtonClass =
@@ -48,12 +59,12 @@ export function TurnStats({
   isResponseComplete = true,
   copyText = "",
   completedAt,
+  onForkFromHere,
+  forkDisabled = false,
+  forkDisabledReason = "busy",
 }: TurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.messageList")
-  // Reuse the live timer's elapsed-unit strings so the per-turn duration
-  // tooltip renders the exact same localized "Xh Ym Zs" format.
-  const tLive = useTranslations("Folder.chat.liveTurnStats")
   const tTasks = useTranslations("Tasks")
   const scroll = useMessageScroll()
   const [isCopied, setIsCopied] = useState(false)
@@ -92,10 +103,13 @@ export function TurnStats({
   const displayModels = models?.length ? models : model ? [model] : []
   const hasCopy = copyText.trim().length > 0
   const hasUsage = Boolean(usage)
+  // The duration itself is shown by the reply's fold header
+  // (`CompletedTurnContent`), not here — this row only uses it as a signal that
+  // the turn was substantial.
   const hasDuration = typeof duration_ms === "number" && duration_ms > 0
   const hasCompletedAt = Boolean(completedLabel)
   // Usage OR duration: some agents (Cursor) never report per-turn token
-  // usage, but a turn with a duration chip is still a substantial reply
+  // usage, but a turn that took real time is still a substantial reply
   // worth jumping back from.
   const hasJump =
     isResponseComplete &&
@@ -128,7 +142,9 @@ export function TurnStats({
   )
 
   if (!isResponseComplete) return null
-  if (!hasCopy && !hasUsage && !hasDuration && !hasCompletedAt && !hasJump)
+  // Deliberately not gated on `hasDuration`: nothing in this row renders a
+  // duration any more, so a turn carrying only one would open an empty row.
+  if (!hasCopy && !hasUsage && !hasCompletedAt && !hasJump && !onForkFromHere)
     return null
 
   return (
@@ -169,6 +185,36 @@ export function TurnStats({
             </TooltipTrigger>
             <TooltipContent side="top">
               {tTasks("createFromMessage")}
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {onForkFromHere && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              {/* `aria-disabled`, deliberately NOT the native `disabled`: a
+                  disabled element receives no pointer events, so the tooltip —
+                  the only thing that says WHY the button is dead — would never
+                  open. Staying focusable also keeps it reachable by keyboard. */}
+              <button
+                type="button"
+                onClick={forkDisabled ? undefined : onForkFromHere}
+                aria-disabled={forkDisabled || undefined}
+                className={cn(
+                  iconButtonClass,
+                  forkDisabled &&
+                    "cursor-not-allowed opacity-50 hover:bg-transparent hover:text-muted-foreground"
+                )}
+                aria-label={t("forkFromHere")}
+              >
+                <Split aria-hidden="true" className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {forkDisabled
+                ? forkDisabledReason === "unnamed"
+                  ? t("forkNotReady")
+                  : t("forkBusy")
+                : t("forkFromHere")}
             </TooltipContent>
           </Tooltip>
         )}
@@ -237,24 +283,6 @@ export function TurnStats({
                   </div>
                 )}
               </div>
-            </TooltipContent>
-          </Tooltip>
-        )}
-        {hasDuration && duration_ms != null && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(iconButtonClass, "cursor-default")}
-                aria-label={t("duration")}
-              >
-                <Timer aria-hidden="true" className="h-3.5 w-3.5" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="top">
-              <span className="font-mono tabular-nums">
-                {formatElapsedLabel(duration_ms, tLive)}
-              </span>
             </TooltipContent>
           </Tooltip>
         )}

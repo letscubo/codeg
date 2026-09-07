@@ -1,7 +1,7 @@
 "use client"
 
 import { useRef, useState } from "react"
-import { Image as ImageIcon } from "lucide-react"
+import { Image as ImageIcon, Store } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
@@ -14,6 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useWorkspaceBackground } from "@/hooks/use-appearance"
+import { WorkspaceBackgroundMarketDialog } from "./workspace-background-market-dialog"
 import {
   MAX_WORKSPACE_BG_BYTES,
   WORKSPACE_BG_ACCEPT,
@@ -43,11 +44,14 @@ export function WorkspaceBackgroundSection() {
     workspaceBgImageUrl,
     setWorkspaceBackgroundImage,
     removeWorkspaceBackground,
+    downloadMarketWorkspaceBackground,
+    workspaceBgSourceUrl,
   } = useWorkspaceBackground()
 
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [marketOpen, setMarketOpen] = useState(false)
 
   const onChooseFile = async (file: File) => {
     setError(null)
@@ -159,6 +163,16 @@ export function WorkspaceBackgroundSection() {
                 ? t("workspaceBackground.replaceImage")
                 : t("workspaceBackground.chooseImage")}
             </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={disabled || busy}
+              onClick={() => setMarketOpen(true)}
+            >
+              <Store className="h-3.5 w-3.5" />
+              {t("workspaceBackground.market.open")}
+            </Button>
             {workspaceBgImageUrl && (
               <Button
                 type="button"
@@ -172,10 +186,10 @@ export function WorkspaceBackgroundSection() {
             )}
           </div>
         </div>
-        <p className="text-[11px] text-muted-foreground leading-4">
+        <p className="text-2xs text-muted-foreground leading-4">
           {t("workspaceBackground.formatHint")}
         </p>
-        {error && <p className="text-[11px] text-destructive">{error}</p>}
+        {error && <p className="text-2xs text-destructive">{error}</p>}
       </div>
 
       {/* ===== 填充模式 ===== */}
@@ -209,7 +223,7 @@ export function WorkspaceBackgroundSection() {
           <label className={fieldLabel}>
             {t("workspaceBackground.maskOpacity")}
           </label>
-          <span className="text-[11px] tabular-nums text-muted-foreground">
+          <span className="text-2xs tabular-nums text-muted-foreground">
             {pct(workspaceBgMaskOpacity)}
           </span>
         </div>
@@ -222,7 +236,7 @@ export function WorkspaceBackgroundSection() {
           onValueChange={([v]) => setWorkspaceBgMaskOpacity(v)}
           aria-label={t("workspaceBackground.maskOpacity")}
         />
-        <p className="text-[11px] text-muted-foreground leading-4">
+        <p className="text-2xs text-muted-foreground leading-4">
           {t("workspaceBackground.maskOpacityHint")}
         </p>
       </div>
@@ -233,7 +247,7 @@ export function WorkspaceBackgroundSection() {
           <label className={fieldLabel}>
             {t("workspaceBackground.imageBlur")}
           </label>
-          <span className="text-[11px] tabular-nums text-muted-foreground">
+          <span className="text-2xs tabular-nums text-muted-foreground">
             {workspaceBgImageBlur}px
           </span>
         </div>
@@ -254,7 +268,7 @@ export function WorkspaceBackgroundSection() {
           <label className={fieldLabel}>
             {t("workspaceBackground.panelOpacity")}
           </label>
-          <span className="text-[11px] tabular-nums text-muted-foreground">
+          <span className="text-2xs tabular-nums text-muted-foreground">
             {pct(workspaceBgPanelOpacity)}
           </span>
         </div>
@@ -267,10 +281,17 @@ export function WorkspaceBackgroundSection() {
           onValueChange={([v]) => setWorkspaceBgPanelOpacity(v)}
           aria-label={t("workspaceBackground.panelOpacity")}
         />
-        <p className="text-[11px] text-muted-foreground leading-4">
+        <p className="text-2xs text-muted-foreground leading-4">
           {t("workspaceBackground.panelOpacityHint")}
         </p>
       </div>
+
+      <WorkspaceBackgroundMarketDialog
+        open={marketOpen}
+        onOpenChange={setMarketOpen}
+        appliedSourceUrl={workspaceBgSourceUrl}
+        onApply={downloadMarketWorkspaceBackground}
+      />
     </section>
   )
 }

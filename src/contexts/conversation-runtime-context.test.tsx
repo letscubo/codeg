@@ -1911,6 +1911,206 @@ describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (cl
       }
     }
   })
+
+  // #494: the wire splits blocks at kind AND attribution boundaries, so a
+  // sub-agent chunk landing between two main-thread deltas ends the main
+  // block. Once the parented blocks are routed out, what remains is one
+  // uninterrupted run of the main agent's output — rendering it as N cards
+  // torn mid-word (`先看 cli` ⁄ `.py 怎么起 server`) is the reported bug, and
+  // it scales with the number of sub-agents streaming at once.
+  it("rejoins main-thread thinking torn apart by interleaved subagent chunks", () => {
+    const result = build([
+      agentCall("toolu_agent"),
+      { type: "thinking", text: "先看 cli" },
+      {
+        type: "thinking",
+        text: "子代理在读文件",
+        parentToolUseId: "toolu_agent",
+      },
+      { type: "thinking", text: ".py 怎么起 server、token 放哪。" },
+      {
+        type: "thinking",
+        text: "子代理还在读",
+        parentToolUseId: "toolu_agent",
+      },
+      { type: "thinking", text: "注意不要和子代理冲突——" },
+    ])
+    const thinking = result.turns
+      .flatMap((t) => t.blocks)
+      .filter((b) => b.type === "thinking")
+    expect(thinking).toEqual([
+      {
+        type: "thinking",
+        text: "先看 cli.py 怎么起 server、token 放哪。注意不要和子代理冲突——",
+      },
+    ])
+  })
+
+  it("rejoins main-thread text torn apart by interleaved subagent chunks", () => {
+    const result = build([
+      agentCall("toolu_agent"),
+      { type: "text", text: "C" },
+      { type: "text", text: "sub prose", parentToolUseId: "toolu_agent" },
+      { type: "text", text: "airn 的 agent 更换机制" },
+    ])
+    const text = result.turns
+      .flatMap((t) => t.blocks)
+      .filter((b) => b.type === "text")
+    expect(text).toEqual([{ type: "text", text: "Cairn 的 agent 更换机制" }])
+  })
+
+  it("rejoins one subagent's transcript split by a second subagent's chunks", () => {
+    const result = build([
+      agentCall("toolu_a"),
+      agentCall("toolu_b"),
+      { type: "thinking", text: "A 想了", parentToolUseId: "toolu_a" },
+      { type: "thinking", text: "B 也在想", parentToolUseId: "toolu_b" },
+      { type: "thinking", text: "一半", parentToolUseId: "toolu_a" },
+      { type: "text", text: "A 说完了", parentToolUseId: "toolu_a" },
+    ])
+    const carriers = result.turns
+      .flatMap((t) => t.blocks)
+      .filter((b) => b.type === "tool_result")
+    // Attribution still holds: A's run is one entry, B's is its own card.
+    expect(carriers.map((c) => c.agent_transcript)).toEqual([
+      [
+        { type: "thinking", text: "A 想了一半" },
+        { type: "text", text: "A 说完了" },
+      ],
+      [{ type: "thinking", text: "B 也在想" }],
+    ])
+  })
+
+  it("keeps a subagent's own tool call as a boundary in its transcript", () => {
+    // Another agent's chunks do not interrupt A's run, but A stopping to run
+    // a tool does — fusing across it would run two paragraphs together.
+    const result = build([
+      agentCall("toolu_a"),
+      { type: "thinking", text: "before", parentToolUseId: "toolu_a" },
+      {
+        type: "tool_call",
+        info: toolInfo({
+          tool_call_id: "toolu_child",
+          title: "Read",
+          meta: { claudeCode: { parentToolUseId: "toolu_a" } },
+        }),
+      },
+      { type: "thinking", text: "after", parentToolUseId: "toolu_a" },
+    ])
+    const carrier = result.turns
+      .flatMap((t) => t.blocks)
+      .find((b) => b.type === "tool_result")
+    expect(
+      carrier?.type === "tool_result" ? carrier.agent_transcript : null
+    ).toEqual([
+      { type: "thinking", text: "before" },
+      { type: "thinking", text: "after" },
+    ])
+  })
+
+  it("keeps a main-thread run split across a turn boundary", () => {
+    // A completed tool between two thinking blocks opens a new turn group —
+    // rejoining must not reach back across it.
+    const result = build([
+      { type: "thinking", text: "before" },
+      {
+        type: "tool_call",
+        info: toolInfo({ tool_call_id: "toolu_done", status: "completed" }),
+      },
+      { type: "thinking", text: "after" },
+    ])
+    expect(
+      result.turns.map((t) =>
+        t.blocks.filter((b) => b.type === "thinking").map((b) => b.text)
+      )
+    ).toEqual([["before"], ["after"]])
+  })
+
+  it("keeps a boundary that preprocessing removed (codex collab close)", () => {
+    // collapseLiveCollabBlocks folds a completed `closeAgent` into the spawn
+    // capsule, so by Phase 2 the two texts look adjacent. They are not: a real
+    // top-level tool call stood between them on the wire.
+    const collab = (id: string, title: string): LiveContentBlock => ({
+      type: "tool_call",
+      info: {
+        tool_call_id: id,
+        title,
+        kind: "other",
+        status: "completed",
+        content: null,
+        raw_input: JSON.stringify({
+          senderThreadId: "main",
+          receiverThreadIds: ["a1"],
+          agentsStates: { a1: { status: "completed", message: null } },
+        }),
+        raw_output_chunks: [],
+        raw_output_total_bytes: 0,
+        locations: null,
+        meta: null,
+        images: [],
+      },
+    })
+    const result = build([
+      collab("collab-spawn", "spawnAgent"),
+      { type: "text", text: "before" },
+      collab("collab-close", "closeAgent"),
+      { type: "text", text: "after" },
+    ])
+    expect(
+      result.turns
+        .flatMap((t) => t.blocks)
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+    ).toEqual(["before", "after"])
+  })
+
+  it("does not let a stale snapshot's empty text block re-split a run", () => {
+    // An empty text block renders nothing (Phase 2 drops it), so it is not a
+    // boundary. Neither producer emits one any more, but a snapshot taken by
+    // an older backend can still carry it.
+    const result = build([
+      { type: "thinking", text: "before" },
+      { type: "text", text: "" },
+      { type: "thinking", text: " after" },
+    ])
+    expect(
+      result.turns
+        .flatMap((t) => t.blocks)
+        .filter((b) => b.type === "thinking")
+        .map((b) => b.text)
+    ).toEqual(["before after"])
+  })
+
+  it("keeps a boundary the PLAN_UPDATE reducer relocated away", () => {
+    // `thinking → plan(v1) → thinking → plan(v2)` reaches the builder as two
+    // adjacent thinking blocks: PLAN_UPDATE keeps one plan and moves it to the
+    // end. The split predicate never leaves same-kind main prose adjacent, so
+    // that shape means a boundary was removed — do not fuse across it.
+    const result = build([
+      { type: "thinking", text: "before" },
+      { type: "thinking", text: "after" },
+      { type: "plan", entries: [] },
+    ])
+    expect(
+      result.turns
+        .flatMap((t) => t.blocks)
+        .filter((b) => b.type === "thinking")
+        .map((b) => b.text)
+    ).toEqual(["before", "after"])
+  })
+
+  it("keeps a plan block between two thinking blocks from fusing them", () => {
+    const result = build([
+      { type: "thinking", text: "before" },
+      { type: "plan", entries: [] },
+      { type: "thinking", text: "after" },
+    ])
+    expect(
+      result.turns
+        .flatMap((t) => t.blocks)
+        .map((b) => (b.type === "thinking" ? b.text : b.type))
+    ).toEqual(["before", "plan", "after"])
+  })
 })
 
 describe("buildStreamingTurnsFromLiveMessage — Kimi TodoList suppression", () => {
@@ -2263,5 +2463,540 @@ describe("buildStreamingTurnsFromLiveMessage — codex search/list-files command
     expect(result?.type === "tool_result" ? result.output_preview : null).toBe(
       output
     )
+  })
+})
+
+/**
+ * A message sent WHILE the agent is replying (native `_session/steering`)
+ * reaches the agent as a user message, so the transcript shows it as one.
+ *
+ * Before this, the live view dropped it entirely: the strip above the composer
+ * was the only trace, and because no user turn landed between the two halves
+ * of the reply, the answer to the steered message continued inside the SAME
+ * assistant bubble - two separate replies rendered as one run-on paragraph.
+ *
+ * The persisted projection already did the right thing (see the
+ * `user_message_chunk` arm of `project_turns` in `parsers/acp_native.rs`,
+ * which flushes the assistant turn and pushes a user turn), so this is what
+ * makes the live view agree with a reload.
+ */
+/** When the backend injected the steered message — its note's `created_at`,
+ *  stamped where the agent runs. Later than the `turn()` helper's default
+ *  timestamp below, so an unrelated turn from earlier history is provably
+ *  older than any steer in these tests. */
+const STEER_AT = "2026-05-28T00:05:00.000Z"
+/** A turn the agent wrote after that injection — i.e. its own copy. */
+const AFTER_STEER = "2026-05-28T00:05:01.000Z"
+
+describe("buildStreamingTurnsFromLiveMessage - mid-turn steering messages", () => {
+  function live(content: LiveContentBlock[]): LiveMessage {
+    return { id: "lm-steer", role: "assistant", content, startedAt: 0 }
+  }
+
+  it("stamps the message with the instant it was sent, not the turn's start", () => {
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "text", text: "working on it" },
+        { type: "steering", id: "note-1", text: "stop", createdAt: STEER_AT },
+      ])
+    ).turns
+    const [reply, user] = turns
+    expect(user.timestamp).toBe(STEER_AT)
+    expect(reply.timestamp).toBe(new Date(0).toISOString())
+  })
+
+  it("falls back to the turn's start when the stamp is unreadable", () => {
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([{ type: "steering", id: "note-1", text: "stop", createdAt: "" }])
+    ).turns
+    expect(turns[0].timestamp).toBe(new Date(0).toISOString())
+  })
+
+  it("renders a steered attachment as its blocks, not as the display text", () => {
+    // `text` is what the composer collapsed the draft into, so a steer that
+    // carried an image must render from `blocks` — otherwise the running turn
+    // shows a sentence about the image and only a reload puts the image back.
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        {
+          type: "steering",
+          id: "note-1",
+          text: "this colour",
+          createdAt: STEER_AT,
+          blocks: [
+            { type: "text", text: "this colour" },
+            {
+              type: "image",
+              data: "aGk=",
+              mime_type: "image/png",
+              uri: null,
+            },
+          ],
+        },
+      ])
+    ).turns
+    expect(turns[0].role).toBe("user")
+    expect(turns[0].blocks).toEqual([
+      { type: "text", text: "this colour" },
+      { type: "image", data: "aGk=", mime_type: "image/png", uri: null },
+    ])
+  })
+
+  it("still renders a text-only steer from its text alone", () => {
+    // The historical shape: no blocks on the note, so nothing about the
+    // text-only path changes.
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "steering", id: "note-1", text: "stop", createdAt: STEER_AT },
+      ])
+    ).turns
+    expect(turns[0].blocks).toEqual([{ type: "text", text: "stop" }])
+  })
+
+  it("renders a delivered mid-turn message as its own user turn", () => {
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "text", text: "working on it" },
+        {
+          type: "steering",
+          id: "note-1",
+          text: "actually, use the other API",
+          createdAt: STEER_AT,
+        },
+      ])
+    ).turns
+
+    const user = turns.filter((t) => t.role === "user")
+    expect(user).toHaveLength(1)
+    expect(user[0].blocks).toEqual([
+      { type: "text", text: "actually, use the other API" },
+    ])
+  })
+
+  it("splits the reply at the boundary so two answers never share one bubble", () => {
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "text", text: "I will report both links once CI is green." },
+        {
+          type: "steering",
+          id: "note-1",
+          text: "not done",
+          createdAt: STEER_AT,
+        },
+        { type: "text", text: "Not done - those are the two PRs..." },
+      ])
+    ).turns
+
+    expect(turns.map((t) => t.role)).toEqual(["assistant", "user", "assistant"])
+    // The two replies stay in separate turns; concatenating them into one
+    // block is exactly the run-on paragraph this fixes.
+    expect(turns[0].blocks).toEqual([
+      { type: "text", text: "I will report both links once CI is green." },
+    ])
+    expect(turns[2].blocks).toEqual([
+      { type: "text", text: "Not done - those are the two PRs..." },
+    ])
+    // Distinct ids, or the timeline dedup would collapse them back together.
+    expect(new Set(turns.map((t) => t.id)).size).toBe(3)
+  })
+
+  it("splits even when the round has no completed tool call before it", () => {
+    // The ordinary round split needs a settled tool call first; a user
+    // interrupting mid-sentence is a boundary regardless.
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "thinking", text: "hmm" },
+        { type: "steering", id: "note-1", text: "stop", createdAt: STEER_AT },
+        { type: "text", text: "ok" },
+      ])
+    ).turns
+    expect(turns.map((t) => t.role)).toEqual(["assistant", "user", "assistant"])
+  })
+
+  it("keeps prose either side of it in separate blocks", () => {
+    // `mainProseContinuations` fuses same-kind prose only across blocks that
+    // render nothing. A steering turn renders, so it must break the run.
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "text", text: "first" },
+        { type: "steering", id: "note-1", text: "wait", createdAt: STEER_AT },
+        { type: "text", text: "second" },
+      ])
+    ).turns
+    expect(turns[0].blocks).toEqual([{ type: "text", text: "first" }])
+    expect(turns[2].blocks).toEqual([{ type: "text", text: "second" }])
+  })
+
+  it("carries several steering messages in the order they were sent", () => {
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "text", text: "a" },
+        { type: "steering", id: "n1", text: "one", createdAt: STEER_AT },
+        { type: "text", text: "b" },
+        { type: "steering", id: "n2", text: "two", createdAt: STEER_AT },
+        { type: "text", text: "c" },
+      ])
+    ).turns
+    expect(turns.map((t) => t.role)).toEqual([
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ])
+    expect(
+      turns
+        .filter((t) => t.role === "user")
+        .map((t) => (t.blocks[0].type === "text" ? t.blocks[0].text : ""))
+    ).toEqual(["one", "two"])
+  })
+
+  it("leaves a turn with no steering completely unchanged", () => {
+    const turns = buildStreamingTurnsFromLiveMessage(
+      1,
+      live([
+        { type: "thinking", text: "think" },
+        { type: "text", text: "reply" },
+      ])
+    ).turns
+    expect(turns).toHaveLength(1)
+    expect(turns[0].role).toBe("assistant")
+  })
+})
+
+/**
+ * The agent writes a steered message into its own transcript, so a detail
+ * fetch landing DURING the turn brings it back as an ordinary user turn under
+ * a parser-assigned id - which no id-keyed dedup can match to the live copy.
+ * Both would render. The live copy is kept because it sits between the two
+ * halves of the reply; the persisted one would land after the whole thing.
+ */
+describe("conversation timeline - a steered message survives a mid-turn reload once", () => {
+  const runtimeHolder: {
+    current: ReturnType<typeof useConversationRuntime> | undefined
+  } = { current: undefined }
+
+  function RuntimeCapture() {
+    const runtime = useConversationRuntime()
+    useEffect(() => {
+      runtimeHolder.current = runtime
+    })
+    return null
+  }
+
+  function turn(
+    id: string,
+    role: "user" | "assistant",
+    text: string,
+    timestamp = "2026-05-28T00:00:00.000Z"
+  ): MessageTurn {
+    return {
+      id,
+      role,
+      blocks: [{ type: "text" as const, text }],
+      timestamp,
+    }
+  }
+
+  function detailWith(
+    turns: MessageTurn[],
+    inFlightUserTurnId: string | null
+  ): DbConversationDetail {
+    return {
+      summary: {
+        id: 99,
+        folder_id: 1,
+        agent_type: "claude",
+        title: "c",
+        title_locked: false,
+        status: "in_progress",
+        kind: "regular",
+        model: null,
+        git_branch: null,
+        external_id: "ext-1",
+        message_count: turns.length,
+        child_count: 0,
+        created_at: "2026-05-28T00:00:00.000Z",
+        updated_at: "2026-05-28T00:00:00.000Z",
+        pinned_at: null,
+      },
+      turns,
+      session_stats: null,
+      in_flight_user_turn_id: inFlightUserTurnId,
+    } as DbConversationDetail
+  }
+
+  function userTexts(
+    items: ReturnType<
+      NonNullable<typeof runtimeHolder.current>["getTimelineTurns"]
+    >
+  ): string[] {
+    return items
+      .filter((t) => t.turn.role === "user")
+      .map((t) =>
+        t.turn.blocks[0]?.type === "text" ? t.turn.blocks[0].text : ""
+      )
+  }
+
+  beforeEach(() => {
+    runtimeHolder.current = undefined
+    mockGetFolderConversation.mockReset()
+    mockGetFolderConversation.mockImplementation(() => new Promise(() => {}))
+  })
+
+  it("shows the steered message once, keeping the live copy's position", async () => {
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+
+    // The turn is running and the reply has been split by a steering message.
+    act(() => {
+      api().setLiveMessage(
+        99,
+        {
+          id: "lm-1",
+          role: "assistant",
+          content: [
+            { type: "text", text: "half one" },
+            {
+              type: "steering",
+              id: "note-1",
+              text: "use the other API",
+              createdAt: STEER_AT,
+            },
+            { type: "text", text: "half two" },
+          ],
+          startedAt: 0,
+        },
+        true
+      )
+    })
+
+    // A mid-turn detail fetch lands, carrying the agent's own record of that
+    // same message under a parser id — written after the injection, which is
+    // what marks it as this message's copy. The backend cannot stamp an
+    // in-flight prompt here: it matches the pending prompt against the
+    // transcript TAIL, and the tail is now the steered message.
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith(
+        [
+          turn("p-1", "user", "the original prompt"),
+          turn("p-2", "user", "use the other API", AFTER_STEER),
+        ],
+        null
+      )
+    )
+    await act(async () => {
+      api().refetchDetail(99, { preserveLive: true })
+    })
+
+    const timeline = api().getTimelineTurns(99)
+    // Once, not twice - and the original prompt is untouched.
+    expect(userTexts(timeline)).toEqual([
+      "the original prompt",
+      "use the other API",
+    ])
+    const steered = timeline.filter(
+      (t) =>
+        t.turn.role === "user" &&
+        t.turn.blocks[0]?.type === "text" &&
+        t.turn.blocks[0].text === "use the other API"
+    )
+    // The surviving copy is the live one, between the halves of the reply.
+    expect(steered).toHaveLength(1)
+    expect(steered[0].phase).toBe("streaming")
+  })
+
+  it("never suppresses this round's prompt, even when a steer repeats it", async () => {
+    // And with NO in-flight stamp, which is the shape the backend produces
+    // once the steered message is on the transcript tail: the prompt is safe
+    // because the agent wrote it before the user steered, not because it was
+    // named.
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    act(() => {
+      api().setLiveMessage(
+        99,
+        {
+          id: "lm-2",
+          role: "assistant",
+          content: [
+            {
+              type: "steering",
+              id: "note-1",
+              text: "continue",
+              createdAt: STEER_AT,
+            },
+          ],
+          startedAt: 0,
+        },
+        true
+      )
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith([turn("p-1", "user", "continue")], null)
+    )
+    await act(async () => {
+      api().refetchDetail(99, { preserveLive: true })
+    })
+    // Both survive: hiding a prompt is the one failure worse than showing a
+    // duplicate.
+    expect(userTexts(api().getTimelineTurns(99))).toEqual([
+      "continue",
+      "continue",
+    ])
+  })
+
+  it("leaves an earlier round's identical prompt in history", async () => {
+    // Steered text is short and repeatable ("continue", "stop"), and content is
+    // the only thing linking the live copy to the persisted one. Matching it
+    // across the whole window would hide the SAME words the user sent three
+    // rounds ago for as long as this turn runs. Only a turn written after the
+    // injection can be a copy of it.
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    act(() => {
+      api().setLiveMessage(
+        99,
+        {
+          id: "lm-3",
+          role: "assistant",
+          content: [
+            { type: "text", text: "half one" },
+            {
+              type: "steering",
+              id: "note-1",
+              text: "continue",
+              createdAt: STEER_AT,
+            },
+            { type: "text", text: "half two" },
+          ],
+          startedAt: 0,
+        },
+        true
+      )
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith(
+        [
+          turn("p-1", "user", "continue"), // an earlier round, same words
+          turn("p-2", "assistant", "sure"),
+          turn("p-3", "user", "now do the thing"), // this turn's prompt
+          turn("p-4", "user", "continue", AFTER_STEER), // the agent's copy
+        ],
+        null
+      )
+    )
+    await act(async () => {
+      api().refetchDetail(99, { preserveLive: true })
+    })
+    // History intact; only the copy inside the running round is folded away.
+    expect(userTexts(api().getTimelineTurns(99))).toEqual([
+      "continue",
+      "now do the thing",
+      "continue",
+    ])
+    const steered = api()
+      .getTimelineTurns(99)
+      .filter(
+        (t) =>
+          t.turn.role === "user" &&
+          t.turn.blocks[0]?.type === "text" &&
+          t.turn.blocks[0].text === "continue"
+      )
+    expect(steered.map((t) => t.phase)).toEqual(["persisted", "streaming"])
+  })
+
+  it("suppresses nothing when the message carries no readable instant", async () => {
+    // An unparseable stamp on either side leaves no way to tell this round's
+    // copy from an older message, so both copies render — a duplicate, never a
+    // disappearance.
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    act(() => {
+      api().setLiveMessage(
+        99,
+        {
+          id: "lm-4",
+          role: "assistant",
+          content: [
+            { type: "steering", id: "note-1", text: "continue", createdAt: "" },
+          ],
+          startedAt: Date.parse(STEER_AT),
+        },
+        true
+      )
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith([turn("p-9", "user", "continue", AFTER_STEER)], null)
+    )
+    await act(async () => {
+      api().refetchDetail(99, { preserveLive: true })
+    })
+    expect(userTexts(api().getTimelineTurns(99))).toEqual([
+      "continue",
+      "continue",
+    ])
+  })
+
+  it("leaves a promoted local turn from an earlier round alone", async () => {
+    // `localTurns` render as phase "persisted" but are NOT part of the detail's
+    // projection — a mid-turn refetch preserves them, and they are stamped from
+    // the client clock, so they are never compared against the injection
+    // instant. Only what the detail itself lists can be the agent's copy.
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    const earlierReply: LiveMessage = {
+      id: "lm-earlier",
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      startedAt: 0,
+    }
+    act(() => {
+      api().appendOptimisticTurn(99, turn("o-1", "user", "continue"), "o-1")
+    })
+    act(() => {
+      api().completeTurn(99, earlierReply)
+    })
+    act(() => {
+      api().setLiveMessage(
+        99,
+        {
+          id: "lm-5",
+          role: "assistant",
+          content: [
+            { type: "text", text: "half one" },
+            {
+              type: "steering",
+              id: "note-1",
+              text: "continue",
+              createdAt: STEER_AT,
+            },
+            { type: "text", text: "half two" },
+          ],
+          startedAt: 0,
+        },
+        true
+      )
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith([turn("p-1", "user", "now do the thing")], "p-1")
+    )
+    await act(async () => {
+      api().refetchDetail(99, { preserveLive: true })
+    })
+    expect(userTexts(api().getTimelineTurns(99))).toEqual([
+      "now do the thing",
+      "continue", // the earlier round's promoted prompt
+      "continue", // this round's steer, live
+    ])
   })
 })

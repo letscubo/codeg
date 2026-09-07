@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  adapterChannelFromEnv,
+  adapterChannelFromEnvText,
   applyClaudeProviderToConfigText,
   buildCodexSandboxConfig,
   codexSandboxBaselineOf,
@@ -21,9 +23,12 @@ import {
   patchCodexConfigTomlText,
   patchEnvByImportantKey,
   patchImportantConfigText,
+  codexSandboxSeedsAcpPreset,
   rebaseDeepSeekDraft,
+  setAdapterChannel,
   setClaudeEnvFlagInConfigText,
   setHostToolsAgentMode,
+  showsCodexReadOnlyAcpWarning,
 } from "./acp-agent-settings"
 import { parse as parseTomlDocument } from "smol-toml"
 import type {
@@ -824,6 +829,77 @@ describe("buildVersionCheck", () => {
     expect(check?.status).toBe("fail")
     expect(check?.fixes).toHaveLength(0)
   })
+
+  // The opt-in latest channel keeps the Upgrade action available in the pass
+  // state: an installed latest-channel agent normally sits AT or AHEAD of the
+  // pin, so the compare-to-pin flow would never offer an upgrade again — and
+  // codeg cannot know whether npm has something newer, because nothing polls
+  // in the background.
+  it("keeps Upgrade available for an installed latest-channel npx agent", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "gemini" as AgentType,
+        distribution_type: "npx",
+        registry_version: "0.57.0",
+        installed_version: "0.60.0",
+        env: { CODEG_ADAPTER_CHANNEL: "latest" },
+      })
+    )
+    expect(check?.status).toBe("pass")
+    expect(check?.message).toContain("Latest channel")
+    expect(check?.fixes.some((fix) => fix.kind === "upgrade_npx")).toBe(true)
+    expect(check?.fixes.some((fix) => fix.kind === "uninstall_npx")).toBe(true)
+  })
+
+  // The pinned default's pass state is byte-for-byte what it was before the
+  // channel existed.
+  it("leaves the pinned default's pass state unchanged", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "gemini" as AgentType,
+        distribution_type: "npx",
+        registry_version: "0.57.0",
+        installed_version: "0.57.0",
+      })
+    )
+    expect(check?.status).toBe("pass")
+    expect(check?.message).toContain("Already latest")
+    expect(check?.fixes.some((fix) => fix.kind === "upgrade_npx")).toBe(false)
+  })
+
+  // A latest-channel agent below the pin still warns: the upgrade it offers
+  // resolves the `latest` dist-tag, which is at least the pin.
+  it("still warns when a latest-channel agent sits below the pin", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "gemini" as AgentType,
+        distribution_type: "npx",
+        registry_version: "0.57.0",
+        installed_version: "0.50.0",
+        env: { CODEG_ADAPTER_CHANNEL: "latest" },
+      })
+    )
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain("Upgrade available")
+  })
+
+  // The channel is an npx concept (an npm dist-tag), so the same env key on a
+  // binary agent must not rewrite its version card.
+  it("ignores the channel key on a non-npx agent", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "open_code" as AgentType,
+        distribution_type: "binary",
+        registry_version: "1.0.0",
+        installed_version: "1.0.0",
+        env: { CODEG_ADAPTER_CHANNEL: "latest" },
+      })
+    )
+    expect(check?.message).toContain("Already latest")
+    expect(check?.fixes.some((fix) => fix.kind === "upgrade_binary")).toBe(
+      false
+    )
+  })
 })
 
 describe("getAgentChecks uv gating", () => {
@@ -1406,6 +1482,34 @@ describe("patchCodexConfigTomlText — codeg's requires_openai_auth default", ()
   })
 })
 
+// The panel used to ship a Reasoning Effort dropdown, and the writer rewrote
+// `model_reasoning_effort` on EVERY patch with "high" as the parse default. So
+// touching any unrelated control injected a key the user never asked for and
+// silently overrode codex's own per-model default. The control is gone and the
+// key is no longer managed here — it belongs to the raw config.toml editor.
+describe("codex model_reasoning_effort is not managed by the panel", () => {
+  const KEY = "model_reasoning_effort"
+
+  it("does not inject the key when another control moves", () => {
+    for (const patch of [
+      { model: "gpt-5" },
+      { apiBaseUrl: "https://api.example/v1" },
+      { supportsWebsockets: true },
+      { skills: true },
+      { defaultModeRequestUserInput: true },
+      { serviceTierFast: true },
+    ]) {
+      expect(patchCodexConfigTomlText("", patch)).not.toContain(KEY)
+    }
+  })
+
+  it("leaves a hand-written value untouched", () => {
+    const toml = ['model = "gpt-5"', `${KEY} = "low"`].join("\n")
+    const result = patchCodexConfigTomlText(toml, { supportsWebsockets: true })
+    expect(result).toContain(`${KEY} = "low"`)
+  })
+})
+
 describe("codex [features].default_mode_request_user_input toggle", () => {
   const KEY = "default_mode_request_user_input"
 
@@ -1731,6 +1835,50 @@ describe("host-tools toggle — hand the fs/terminal channels back to the agent"
   })
 })
 
+describe("adapter-channel control — opt into the latest adapter release", () => {
+  const KEY = "CODEG_ADAPTER_CHANNEL"
+
+  it("defaults to pinned for an agent that has never touched the control", () => {
+    expect(adapterChannelFromEnvText("")).toBe("pinned")
+    expect(adapterChannelFromEnvText("XAI_API_KEY=abc")).toBe("pinned")
+    expect(adapterChannelFromEnv({})).toBe("pinned")
+  })
+
+  it("round-trips latest and back to pinned", () => {
+    const latest = setAdapterChannel("XAI_API_KEY=abc", "latest")
+    expect(latest).toContain(`${KEY}=latest`)
+    expect(adapterChannelFromEnvText(latest)).toBe("latest")
+
+    // Pinned DELETES the key: unlike the host-tools knob there is no
+    // process-env second layer that could make "absent" mean something else,
+    // so absent is unambiguously the default on both sides, and the raw
+    // editor stays free of a key that only restates it.
+    const pinned = setAdapterChannel(latest, "pinned")
+    expect(pinned).not.toContain(KEY)
+    expect(adapterChannelFromEnvText(pinned)).toBe("pinned")
+    expect(pinned).toContain("XAI_API_KEY=abc")
+  })
+
+  it("reads only the exact sentinel, matching the Rust reader", () => {
+    // `adapter_channel_is_latest` (commands/acp.rs) treats exactly the trimmed
+    // `latest` as the opt-in; everything else stays on the reviewed pin.
+    expect(adapterChannelFromEnvText(`${KEY}=latest`)).toBe("latest")
+    expect(adapterChannelFromEnvText(`${KEY} = latest `)).toBe("latest")
+    expect(adapterChannelFromEnvText(`${KEY}=Latest`)).toBe("pinned")
+    expect(adapterChannelFromEnvText(`${KEY}=pinned`)).toBe("pinned")
+    expect(adapterChannelFromEnvText(`${KEY}=`)).toBe("pinned")
+    expect(adapterChannelFromEnv({ [KEY]: "latest" })).toBe("latest")
+    expect(adapterChannelFromEnv({ [KEY]: "nightly" })).toBe("pinned")
+  })
+
+  it("does not double up when selected twice", () => {
+    const once = setAdapterChannel("", "latest")
+    const twice = setAdapterChannel(once, "latest")
+    expect(twice).toBe(once)
+    expect(twice.match(new RegExp(KEY, "g"))).toHaveLength(1)
+  })
+})
+
 describe("rebaseDeepSeekDraft", () => {
   // Only the fields this helper reads or writes; the rest of AgentDraft is
   // spread through untouched, which the identity assertion below pins.
@@ -1936,5 +2084,33 @@ describe("important env keys", () => {
         "qmodel_38max"
       )
     ).toContain("QODER_MODEL=qmodel_38max")
+  })
+})
+
+describe("codex ACP preset disclosures", () => {
+  // Every claim the panel makes about the seeded approval preset is only true
+  // when a preset is actually seeded. `default_permissions` shadowing means
+  // `codex_initial_agent_mode` declines to map the config at all, so the
+  // session falls back to the adapter's `agent` default — whose approvals are
+  // pre-screened by a model, not routed to the user.
+  it("stops claiming a seeded preset once default_permissions shadows the keys", () => {
+    expect(codexSandboxSeedsAcpPreset(false)).toBe(true)
+    expect(codexSandboxSeedsAcpPreset(true)).toBe(false)
+  })
+
+  it("only warns about the lost read-only sandbox when codeg really seeds read-only", () => {
+    // Unshadowed read-only: codeg injects the `read-only` preset, which on
+    // codex-acp >=1.7.0 is workspace-write with `approvalsReviewer: "user"`.
+    // Both halves of the warning hold.
+    expect(showsCodexReadOnlyAcpWarning("read-only", false)).toBe(true)
+    // Shadowed: no preset is injected, so the warning's promise that every
+    // escalation reaches the user would be false — and it would sit directly
+    // under `sandboxShadowedWarning` saying the key is ignored.
+    expect(showsCodexReadOnlyAcpWarning("read-only", true)).toBe(false)
+    // Other sandbox modes never select the read-only preset ("" = unset).
+    for (const mode of ["workspace-write", "danger-full-access", ""] as const) {
+      expect(showsCodexReadOnlyAcpWarning(mode, false)).toBe(false)
+      expect(showsCodexReadOnlyAcpWarning(mode, true)).toBe(false)
+    }
   })
 })

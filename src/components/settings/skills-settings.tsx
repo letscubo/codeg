@@ -70,6 +70,7 @@ import type {
   FolderHistoryEntry,
 } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
+import { joinFsPath } from "@/lib/path-utils"
 
 type SkillsTranslator = (
   key: string,
@@ -111,13 +112,6 @@ function defaultSkillLayoutForAgent(
   return null
 }
 
-function pathJoin(base: string, suffix: string): string {
-  if (base.endsWith("/") || base.endsWith("\\")) {
-    return `${base}${suffix}`
-  }
-  return `${base}/${suffix}`
-}
-
 function buildDraftPathPreview(params: {
   location: AgentSkillLocation | null
   id: string
@@ -129,11 +123,14 @@ function buildDraftPathPreview(params: {
   if (isExisting && selectedSkillPath) return selectedSkillPath
   if (!location || !id.trim()) return null
 
+  // `location.path` is a native OS path, so the preview has to be joined with
+  // that path's own separator — a hardcoded "/" made the Windows hint read
+  // `C:\Users\me\.claude\skills/my-skill/SKILL.md`.
   const trimmedId = id.trim()
   if (layout === "skill_directory") {
-    return pathJoin(location.path, `${trimmedId}/SKILL.md`)
+    return joinFsPath(location.path, `${trimmedId}/SKILL.md`)
   }
-  return pathJoin(location.path, `${trimmedId}.md`)
+  return joinFsPath(location.path, `${trimmedId}.md`)
 }
 
 function dirname(path: string): string {
@@ -861,7 +858,7 @@ export function SkillsSettings() {
                                 <span className="text-xs font-medium shrink-0">
                                   {folder.name}
                                 </span>
-                                <span className="text-[10px] text-muted-foreground truncate">
+                                <span className="text-3xs text-muted-foreground truncate">
                                   {folder.path}
                                 </span>
                               </span>
@@ -966,7 +963,7 @@ export function SkillsSettings() {
                                   </Badge>
                                 )}
                               </div>
-                              <div className="text-[11px] text-muted-foreground truncate mt-1">
+                              <div className="text-2xs text-muted-foreground truncate mt-1">
                                 {skill.path}
                               </div>
                             </button>
@@ -1086,7 +1083,7 @@ export function SkillsSettings() {
                             <Badge
                               variant="outline"
                               title={t("systemHint")}
-                              className="h-5 px-1.5 text-[10px] leading-none shrink-0 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                              className="h-5 px-1.5 text-3xs leading-none shrink-0 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
                             >
                               {t("systemBadge")}
                             </Badge>
@@ -1136,7 +1133,7 @@ export function SkillsSettings() {
 
                       <div className="flex-1 overflow-y-auto p-4 space-y-4">
                         <div className="rounded-md border p-3 space-y-2.5">
-                          <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+                          <div className="text-2xs text-muted-foreground flex items-center gap-1">
                             <BookOpenText className="h-3.5 w-3.5" />
                             {t("skillInfo")}
                           </div>
@@ -1156,24 +1153,24 @@ export function SkillsSettings() {
                           />
 
                           {skillsScope === "folder" && !selectedFolderPath ? (
-                            <div className="text-[11px] text-muted-foreground break-all">
+                            <div className="text-2xs text-muted-foreground break-all">
                               {t("scope.pickFolderHint")}
                             </div>
                           ) : draftPathPreview ? (
-                            <div className="text-[11px] text-muted-foreground break-all">
+                            <div className="text-2xs text-muted-foreground break-all">
                               {t("skillsDirectoryWithPath", {
                                 path: draftPathPreview,
                               })}
                             </div>
                           ) : (
-                            <div className="text-[11px] text-muted-foreground break-all">
+                            <div className="text-2xs text-muted-foreground break-all">
                               {t("skillsDirectoryNeedId")}
                             </div>
                           )}
                         </div>
 
                         <div className="rounded-md border p-3 space-y-2">
-                          <div className="text-[11px] text-muted-foreground flex items-center justify-between gap-2">
+                          <div className="text-2xs text-muted-foreground flex items-center justify-between gap-2">
                             <span>{t("markdownContent")}</span>
                             <div className="flex items-center gap-1.5">
                               <span>
@@ -1222,7 +1219,7 @@ export function SkillsSettings() {
                             <div className="space-y-2">
                               {parsedPreviewContent.frontMatterRaw && (
                                 <div className="rounded-md border bg-muted/10 p-3">
-                                  <div className="text-[11px] text-muted-foreground mb-2">
+                                  <div className="text-2xs text-muted-foreground mb-2">
                                     {t("metadataTitle")}
                                   </div>
                                   {parsedPreviewContent.fields.length > 0 ? (
@@ -1231,7 +1228,7 @@ export function SkillsSettings() {
                                         (field) => (
                                           <div
                                             key={field.key}
-                                            className="text-xs grid grid-cols-[100px_1fr] gap-2 items-start"
+                                            className="text-xs grid grid-cols-[6.25rem_1fr] gap-2 items-start"
                                           >
                                             <span className="text-muted-foreground font-mono truncate">
                                               {field.key}
@@ -1283,7 +1280,7 @@ export function SkillsSettings() {
                           )}
 
                           {skillReading && (
-                            <div className="text-[11px] text-muted-foreground">
+                            <div className="text-2xs text-muted-foreground">
                               {t("loadingSkill")}
                             </div>
                           )}

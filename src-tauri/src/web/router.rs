@@ -66,6 +66,18 @@ pub fn build_router(
             post(handlers::delegation::set_delegation_settings),
         )
         .route(
+            "/get_codeg_mcp_service_status",
+            post(handlers::mcp_service::get_codeg_mcp_service_status),
+        )
+        .route(
+            "/start_codeg_mcp_service",
+            post(handlers::mcp_service::start_codeg_mcp_service),
+        )
+        .route(
+            "/set_codeg_mcp_tool_group",
+            post(handlers::mcp_service::set_codeg_mcp_tool_group),
+        )
+        .route(
             "/get_feedback_settings",
             post(handlers::feedback::get_feedback_settings),
         )
@@ -182,6 +194,7 @@ pub fn build_router(
         )
         .route("/get_folder", post(handlers::folders::get_folder))
         .route("/open_folder", post(handlers::folders::open_folder))
+        .route("/open_in_code", post(handlers::folders::open_in_code))
         .route(
             "/open_worktree_folder",
             post(handlers::folders::open_worktree_folder),
@@ -202,7 +215,30 @@ pub fn build_router(
             "/remove_folder_from_workspace",
             post(handlers::folders::remove_folder_from_workspace),
         )
-        .route("/reorder_folders", post(handlers::folders::reorder_folders))
+        .route(
+            "/list_folder_groups",
+            post(handlers::folders::list_folder_groups),
+        )
+        .route(
+            "/create_folder_group",
+            post(handlers::folders::create_folder_group),
+        )
+        .route(
+            "/update_folder_group",
+            post(handlers::folders::update_folder_group),
+        )
+        .route(
+            "/delete_folder_group",
+            post(handlers::folders::delete_folder_group),
+        )
+        .route(
+            "/apply_sidebar_layout",
+            post(handlers::folders::apply_sidebar_layout),
+        )
+        .route(
+            "/set_folder_group",
+            post(handlers::folders::set_folder_group),
+        )
         .route(
             "/update_folder_color",
             post(handlers::folders::update_folder_color),
@@ -238,6 +274,39 @@ pub fn build_router(
         .route(
             "/remove_folder_link",
             post(handlers::folder_links::remove_folder_link),
+        )
+        // ─── Canvas ───
+        .route(
+            "/canvas_list_nodes",
+            post(handlers::canvas::canvas_list_nodes),
+        )
+        .route(
+            "/canvas_create_node",
+            post(handlers::canvas::canvas_create_node),
+        )
+        .route(
+            "/canvas_group_into_region",
+            post(handlers::canvas::canvas_group_into_region),
+        )
+        .route(
+            "/canvas_update_node",
+            post(handlers::canvas::canvas_update_node),
+        )
+        .route(
+            "/canvas_move_nodes",
+            post(handlers::canvas::canvas_move_nodes),
+        )
+        .route(
+            "/canvas_detach_member",
+            post(handlers::canvas::canvas_detach_member),
+        )
+        .route(
+            "/canvas_delete_node",
+            post(handlers::canvas::canvas_delete_node),
+        )
+        .route(
+            "/canvas_delete_nodes",
+            post(handlers::canvas::canvas_delete_nodes),
         )
         .route(
             "/add_folder_to_history",
@@ -327,6 +396,10 @@ pub fn build_router(
             post(handlers::git::git_commit_branches),
         )
         .route("/git_show_file", post(handlers::git::git_show_file))
+        .route(
+            "/git_show_file_base64",
+            post(handlers::git::git_show_file_base64),
+        )
         .route("/git_diff", post(handlers::git::git_diff))
         .route(
             "/git_diff_with_branch",
@@ -486,7 +559,14 @@ pub fn build_router(
             "/backup_upload",
             post(handlers::backup::backup_upload).layer(DefaultBodyLimit::disable()),
         )
-        .route("/backup_inspect", post(handlers::backup::backup_inspect))
+        .route(
+            "/backup_prepare_source",
+            post(handlers::backup::backup_prepare_source),
+        )
+        .route(
+            "/backup_release_source",
+            post(handlers::backup::backup_release_source),
+        )
         .route(
             "/backup_scan_external_conflicts",
             post(handlers::backup::backup_scan_external_conflicts),
@@ -496,6 +576,19 @@ pub fn build_router(
             post(handlers::backup::backup_restore_stage),
         )
         .route("/backup_cancel", post(handlers::backup::backup_cancel))
+        .route(
+            "/backup_list_safety_snapshots",
+            post(handlers::backup::backup_list_safety_snapshots),
+        )
+        .route("/backup_rollback", post(handlers::backup::backup_rollback))
+        .route(
+            "/backup_active_agents",
+            post(handlers::backup::backup_active_agents),
+        )
+        .route(
+            "/backup_discard_pending",
+            post(handlers::backup::backup_discard_pending),
+        )
         .route(
             "/download_workspace_file",
             post(handlers::workspace_files::download_workspace_file),
@@ -587,6 +680,10 @@ pub fn build_router(
             post(handlers::version_control::validate_gitlab_token),
         )
         .route(
+            "/validate_gitea_token",
+            post(handlers::version_control::validate_gitea_token),
+        )
+        .route(
             "/save_account_token",
             post(handlers::version_control::save_account_token),
         )
@@ -673,6 +770,10 @@ pub fn build_router(
         .route("/acp_cancel", post(handlers::acp::acp_cancel))
         .route("/acp_fork", post(handlers::acp::acp_fork))
         .route(
+            "/acp_stop_async_task",
+            post(handlers::acp::acp_stop_async_task),
+        )
+        .route(
             "/acp_respond_permission",
             post(handlers::acp::acp_respond_permission),
         )
@@ -755,6 +856,18 @@ pub fn build_router(
         .route(
             "/acp_sync_antigravity_settings",
             post(handlers::acp::acp_sync_antigravity_settings),
+        )
+        .route(
+            "/acp_antigravity_login_start",
+            post(handlers::acp::acp_antigravity_login_start),
+        )
+        .route(
+            "/acp_antigravity_login_finish",
+            post(handlers::acp::acp_antigravity_login_finish),
+        )
+        .route(
+            "/acp_antigravity_login_cancel",
+            post(handlers::acp::acp_antigravity_login_cancel),
         )
         .route(
             "/acp_pi_project_trust_state",
@@ -1349,6 +1462,39 @@ pub fn build_router(
             post(handlers::forge::forge_list_labels),
         )
         .route(
+            "/forge_list_comments",
+            post(handlers::forge::forge_list_comments),
+        )
+        .route(
+            "/forge_create_comment",
+            post(handlers::forge::forge_create_comment),
+        )
+        .route(
+            "/forge_set_item_state",
+            post(handlers::forge::forge_set_item_state),
+        )
+        .route(
+            "/forge_create_issue",
+            post(handlers::forge::forge_create_issue),
+        )
+        .route(
+            "/forge_change_detail",
+            post(handlers::forge::forge_change_detail),
+        )
+        .route(
+            "/forge_change_files",
+            post(handlers::forge::forge_change_files),
+        )
+        .route("/forge_identity", post(handlers::forge::forge_identity))
+        .route(
+            "/forge_merge_options",
+            post(handlers::forge::forge_merge_options),
+        )
+        .route(
+            "/forge_merge_change",
+            post(handlers::forge::forge_merge_change),
+        )
+        .route(
             "/work_task_create_from_forge",
             post(handlers::forge::work_task_create_from_forge),
         )
@@ -1447,6 +1593,18 @@ pub fn build_router(
         .route(
             "/background_clear",
             post(handlers::background::background_clear),
+        )
+        .route(
+            "/background_market_search",
+            post(handlers::background::background_market_search),
+        )
+        .route(
+            "/background_market_asset",
+            post(handlers::background::background_market_asset),
+        )
+        .route(
+            "/background_market_download",
+            post(handlers::background::background_market_download),
         )
         // ─── Pet ───
         .route("/pet_list", post(handlers::pet::pet_list))

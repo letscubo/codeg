@@ -519,6 +519,7 @@ fn push_goal_marker(messages: &mut Vec<UnifiedMessage>, goal: &PendingGoal) -> O
         duration_ms: None,
         model: None,
         completed_at: Some(goal.timestamp),
+    agent_message_id: None,
     });
     Some(marker.objective)
 }
@@ -692,6 +693,75 @@ fn is_context_continuation(content: &[ContentBlock]) -> bool {
     })
 }
 
+/// The compaction divider for a `system`/`compact_boundary` record, as the
+/// provider-neutral tool pair every agent's compaction renders through.
+///
+/// The live ACP path gets this for free: claude-agent-acp 0.75.0 streams a
+/// `tool_call` tagged `_meta.contextCompaction` (the same key codex-acp 1.3.0
+/// introduced), which `<ContextCompactionCard>` matches on `_meta` alone rather
+/// than per agent. This is the history half, so reopening a conversation shows
+/// the same divider in the same place — and it works for sessions run through
+/// the plain `claude` CLI too, which writes the record but speaks no ACP.
+///
+/// Two shape rules, both borrowed from `parsers::grok` and `parsers::deepseek`:
+/// the ToolUse needs its paired ToolResult or the card reads as a call still
+/// running, and `tool_use_id` is the record's own uuid so re-parsing the same
+/// transcript yields the same block.
+///
+/// The record is bookkeeping, not a message, so it never carries usage or a
+/// model, and the caller leaves `agent_message_id` unset.
+fn compaction_blocks(value: &serde_json::Value, tool_use_id: String) -> Vec<ContentBlock> {
+    let meta = value.get("compactMetadata");
+    let field = |key: &str| meta.and_then(|m| m.get(key));
+
+    let mut marker = serde_json::Map::new();
+    marker.insert("version".to_string(), serde_json::Value::from(1));
+    // The transcript spells the automatic trigger `auto`; the wire spells it
+    // `automatic` (the adapter's `contextCompactionMetadataFromBoundary` does
+    // exactly this rename before streaming it). Renaming here too is what keeps
+    // the tooltip from changing depending on whether the session is live.
+    if let Some(trigger) = field("trigger").and_then(|v| v.as_str()) {
+        let trigger = if trigger == "auto" {
+            "automatic"
+        } else {
+            trigger
+        };
+        marker.insert("trigger".to_string(), serde_json::Value::from(trigger));
+    }
+    // Each count is independently optional in the SDK's own type, and the card
+    // degrades to the plain "compacted" label when either side is missing —
+    // so a partial record still renders a divider rather than nothing.
+    for key in ["preTokens", "postTokens", "durationMs"] {
+        if let Some(n) = field(key).and_then(serde_json::Value::as_u64) {
+            marker.insert(key.to_string(), serde_json::Value::from(n));
+        }
+    }
+
+    vec![
+        ContentBlock::ToolUse {
+            tool_use_id: Some(tool_use_id.clone()),
+            tool_name: "context_compaction".to_string(),
+            input_preview: None,
+            status: None,
+            meta: Some(serde_json::Value::Object(
+                [(
+                    "contextCompaction".to_string(),
+                    serde_json::Value::Object(marker),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id: Some(tool_use_id),
+            output_preview: None,
+            is_error: false,
+            agent_stats: None,
+            images: Vec::new(),
+        },
+    ]
+}
+
 /// `pub(crate)`: Qoder stamps the same `<synthetic>` model on the assistant
 /// record it writes for a failed API turn (alongside `isApiErrorMessage`), so
 /// `parsers::qoder` shares this predicate — see `is_non_conversational_assistant`
@@ -740,11 +810,48 @@ fn claude_context_window_max_tokens_for_model(model: Option<&str>) -> Option<u64
     None
 }
 
-/// The Anthropic-usage-shape occupancy rule now lives in
-/// [`super::latest_turn_prompt_usage_tokens`] so Qoder — which writes the same
-/// counters — reads the gauge the same way instead of re-deriving it.
+/// Post-compaction occupancy carried by a synthesized compaction divider, if
+/// this turn is one. See [`compaction_blocks`] for where the marker is built.
+fn compaction_post_tokens(turn: &MessageTurn) -> Option<u64> {
+    turn.blocks.iter().find_map(|b| match b {
+        ContentBlock::ToolUse {
+            tool_name, meta, ..
+        } if tool_name == "context_compaction" => meta
+            .as_ref()?
+            .get("contextCompaction")?
+            .get("postTokens")?
+            .as_u64(),
+        _ => None,
+    })
+}
+
+/// Context-window occupancy: the Anthropic-usage-shape rule from
+/// [`super::latest_turn_prompt_usage_tokens`] (shared with Qoder, which writes
+/// the same counters), plus the one thing that rule cannot see.
+///
+/// A compaction REPLACES the prompt window, and the record announcing it
+/// carries no usage of its own — so the plain rule walks straight past it to
+/// the last pre-compaction reply and reports a window that no longer exists.
+/// Right after a `/compact` with no follow-up turn yet, that is the full
+/// pre-compaction number: measured on a real transcript, 108,307 reported for
+/// a window the boundary itself says is 4,462.
+///
+/// `postTokens` is the same value the adapter feeds the live gauge — 0.75.0
+/// answers a `compact_boundary` with `usage_update {used: post_tokens}` — so
+/// honouring it here is what makes the reopened conversation agree with the
+/// session that was just streaming.
+///
+/// Reverse scan, first hit wins: a reply AFTER the compaction already prices
+/// the compacted window, so it outranks the boundary; the boundary only speaks
+/// when nothing has been said since. The two are disjoint per turn — a
+/// compaction divider is synthesized as a turn of its own and never carries
+/// usage.
 fn latest_claude_context_window_used_tokens(turns: &[MessageTurn]) -> Option<u64> {
-    super::latest_turn_prompt_usage_tokens(turns)
+    turns.iter().rev().find_map(|turn| {
+        compaction_post_tokens(turn).or_else(|| super::latest_turn_prompt_usage_tokens(
+            std::slice::from_ref(turn),
+        ))
+    })
 }
 
 fn merge_claude_context_window_stats(
@@ -1135,6 +1242,21 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// API call's usage. See [`Self::claim_assistant_usage`] for why only one
     /// line of a group may carry it.
     usage_owner_by_message_id: std::collections::HashMap<String, usize>,
+    /// API response id for the immediately preceding assistant record. Claude
+    /// writes each content block on its own JSONL line, so this lets adjacent
+    /// thinking-only fragments from one response share a message without
+    /// crossing text, tool, or user boundaries.
+    pending_assistant_message_id: Option<String>,
+    /// `uuid`s of the `system`/`compact_boundary` records already turned into a
+    /// divider, because a transcript repeats them VERBATIM.
+    ///
+    /// Every resume replays the surviving history into the same file, boundary
+    /// records included — same uuid, same timestamp, same `compactMetadata`.
+    /// Measured on one real 19,435-line transcript: 22 boundary records for 7
+    /// actual compactions, one of them written six times. Keyed on the record
+    /// uuid rather than the metadata so two genuine compactions that happen to
+    /// reduce the same amount still get a divider each.
+    seen_compaction_uuids: std::collections::HashSet<String>,
 }
 
 impl ClaudeRecordAccumulator {
@@ -1156,6 +1278,8 @@ impl ClaudeRecordAccumulator {
             background_acks: std::collections::HashMap::new(),
             background_notifications: std::collections::HashMap::new(),
             usage_owner_by_message_id: std::collections::HashMap::new(),
+            pending_assistant_message_id: None,
+            seen_compaction_uuids: std::collections::HashSet::new(),
         }
     }
 
@@ -1164,10 +1288,10 @@ impl ClaudeRecordAccumulator {
     /// Claude Code writes **one JSONL line per content block**, not one per API
     /// call: a response that thinks, then answers, then calls two tools becomes
     /// four `assistant` lines sharing a single `message.id` — and every one of
-    /// them repeats that call's *complete* usage object. Each line becomes its
-    /// own [`UnifiedMessage`], its own turn, and (for the dashboard) its own
-    /// fact row, so summing them multiplies one API call's tokens by its block
-    /// count. Measured over a real transcript tree that is a 2.4× over-count
+    /// them repeats that call's *complete* usage object. Most block lines become
+    /// separate [`UnifiedMessage`]s and dashboard fact rows, so summing them
+    /// multiplies one API call's tokens by its block count. Measured over a real
+    /// transcript tree that is a 2.4× over-count
     /// (17.1 B counted vs 7.0 B actually spent), and 74 % of all calls are
     /// affected — a tool-heavy session inflates the most.
     ///
@@ -1184,10 +1308,10 @@ impl ClaudeRecordAccumulator {
     /// reported.
     ///
     /// `owner_index` is the slot the claiming message WILL occupy — normally
-    /// `messages.len()` (a fresh push). `parsers::qoder` merges the fragments of
-    /// one `message.id` into a single bubble, so it claims for
-    /// `messages.len() - 1` instead; passing it explicitly keeps the demotion
-    /// bookkeeping correct for both shapes.
+    /// `messages.len()` (a fresh push). `parsers::qoder` merges all adjacent
+    /// response fragments, while this parser merges adjacent thinking-only
+    /// fragments, so both may claim for `messages.len() - 1`; passing the index
+    /// explicitly keeps the demotion bookkeeping correct for every shape.
     pub(crate) fn claim_assistant_usage(
         messages: &mut [UnifiedMessage],
         usage_owner_by_message_id: &mut std::collections::HashMap<String, usize>,
@@ -1262,9 +1386,17 @@ impl ClaudeRecordAccumulator {
             background_acks,
             background_notifications,
             usage_owner_by_message_id,
+            pending_assistant_message_id,
+            seen_compaction_uuids,
         } = self;
 
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        // Even filtered user bookkeeping (for example an interrupt marker) is
+        // a response boundary and must not reconnect thinking on either side.
+        if msg_type == "user" {
+            *pending_assistant_message_id = None;
+        }
 
         if msg_type == "file-history-snapshot" || msg_type == "progress" {
             return;
@@ -1294,6 +1426,10 @@ impl ClaudeRecordAccumulator {
         // matching filter on the batch path).
         if is_meta_message(&value) || is_interrupt_marker(&value) {
             return;
+        }
+
+        if msg_type != "assistant" && msg_type != "user" {
+            *pending_assistant_message_id = None;
         }
 
         // Claude Code records the user-set name (`/rename`) and its own
@@ -1345,6 +1481,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
+                    agent_message_id: None,
                     },
                     prompt_id,
                 ));
@@ -1355,6 +1492,7 @@ impl ClaudeRecordAccumulator {
         match msg_type {
             "assistant" if is_synthetic_assistant(&value) => {
                 // Skip synthetic assistant placeholders for local commands
+                *pending_assistant_message_id = None;
             }
             "user" => {
                 // Capture `<task-notification>` payloads for the background
@@ -1512,6 +1650,7 @@ impl ClaudeRecordAccumulator {
                     duration_ms: None,
                     model: None,
                     completed_at: Some(timestamp),
+                agent_message_id: None,
                 });
             }
             "assistant" => {
@@ -1539,30 +1678,80 @@ impl ClaudeRecordAccumulator {
                 }
 
                 let content = extract_assistant_content(&value);
+                let message_id = value
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(|id| id.as_str())
+                    .filter(|id| !id.is_empty());
+                let merges_thinking_fragment = message_id.is_some()
+                    && pending_assistant_message_id.as_deref() == message_id
+                    && matches!(
+                        (messages.last(), content.as_slice()),
+                        (
+                            Some(UnifiedMessage {
+                                role: MessageRole::Assistant,
+                                content: previous,
+                                ..
+                            }),
+                            [ContentBlock::Thinking { .. }]
+                        ) if matches!(previous.last(), Some(ContentBlock::Thinking { .. }))
+                    );
                 // One API call is spread over several lines that each repeat
                 // its full usage; only one of them may keep it.
-                let owner_index = messages.len();
+                let owner_index = if merges_thinking_fragment {
+                    messages.len() - 1
+                } else {
+                    messages.len()
+                };
                 let usage = Self::claim_assistant_usage(
                     messages,
                     usage_owner_by_message_id,
-                    value
-                        .get("message")
-                        .and_then(|m| m.get("id"))
-                        .and_then(|id| id.as_str()),
+                    message_id,
                     extract_usage(&value),
                     owner_index,
                 );
 
-                messages.push(UnifiedMessage {
-                    id: uuid,
-                    role: MessageRole::Assistant,
-                    content,
-                    timestamp,
-                    usage,
-                    duration_ms: None,
-                    model: msg_model,
-                    completed_at: Some(timestamp),
-                });
+                if merges_thinking_fragment {
+                    let last = messages.last_mut().expect("checked non-empty");
+                    let ContentBlock::Thinking { text: fragment } =
+                        content.into_iter().next().expect("checked one block")
+                    else {
+                        unreachable!("checked thinking block")
+                    };
+                    let Some(ContentBlock::Thinking { text }) = last.content.last_mut() else {
+                        unreachable!("checked trailing thinking block")
+                    };
+                    text.push_str(&fragment);
+                    last.completed_at = Some(timestamp);
+                    if usage.is_some() {
+                        last.usage = usage;
+                    }
+                    if msg_model.is_some() {
+                        last.model = msg_model;
+                    }
+                } else {
+                    messages.push(UnifiedMessage {
+                        // `messageIdForGrouping` in claude-agent-acp: the API
+                        // message id when the record carries one, else the
+                        // record uuid. Deriving it here rather than capturing
+                        // the live `messageId` chunk field is what lets a
+                        // RELOADED conversation still offer a fork point — the
+                        // rule is a pure function of the record, so the offline
+                        // parse names the message exactly as the adapter does.
+                        agent_message_id: Some(
+                            message_id.map_or_else(|| uuid.clone(), str::to_string),
+                        ),
+                        id: uuid,
+                        role: MessageRole::Assistant,
+                        content,
+                        timestamp,
+                        usage,
+                        duration_ms: None,
+                        model: msg_model,
+                        completed_at: Some(timestamp),
+                    });
+                }
+                *pending_assistant_message_id = message_id.map(str::to_string);
             }
             "attachment" => {
                 // `/goal` transitions ride on attachment records; everything
@@ -1607,17 +1796,61 @@ impl ClaudeRecordAccumulator {
             }
             "system" => {
                 let subtype = value.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-                if subtype == "turn_duration" {
-                    if let Some(duration) = value.get("durationMs").and_then(|d| d.as_u64()) {
-                        // Attach to the last assistant message
-                        if let Some(last) = messages
-                            .iter_mut()
-                            .rev()
-                            .find(|m| matches!(m.role, MessageRole::Assistant))
-                        {
-                            last.duration_ms = Some(duration);
+                match subtype {
+                    "turn_duration" => {
+                        if let Some(duration) = value.get("durationMs").and_then(|d| d.as_u64()) {
+                            // Attach to the last assistant message
+                            if let Some(last) = messages
+                                .iter_mut()
+                                .rev()
+                                .find(|m| matches!(m.role, MessageRole::Assistant))
+                            {
+                                last.duration_ms = Some(duration);
+                            }
                         }
                     }
+                    // The history half of what claude-agent-acp 0.75.0 streams
+                    // live as a `_meta.contextCompaction` tool-call lifecycle:
+                    // without this arm the divider card appears while the turn
+                    // runs and then vanishes when the conversation is reopened.
+                    // Synthesizing it here — rather than only in the ACP
+                    // transcript — also covers sessions run through the plain
+                    // `claude` CLI, which writes this record but speaks no ACP.
+                    "compact_boundary" => {
+                        let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                        let id = value
+                            .get("uuid")
+                            .and_then(|u| u.as_str())
+                            .filter(|u| !u.is_empty())
+                            .map_or_else(
+                                || format!("claude-compaction-{}", messages.len()),
+                                str::to_string,
+                            );
+                        // A resume replays the surviving history into the same
+                        // file, boundary records included — so one compaction
+                        // can appear a dozen lines apart, byte-identical. Draw
+                        // it once. See `seen_compaction_uuids`.
+                        if !seen_compaction_uuids.insert(id.clone()) {
+                            return;
+                        }
+                        messages.push(UnifiedMessage {
+                            id: format!("synth-compaction-{}", messages.len()),
+                            role: MessageRole::Assistant,
+                            content: compaction_blocks(&value, id),
+                            timestamp,
+                            usage: None,
+                            duration_ms: None,
+                            model: None,
+                            completed_at: Some(timestamp),
+                            // Nothing in the model's own history to fork at:
+                            // this record is transcript bookkeeping, not an
+                            // assistant message. `acp::fork` forks such turns
+                            // at the tail rather than fingerprinting their
+                            // empty text.
+                            agent_message_id: None,
+                        });
+                    }
+                    _ => {}
                 }
             }
             "tool_use" => {
@@ -1660,6 +1893,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
+                    agent_message_id: None,
                     });
                 }
             }
@@ -1780,6 +2014,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
+                    agent_message_id: None,
                     });
                 }
             }
@@ -2564,6 +2799,11 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
             let mut blocks: Vec<ContentBlock> = msg.content.clone();
             let timestamp = msg.timestamp;
             let id = format!("turn-{}", turns.len());
+            // The turn's fork point is the assistant message that OPENS it —
+            // the tool-result-only messages absorbed below are the same API
+            // call continuing, and forking "up to" one of those would cut the
+            // turn in half. Absent on synthesized turns, which name no record.
+            let agent_message_id = msg.agent_message_id.clone();
             let usage = msg.usage.clone();
             let duration_ms = msg.duration_ms;
             let turn_model = msg.model.clone();
@@ -2594,6 +2834,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms,
                 model: turn_model,
                 completed_at,
+                agent_message_id,
             });
         } else if matches!(msg.role, MessageRole::System) {
             turns.push(MessageTurn {
@@ -2605,6 +2846,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+            agent_message_id: None,
             });
             i += 1;
         } else {
@@ -2617,6 +2859,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+            agent_message_id: None,
             });
             i += 1;
         }
@@ -2632,6 +2875,238 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    /// A resume replays the surviving history into the SAME transcript,
+    /// boundary records included — byte-identical, original uuid and timestamp
+    /// intact. One real 19,435-line transcript holds 22 boundary records for 7
+    /// compactions, one of them written six times; without dedup that session
+    /// draws six identical dividers in a row.
+    #[test]
+    fn a_replayed_compact_boundary_draws_only_one_divider() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-Users-test-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("sess-replay.jsonl");
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-09-05T03:41:00.000Z","uuid":"cb1","compactMetadata":{"trigger":"manual","preTokens":467393,"postTokens":11875,"durationMs":142463}}"#;
+        // A SECOND compaction, distinct uuid — must still get its own divider.
+        let other = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-09-05T06:00:00.000Z","uuid":"cb2","compactMetadata":{"trigger":"manual","preTokens":475949,"postTokens":12634,"durationMs":134503}}"#;
+        let reply = |uuid: &str, ts: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","uuid":"{uuid}","message":{{"id":"m-{uuid}","role":"assistant","model":"claude-opus-5","content":[{{"type":"text","text":"reply {uuid}"}}]}}}}"#
+            )
+        };
+        let lines = [
+            boundary.to_string(),
+            reply("a1", "2026-09-05T03:42:00.000Z"),
+            boundary.to_string(),
+            other.to_string(),
+            reply("a2", "2026-09-05T06:02:00.000Z"),
+            boundary.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let parser = ClaudeParser::with_base_dir(dir.path().to_path_buf());
+        let detail = parser.get_conversation("sess-replay").unwrap();
+        let ids: Vec<&str> = detail
+            .turns
+            .iter()
+            .filter_map(|t| {
+                t.blocks.iter().find_map(|b| match b {
+                    ContentBlock::ToolUse {
+                        tool_name,
+                        tool_use_id,
+                        ..
+                    } if tool_name == "context_compaction" => tool_use_id.as_deref(),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["cb1", "cb2"],
+            "one divider per DISTINCT boundary, in first-seen order"
+        );
+    }
+
+    /// The gauge after a `/compact` with nothing said since.
+    ///
+    /// The boundary carries no usage of its own, so the plain
+    /// last-turn-with-usage rule walks past it to the pre-compaction reply and
+    /// reports a window that no longer exists — measured on a real transcript,
+    /// 108,307 for a window the boundary itself puts at 4,462. Live is right
+    /// because the adapter answers the boundary with `usage_update {used:
+    /// post_tokens}`; history has to agree.
+    #[test]
+    fn compaction_post_tokens_become_the_context_gauge() {
+        let usage_turn = |id: &str, prompt: u64| MessageTurn {
+            id: id.into(),
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: "reply".into(),
+            }],
+            timestamp: Utc::now(),
+            usage: Some(TurnUsage {
+                input_tokens: prompt,
+                output_tokens: 500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+            agent_message_id: Some(id.into()),
+        };
+        let compaction = |post: u64| MessageTurn {
+            id: "turn-c".into(),
+            role: TurnRole::Assistant,
+            blocks: compaction_blocks(
+                &json!({"compactMetadata": {"trigger": "manual", "preTokens": 108716, "postTokens": post, "durationMs": 92728}}),
+                "cb1".into(),
+            ),
+            timestamp: Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+            agent_message_id: None,
+        };
+
+        // Nothing since the compaction: the boundary is the only honest number.
+        assert_eq!(
+            latest_claude_context_window_used_tokens(&[
+                usage_turn("turn-0", 108_307),
+                compaction(4_462),
+            ]),
+            Some(4_462)
+        );
+        // A reply AFTER it already prices the compacted window, so it wins.
+        assert_eq!(
+            latest_claude_context_window_used_tokens(&[
+                usage_turn("turn-0", 108_307),
+                compaction(4_462),
+                usage_turn("turn-2", 9_000),
+            ]),
+            Some(9_000)
+        );
+        // No compaction anywhere leaves the original rule untouched.
+        assert_eq!(
+            latest_claude_context_window_used_tokens(&[usage_turn("turn-0", 108_307)]),
+            Some(108_307)
+        );
+    }
+
+    /// A compaction is a boundary between turns, so history has to draw the
+    /// same divider the live ACP stream does — claude-agent-acp 0.75.0 streams
+    /// `_meta.contextCompaction`, and without the parser half the card would
+    /// appear during the turn and disappear when the conversation is reopened.
+    #[test]
+    fn compact_boundary_becomes_a_compaction_divider_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-Users-test-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("sess-compaction.jsonl");
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-09-05T03:40:00.000Z","uuid":"u1","cwd":"/Users/test/proj","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-09-05T03:40:05.000Z","uuid":"a1","message":{"id":"msg_01","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Working on it."}]}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-09-05T03:41:00.000Z","uuid":"cb1","parentUuid":null,"logicalParentUuid":"a1","content":"Conversation compacted","compactMetadata":{"trigger":"auto","preTokens":312909,"postTokens":17018,"durationMs":97559,"cumulativeDroppedTokens":295891}}"#,
+            r#"{"type":"user","timestamp":"2026-09-05T03:41:01.000Z","uuid":"cs1","isCompactSummary":true,"cwd":"/Users/test/proj","message":{"role":"user","content":"This session is being continued from a previous conversation…"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-09-05T03:41:09.000Z","uuid":"a2","message":{"id":"msg_02","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Picking it back up."}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let parser = ClaudeParser::with_base_dir(dir.path().to_path_buf());
+        let detail = parser.get_conversation("sess-compaction").unwrap();
+
+        // Its own turn, sitting BETWEEN the two replies — the frontend hoists a
+        // compaction-only group into a standalone divider, which it can only do
+        // when the blocks are not folded into a neighbouring turn.
+        let idx = detail
+            .turns
+            .iter()
+            .position(|t| {
+                t.blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::ToolUse { tool_name, .. }
+                        if tool_name == "context_compaction")
+                })
+            })
+            .expect("the boundary record must produce a compaction turn");
+        let turn = &detail.turns[idx];
+        assert!(matches!(turn.role, TurnRole::Assistant));
+        assert_eq!(turn.blocks.len(), 2, "the ToolUse and its paired result");
+        // Bookkeeping, not a message: naming it as a fork point would send
+        // `fingerprint("")`, which matches every text-free grouping at once.
+        assert!(turn.agent_message_id.is_none());
+
+        let ContentBlock::ToolUse {
+            tool_use_id, meta, ..
+        } = &turn.blocks[0]
+        else {
+            panic!("expected the compaction ToolUse first");
+        };
+        // The record's own uuid, so re-parsing the transcript is idempotent.
+        assert_eq!(tool_use_id.as_deref(), Some("cb1"));
+        assert_eq!(
+            meta.as_ref().and_then(|m| m.get("contextCompaction")),
+            Some(&json!({
+                "version": 1,
+                // Renamed from the transcript's `auto` so the card's tooltip
+                // reads the same live and in history.
+                "trigger": "automatic",
+                "preTokens": 312909,
+                "postTokens": 17018,
+                "durationMs": 97559,
+            }))
+        );
+        // A ToolUse with no result reads as a call still running.
+        assert!(matches!(
+            &turn.blocks[1],
+            ContentBlock::ToolResult { tool_use_id, is_error: false, .. }
+                if tool_use_id.as_deref() == Some("cb1")
+        ));
+
+        // Positive half: the divider is inserted, not substituted — both
+        // replies and the continuation summary survive around it.
+        let rendered = serde_json::to_string(&detail.turns).unwrap();
+        assert!(rendered.contains("Working on it."));
+        assert!(rendered.contains("Picking it back up."));
+        assert!(detail.turns[..idx]
+            .iter()
+            .any(|t| matches!(t.role, TurnRole::Assistant)));
+        assert!(detail.turns[idx + 1..]
+            .iter()
+            .any(|t| matches!(t.role, TurnRole::Assistant)));
+    }
+
+    /// `manual` is already the wire spelling, so only `auto` is renamed — and a
+    /// record whose metadata never arrived still marks the boundary, because
+    /// the card degrades to its plain label when the counts are missing.
+    #[test]
+    fn compaction_trigger_is_renamed_only_for_auto() {
+        let manual = json!({
+            "type": "system", "subtype": "compact_boundary", "uuid": "cb1",
+            "compactMetadata": {"trigger": "manual", "preTokens": 100, "postTokens": 10},
+        });
+        let ContentBlock::ToolUse { meta, .. } = &compaction_blocks(&manual, "cb1".into())[0]
+        else {
+            panic!("expected a ToolUse");
+        };
+        assert_eq!(
+            meta.as_ref().and_then(|m| m.get("contextCompaction")),
+            Some(&json!({"version": 1, "trigger": "manual", "preTokens": 100, "postTokens": 10}))
+        );
+
+        let bare = json!({"type": "system", "subtype": "compact_boundary", "uuid": "cb2"});
+        let blocks = compaction_blocks(&bare, "cb2".into());
+        let ContentBlock::ToolUse { meta, .. } = &blocks[0] else {
+            panic!("expected a ToolUse");
+        };
+        assert_eq!(
+            meta.as_ref().and_then(|m| m.get("contextCompaction")),
+            Some(&json!({"version": 1})),
+            "the version alone is what `isContextCompactionMeta` matches on"
+        );
+        assert_eq!(blocks.len(), 2, "still a well-formed pair");
+    }
 
     /// Cancelling a turn makes Claude Code append a `user` record reading
     /// `[Request interrupted by user]`. It is addressed to the MODEL — it
@@ -2906,6 +3381,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+            agent_message_id: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2921,6 +3397,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+            agent_message_id: None,
             },
         ];
 
@@ -3488,6 +3965,56 @@ mod tests {
         detail
     }
 
+    /// The fork point codeg sends must be the id the ADAPTER would look up.
+    /// claude-agent-acp's `messageIdForGrouping` takes the API message id when
+    /// the record has one, so an assistant turn must carry that — not the
+    /// record uuid `MessageTurn::id`-adjacent code uses everywhere else.
+    #[test]
+    fn assistant_turns_carry_the_api_message_id_as_the_fork_point() {
+        let usage = json!({
+            "input_tokens": 1, "output_tokens": 1,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0
+        });
+        let detail = parse_lines_into_detail(&[assistant_block_line(
+            "record-uuid-1",
+            "msg_01ABC",
+            "2026-03-01T10:00:00Z",
+            json!({"type": "text", "text": "hello"}),
+            usage,
+        )]);
+        let turn = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("an assistant turn");
+        assert_eq!(turn.agent_message_id.as_deref(), Some("msg_01ABC"));
+    }
+
+    /// `messageIdForGrouping` falls back to the record uuid when the message
+    /// carries no id, and so must codeg — otherwise those turns would silently
+    /// lose their fork point.
+    #[test]
+    fn assistant_turns_fall_back_to_the_record_uuid() {
+        let line = json!({
+            "type": "assistant",
+            "sessionId": "dedup-test",
+            "timestamp": "2026-03-01T10:00:00Z",
+            "uuid": "record-uuid-2",
+            "message": {
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "hello"}],
+            }
+        })
+        .to_string();
+        let detail = parse_lines_into_detail(&[line]);
+        let turn = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("an assistant turn");
+        assert_eq!(turn.agent_message_id.as_deref(), Some("record-uuid-2"));
+    }
+
     fn total_usage_tokens(detail: &crate::models::ConversationDetail) -> u64 {
         detail
             .turns
@@ -3498,6 +4025,288 @@ mod tests {
                     + u.cache_read_input_tokens
             })
             .sum()
+    }
+
+    #[test]
+    fn adjacent_thinking_fragments_from_one_response_share_one_turn() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let lines = [
+            assistant_block_line(
+                "first-record",
+                "msg-one-response",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "inspect"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "second-record",
+                "msg-one-response",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "thinking", "thinking": " result"}),
+                usage,
+            ),
+        ];
+
+        let detail = parse_lines_into_detail(&lines);
+        assert_eq!(detail.turns.len(), 1);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Thinking { text }] if text == "inspect result"
+        ));
+        assert_eq!(
+            detail.turns[0].timestamp.to_rfc3339(),
+            "2026-03-01T10:00:00+00:00"
+        );
+        assert_eq!(
+            detail.turns[0]
+                .completed_at
+                .expect("last fragment completion")
+                .to_rfc3339(),
+            "2026-03-01T10:00:02+00:00"
+        );
+        assert_eq!(total_usage_tokens(&detail), 120);
+
+        let mut acc = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        for line in &lines {
+            acc.feed_line(line);
+        }
+        assert_eq!(acc.messages.len(), 1);
+        assert_eq!(acc.messages[0].id, "first-record");
+    }
+
+    #[test]
+    fn thinking_fragments_do_not_cross_response_or_content_boundaries() {
+        let usage = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+
+        let different_responses = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg-first",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-second",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "thinking", "thinking": "two"}),
+                usage.clone(),
+            ),
+        ]);
+        assert_eq!(different_responses.turns.len(), 2);
+
+        let separated_by_text = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg-same",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-same",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "text", "text": "answer"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a3",
+                "msg-same",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "thinking", "thinking": "two"}),
+                usage,
+            ),
+        ]);
+        assert_eq!(separated_by_text.turns.len(), 3);
+        let thinking: Vec<_> = separated_by_text
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, ["one", "two"]);
+
+        let interrupted = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg-interrupted",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "before"}),
+                json!({}),
+            ),
+            json!({
+                "type": "user",
+                "timestamp": "2026-03-01T10:00:01Z",
+                "uuid": "u-interrupt",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "[Request interrupted by user]"
+                }]}
+            })
+            .to_string(),
+            assistant_block_line(
+                "a2",
+                "msg-interrupted",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "thinking", "thinking": "after"}),
+                json!({}),
+            ),
+        ]);
+        assert_eq!(interrupted.turns.len(), 2);
+    }
+
+    #[test]
+    fn thinking_fragments_do_not_cross_tool_result_boundaries() {
+        let usage = json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let lines = [
+            assistant_block_line(
+                "a1",
+                "msg-same",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "before"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-same",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "tool_use", "id": "tu1", "name": "Read", "input": {}}),
+                usage.clone(),
+            ),
+            json!({
+                "type": "user",
+                "timestamp": "2026-03-01T10:00:02Z",
+                "uuid": "u1",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu1",
+                    "content": "done"
+                }]}
+            })
+            .to_string(),
+            assistant_block_line(
+                "a3",
+                "msg-same",
+                "2026-03-01T10:00:03Z",
+                json!({"type": "thinking", "thinking": "after"}),
+                usage,
+            ),
+        ];
+
+        let detail = parse_lines_into_detail(&lines);
+        let assistant_turns: Vec<_> = detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::Assistant))
+            .collect();
+        assert_eq!(assistant_turns.len(), 3);
+        assert!(matches!(
+            assistant_turns[0].blocks.as_slice(),
+            [ContentBlock::Thinking { text }] if text == "before"
+        ));
+        assert!(assistant_turns[1]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. })));
+        assert!(matches!(
+            assistant_turns[2].blocks.as_slice(),
+            [ContentBlock::Thinking { text }] if text == "after"
+        ));
+        assert_eq!(total_usage_tokens(&detail), 15);
+    }
+
+    #[test]
+    fn merged_thinking_keeps_largest_usage_payload() {
+        let zeros = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let real = json!({
+            "input_tokens": 2,
+            "output_tokens": 383,
+            "cache_creation_input_tokens": 418,
+            "cache_read_input_tokens": 177_892
+        });
+
+        for (first, second) in [(zeros.clone(), real.clone()), (real.clone(), zeros.clone())] {
+            let detail = parse_lines_into_detail(&[
+                assistant_block_line(
+                    "a1",
+                    "msg-mixed",
+                    "2026-03-01T10:00:00Z",
+                    json!({"type": "thinking", "thinking": "one"}),
+                    first,
+                ),
+                assistant_block_line(
+                    "a2",
+                    "msg-mixed",
+                    "2026-03-01T10:00:01Z",
+                    json!({"type": "thinking", "thinking": "two"}),
+                    second,
+                ),
+            ]);
+            assert_eq!(detail.turns.len(), 1);
+            assert_eq!(total_usage_tokens(&detail), 178_695);
+        }
+    }
+
+    #[test]
+    fn thinking_merge_state_survives_incremental_feed_calls() {
+        let usage = json!({
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let lines = [
+            assistant_block_line(
+                "a1",
+                "msg-incremental",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "part one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-incremental",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "thinking", "thinking": " part two"}),
+                usage,
+            ),
+        ];
+
+        let whole = parse_lines_into_detail(&lines);
+
+        let mut incremental = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        incremental.feed_line(&lines[0]);
+        incremental.feed_line(&lines[1]);
+
+        assert_eq!(
+            serde_json::to_value(group_into_turns(incremental.messages)).unwrap(),
+            serde_json::to_value(whole.turns).unwrap()
+        );
     }
 
     #[test]

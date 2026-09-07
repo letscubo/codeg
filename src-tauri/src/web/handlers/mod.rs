@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod app_update;
 pub mod automation;
+pub mod canvas;
 pub mod background;
 pub mod backup;
 pub mod chat_authoring;
@@ -20,6 +21,7 @@ pub mod forge;
 pub mod git;
 pub mod logging;
 pub mod mcp;
+pub mod mcp_service;
 pub mod model_provider;
 // ─── fork(letscubo)专属,上游无此模块 ───
 pub mod myclaw;

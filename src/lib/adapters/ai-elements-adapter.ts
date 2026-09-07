@@ -14,20 +14,26 @@ import {
   isDelegationStatusToolName,
 } from "@/lib/adapters/tool-kind-classifier"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
+import { isCodexGrepNoMatchEnvelope } from "@/lib/codex-command-action"
 import { isBackgroundTaskToolCall } from "@/lib/background-task"
 import { isContextCompactionMeta } from "@/lib/context-compaction"
 import { isUnsettledToolCall } from "@/lib/tool-call-lifecycle"
 import { feedbackCheckHasContent } from "@/lib/feedback-check"
 import {
+  extractPlanMarkdown,
   isPlanLikeToolName,
   isPlanModeToolName,
   parseTodosFromJson,
+  // plan-parse's separator-stripping form, distinct from the underscore-
+  // preserving `normalizeToolName` imported above from tool-call-normalization.
+  normalizeToolName as normalizePlanToolName,
 } from "@/lib/plan-parse"
 import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
   unwrapReferenceDestination,
 } from "@/lib/reference-link"
+import { imageCardLabel } from "@/lib/image-tool-label"
 
 /**
  * Adapted content part types for AI SDK Elements components
@@ -61,9 +67,12 @@ export type AdaptedToolCallPart = {
   toolStatus?: string | null
   /**
    * ACP extensibility metadata forwarded from `ContentBlock.tool_use.meta`.
-   * Opaque pass-through; the only consumer today is `<DelegatedSubThread>`
-   * which reads `meta["codeg.delegation"]` as a binding fallback when the
-   * live DelegationContext entry is missing (page refresh, late mount).
+   * Opaque pass-through, read by narrow accessors rather than interpreted here:
+   * `<DelegatedSubThread>` takes `meta["codeg.delegation"]` as a binding
+   * fallback when the live DelegationContext entry is missing (page refresh,
+   * late mount), and the command card takes
+   * `meta.jetbrains.air.asyncTasks.backgrounded` (`toolCallMovedToBackground`)
+   * to explain a call that will never settle inside the turn.
    */
   meta?: Record<string, unknown> | null
   /**
@@ -92,6 +101,8 @@ export type AdaptedGeneratedImagePart = {
   /** `null` while the agent has emitted the ToolCall but no image yet. */
   image: UserImageDisplay | null
   status: ToolCallStatus | null
+  /** Unset for Codex image generation; otherwise the tool or page name. */
+  label?: string | null
 }
 
 export type AdaptedGoalRunPart = {
@@ -424,14 +435,165 @@ function parseInlineToolResultPayload(payload: string): {
 const PROPOSED_PLAN_OPEN = "<proposed_plan>"
 const PROPOSED_PLAN_CLOSE = "</proposed_plan>"
 
+/** A `[start, end)` slice of an assistant text block. */
+type TextRange = readonly [number, number]
+
+/**
+ * The spans of `text` that markdown renders as literal code: fenced blocks and
+ * inline code spans.
+ *
+ * `<proposed_plan>` is matched as a bare substring, so an assistant that merely
+ * *writes about* the tag hits the same detector codex's real plans do — and any
+ * agent can do that, not just codex. It happens for real: an unclosed mention
+ * inside a code span (``…助手的 `<proposed_plan>` 记录…``) used to swallow the
+ * whole rest of the message into a plan card. Anything the reader will see as
+ * literal code is quoting the tag, never emitting it, so it is skipped here.
+ *
+ * Inline spans are matched within a single line only. A stray unbalanced
+ * backtick then marks nothing, where a document-wide search could mark a real
+ * plan as "quoted" and suppress its card — the failure worth avoiding.
+ */
+function markdownCodeSpans(text: string): TextRange[] {
+  const spans: TextRange[] = []
+  let fence: { char: string; length: number; start: number } | null = null
+  let lineStart = 0
+
+  for (;;) {
+    const newline = text.indexOf("\n", lineStart)
+    const lineEnd = newline === -1 ? text.length : newline
+    // A CRLF line keeps its `\r` in the slice, and `.` matches every character
+    // EXCEPT a line terminator — leaving it in makes every fence unrecognisable
+    // on Windows-style text, which would quietly disable the guard below.
+    const contentEnd =
+      lineEnd > lineStart && text[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(
+      text.slice(lineStart, contentEnd)
+    )
+
+    if (fence) {
+      // A closing fence repeats the opener's character at least as many times,
+      // with nothing but whitespace after it.
+      if (
+        marker &&
+        marker[1][0] === fence.char &&
+        marker[1].length >= fence.length &&
+        marker[2].trim().length === 0
+      ) {
+        spans.push([fence.start, lineEnd])
+        fence = null
+      }
+    } else if (marker) {
+      fence = { char: marker[1][0], length: marker[1].length, start: lineStart }
+    } else {
+      collectInlineCodeSpans(text, lineStart, contentEnd, spans)
+    }
+
+    if (newline === -1) break
+    lineStart = newline + 1
+  }
+
+  // An unclosed fence runs to the end of the block, which is also how the
+  // renderer shows it.
+  if (fence) spans.push([fence.start, text.length])
+  return spans
+}
+
+/**
+ * Append the inline code spans of `text[lineStart, lineEnd)` to `spans`. A run
+ * of N backticks opens a span that only a later run of *exactly* N backticks
+ * closes (CommonMark); an unmatched run is ordinary text.
+ */
+function collectInlineCodeSpans(
+  text: string,
+  lineStart: number,
+  lineEnd: number,
+  spans: TextRange[]
+): void {
+  const runEnd = (from: number) => {
+    let end = from
+    while (end < lineEnd && text[end] === "`") end += 1
+    return end
+  }
+
+  let index = lineStart
+  while (index < lineEnd) {
+    if (text[index] !== "`") {
+      index += 1
+      continue
+    }
+    const openEnd = runEnd(index)
+    const width = openEnd - index
+
+    let close = -1
+    let scan = openEnd
+    while (scan < lineEnd) {
+      if (text[scan] !== "`") {
+        scan += 1
+        continue
+      }
+      const end = runEnd(scan)
+      if (end - scan === width) {
+        close = end
+        break
+      }
+      scan = end
+    }
+
+    if (close === -1) {
+      index = openEnd
+      continue
+    }
+    spans.push([index, close])
+    index = close
+  }
+}
+
+function isWithin(index: number, ranges: readonly TextRange[]): boolean {
+  return ranges.some(([start, end]) => index >= start && index < end)
+}
+
+/** The next `marker` at or after `from` that is not quoted as code, or -1. */
+function indexOfOutsideCode(
+  text: string,
+  marker: string,
+  from: number,
+  codeSpans: readonly TextRange[]
+): number {
+  let at = text.indexOf(marker, from)
+  while (at !== -1 && isWithin(at, codeSpans)) {
+    at = text.indexOf(marker, at + marker.length)
+  }
+  return at
+}
+
+/**
+ * Whether the opener at `index` begins its own line.
+ *
+ * codex writes the block as its own record, so across the local corpus every
+ * real plan opener starts a line (most at offset 0) and the only mid-line one
+ * is codex itself naming the tag in prose. Requiring it costs nothing and keeps
+ * a mention that escaped the code-span check from eating the rest of the reply.
+ * The indent cap is CommonMark's: past three spaces the line is an indented
+ * code block, so markdown would render the tag literally anyway.
+ */
+function opensOwnLine(text: string, index: number): boolean {
+  const lead = text.slice(text.lastIndexOf("\n", index - 1) + 1, index)
+  if (lead.trim().length > 0) return false
+  // CommonMark advances a tab to the next multiple-of-4 column, so a single
+  // leading tab is already past the threshold on its own.
+  return lead.replace(/\t/g, "    ").length <= 3
+}
+
 /**
  * Lift codex Plan-mode `<proposed_plan>…</proposed_plan>` block(s) out of an
  * assistant text block into dedicated `proposed-plan` parts, leaving surrounding
  * prose as normal text. Returns `null` when the text has no such block (so it
- * falls through to the normal text path). While the turn streams, an as-yet
- * unclosed block renders as a streaming card (its markdown grows in place);
- * once `</proposed_plan>` arrives it settles. The open/close markers are always
- * consumed so the raw tags never render, even for an empty or truncated block.
+ * falls through to the normal text path) — including when every tag it contains
+ * is only being quoted, which leaves such a message rendering verbatim.
+ * While the turn streams, an as-yet unclosed block renders as a streaming card
+ * (its markdown grows in place); once `</proposed_plan>` arrives it settles. The
+ * open/close markers are always consumed so the raw tags never render, even for
+ * an empty or truncated block.
  */
 function expandProposedPlanText(
   text: string,
@@ -439,12 +601,21 @@ function expandProposedPlanText(
 ): AdaptedContentPart[] | null {
   if (!text.includes(PROPOSED_PLAN_OPEN)) return null
 
+  const codeSpans = markdownCodeSpans(text)
   const parts: AdaptedContentPart[] = []
   let cursor = 0
   let sawPlan = false
 
   for (;;) {
-    const open = text.indexOf(PROPOSED_PLAN_OPEN, cursor)
+    let open = indexOfOutsideCode(text, PROPOSED_PLAN_OPEN, cursor, codeSpans)
+    while (open !== -1 && !opensOwnLine(text, open)) {
+      open = indexOfOutsideCode(
+        text,
+        PROPOSED_PLAN_OPEN,
+        open + PROPOSED_PLAN_OPEN.length,
+        codeSpans
+      )
+    }
     if (open === -1) break
     sawPlan = true
 
@@ -452,7 +623,15 @@ function expandProposedPlanText(
     if (lead.trim().length > 0) parts.push({ type: "text", text: lead })
 
     const bodyStart = open + PROPOSED_PLAN_OPEN.length
-    const close = text.indexOf(PROPOSED_PLAN_CLOSE, bodyStart)
+    // The closer is not held to the line-start rule: a plan whose closing tag
+    // went unrecognised would drag the trailing prose into the card, which is
+    // worse than a card that ends early.
+    const close = indexOfOutsideCode(
+      text,
+      PROPOSED_PLAN_CLOSE,
+      bodyStart,
+      codeSpans
+    )
     const stillStreaming = close === -1
     const body = (
       stillStreaming ? text.slice(bodyStart) : text.slice(bodyStart, close)
@@ -1073,6 +1252,7 @@ function adaptContentBlock(
         revisedPrompt: block.revised_prompt ?? null,
         image: display,
         status: block.status ?? null,
+        label: block.label ?? null,
       }
     }
 
@@ -1116,11 +1296,23 @@ function deriveImageNameFromImageData(img: {
  * through to the normal tool-card path. Images missing `data`/`mime_type` are
  * skipped; if that empties the list, `null` is returned too.
  */
-function adaptImageToolResultParts(result: {
-  images?: ImageData[] | null
-}): AdaptedGeneratedImagePart[] | null {
+function adaptImageToolResultParts(
+  result: {
+    images?: ImageData[] | null
+  },
+  ctx?: {
+    toolName?: string | null
+    input?: string | null
+    title?: string | null
+  }
+): AdaptedGeneratedImagePart[] | null {
   const images = result.images
   if (!images || images.length === 0) return null
+  const label = imageCardLabel({
+    title: ctx?.title,
+    toolName: ctx?.toolName,
+    input: ctx?.input,
+  })
   const parts: AdaptedGeneratedImagePart[] = []
   for (const img of images) {
     if (!img.data || !img.mime_type) continue
@@ -1137,6 +1329,7 @@ function adaptImageToolResultParts(result: {
       // Historical replay always carries a present image, so status is
       // irrelevant to the renderer; `null` is treated as success.
       status: null,
+      label,
     })
   }
   return parts.length > 0 ? parts : null
@@ -1578,23 +1771,47 @@ function mergeGoalObjectiveHints(
  * prose, the codex Plan-mode document the user has to read, and a generated
  * image. Everything else (tool calls/results/groups, reasoning, todo plans,
  * delegation and background-task polls) is process and belongs in the capsule.
+ *
+ * Written as an exhaustive switch rather than a type set on purpose: a new
+ * `AdaptedContentPart` variant then fails to compile here until it is
+ * classified, so the Goal capsule and the completed-turn collapse (which both
+ * hide process behind a chip) can never silently disagree about what an answer
+ * is.
  */
-const GOAL_ANSWER_PART_TYPES: ReadonlySet<AdaptedContentPart["type"]> = new Set(
-  ["text", "proposed-plan", "generated-image"]
-)
+export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
+  switch (part.type) {
+    case "text":
+    case "proposed-plan":
+    case "generated-image":
+      return true
+    case "reasoning":
+    case "tool-call":
+    case "tool-result":
+    case "tool-group":
+    case "delegation-status-group":
+    case "background-task-group":
+    case "goal-run":
+    case "plan":
+      return false
+  }
+}
 
 /**
- * Split a settled unfinished run's body at the last process part: everything
- * after it is the answer and gets lifted out, in order. Answer parts BEFORE a
- * process part stay inside — prose followed by more work is a mid-run note,
+ * Split a reply (or a settled unfinished goal run's body) at its last process
+ * part: everything after it is the answer, in order. Answer parts BEFORE a
+ * process part stay in `body` — prose followed by more work is a mid-run note,
  * not a wrap-up, and lifting it would reorder the reply.
+ *
+ * Two consumers: `groupGoalRuns` lifts `trailing` out of a settled capsule, and
+ * the completed-turn collapse keeps `trailing` visible while folding `body`
+ * behind the "Worked for …" trigger.
  */
-function splitTrailingAnswerParts(items: AdaptedContentPart[]): {
+export function splitTrailingAnswerParts(items: AdaptedContentPart[]): {
   body: AdaptedContentPart[]
   trailing: AdaptedContentPart[]
 } {
   let end = items.length
-  while (end > 0 && GOAL_ANSWER_PART_TYPES.has(items[end - 1]!.type)) {
+  while (end > 0 && isTurnAnswerPart(items[end - 1]!)) {
     end -= 1
   }
   if (end === items.length) {
@@ -1758,6 +1975,28 @@ function buildToolResultMap(
 }
 
 /**
+ * Codex reports a ripgrep search with no matches as a failed ACP tool result:
+ * exit 1 with an otherwise empty command envelope. Treat only that exact shape
+ * as a successful presentation state. The ContentBlock and its raw envelope
+ * stay untouched, and every other nonzero result remains an error.
+ *
+ * Shares `isCodexGrepNoMatchEnvelope` with the search body in
+ * `content-parts-renderer`, which recognises the same envelope to render "No
+ * matches" instead of a raw JSON dump. Two predicates for one fact would let
+ * the card's status and its body disagree.
+ */
+function isCodexGrepNoMatchResult(
+  toolName: string,
+  result: ContentBlock & { type: "tool_result" }
+): boolean {
+  if (!result.is_error || typeof result.output_preview !== "string")
+    return false
+  if (normalizeToolName(toolName) !== "grep") return false
+
+  return isCodexGrepNoMatchEnvelope(result.output_preview)
+}
+
+/**
  * Transform a MessageTurn (from backend) to AdaptedMessage format.
  * Same correlation logic as adaptUnifiedMessage but operates on turn.blocks.
  *
@@ -1768,6 +2007,45 @@ function buildToolResultMap(
  * the renderer can keep showing the running spinner while the live output
  * streams in.
  */
+/**
+ * Drop an assistant text part that only repeats a plan already rendered as a
+ * card by a `plan_review` tool call in the SAME turn.
+ *
+ * codex publishes its Plan-mode plan on two live channels at once: as an
+ * ordinary `agent_message` (so it streams as normal assistant prose) and as
+ * `rawInput.plan` on the plan-review permission request codeg seeds a tool call
+ * from. Both land in one turn — the live turn splitter only cuts a new turn on
+ * a content block that FOLLOWS a completed tool call — so the reader sees the
+ * whole plan twice, once bare and once boxed.
+ *
+ * The card wins: it carries the title, the clamp and the decision marker. Only
+ * an exact match (after trimming) is dropped, so a message that merely quotes
+ * or extends the plan keeps its text.
+ */
+export function dropPlanTextDuplicatedByReviewCard(
+  parts: AdaptedContentPart[]
+): AdaptedContentPart[] {
+  const planned = new Set<string>()
+  for (const part of parts) {
+    if (part.type !== "tool-call") continue
+    if (normalizePlanToolName(part.toolName) !== "planreview") continue
+    let parsed: unknown
+    try {
+      parsed = part.input ? JSON.parse(part.input) : null
+    } catch {
+      continue
+    }
+    const record = asRecord(parsed)
+    const plan = record ? extractPlanMarkdown(record) : null
+    if (plan) planned.add(plan.trim())
+  }
+  if (planned.size === 0) return parts
+
+  return parts.filter(
+    (part) => part.type !== "text" || !planned.has(part.text.trim())
+  )
+}
+
 export function adaptMessageTurn(
   turn: MessageTurn,
   text: AdapterMessageText,
@@ -1871,11 +2149,18 @@ export function adaptMessageTurn(
         // mid-stream we keep the spinner via the normal tool-call path.
         const imageParts = isToolStillRunning
           ? null
-          : adaptImageToolResultParts(matchedResult)
+          : adaptImageToolResultParts(matchedResult, {
+              toolName: block.tool_name,
+              input: block.input_preview,
+            })
         if (imageParts) {
           adaptedContent.push(...imageParts)
           continue
         }
+        const isNoMatch = isCodexGrepNoMatchResult(
+          block.tool_name,
+          matchedResult
+        )
         adaptedContent.push({
           type: "tool-call",
           toolCallId,
@@ -1883,13 +2168,14 @@ export function adaptMessageTurn(
           input: block.input_preview,
           state: isToolStillRunning
             ? "input-available"
-            : matchedResult.is_error
+            : matchedResult.is_error && !isNoMatch
               ? "output-error"
               : "output-available",
           output: matchedResult.output_preview,
-          errorText: matchedResult.is_error
-            ? matchedResult.output_preview || undefined
-            : undefined,
+          errorText:
+            matchedResult.is_error && !isNoMatch
+              ? matchedResult.output_preview || undefined
+              : undefined,
           agentStats: matchedResult.agent_stats ?? undefined,
           meta: block.meta ?? null,
           agentTranscript: matchedResult.agent_transcript ?? undefined,
@@ -1908,23 +2194,32 @@ export function adaptMessageTurn(
           positionMatchedIndices.add(index + 1)
           // Same image-result handling as the id-matched branch above: a Read
           // returning image bytes renders as image card(s) in-position.
-          const imageParts = adaptImageToolResultParts(positionalResult)
+          const imageParts = adaptImageToolResultParts(positionalResult, {
+            toolName: block.tool_name,
+            input: block.input_preview,
+          })
           if (imageParts) {
             adaptedContent.push(...imageParts)
             continue
           }
+          const isNoMatch = isCodexGrepNoMatchResult(
+            block.tool_name,
+            positionalResult
+          )
           adaptedContent.push({
             type: "tool-call",
             toolCallId,
             toolName: block.tool_name,
             input: block.input_preview,
-            state: positionalResult.is_error
-              ? "output-error"
-              : "output-available",
+            state:
+              positionalResult.is_error && !isNoMatch
+                ? "output-error"
+                : "output-available",
             output: positionalResult.output_preview,
-            errorText: positionalResult.is_error
-              ? positionalResult.output_preview || undefined
-              : undefined,
+            errorText:
+              positionalResult.is_error && !isNoMatch
+                ? positionalResult.output_preview || undefined
+                : undefined,
             agentStats: positionalResult.agent_stats ?? undefined,
             meta: block.meta ?? null,
             agentTranscript: positionalResult.agent_transcript ?? undefined,
@@ -2002,7 +2297,9 @@ export function adaptMessageTurn(
             groupConsecutiveDelegationStatus(
               groupConsecutiveToolCalls(
                 dropEmptyInFlightToolCalls(
-                  dropHiddenFeedbackChecks(adaptedContent)
+                  dropHiddenFeedbackChecks(
+                    dropPlanTextDuplicatedByReviewCard(adaptedContent)
+                  )
                 )
               )
             )

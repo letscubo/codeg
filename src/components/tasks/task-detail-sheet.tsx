@@ -1159,15 +1159,29 @@ export function TaskDetailSheet({
                 </dl>
               </section>
 
-              {/* Changed files vs the recorded base. */}
+              {/* Changed files vs the recorded base — which for a task that
+                  came FROM a pull request is the merge base, so this list is
+                  "the pull request plus whatever the agent did". The counters
+                  above it are the task's own work alone (see
+                  `hasNothingToMerge`), so the difference is spelled out rather
+                  than left to read as a contradiction. */}
               {worktreeUsable ? (
                 <section className="flex flex-col gap-1.5">
                   <div className="flex items-center justify-between gap-2">
-                    <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    <h3 className="min-w-0 text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
                       {t("detailFiles")}
                       {files.length > 0 ? (
                         <span className="ml-1.5 font-normal text-muted-foreground/70 tabular-nums">
                           {files.length}
+                        </span>
+                      ) : null}
+                      {mustDeliverToPr(task) && files.length > 0 ? (
+                        <span className="ml-1.5 font-normal normal-case tracking-normal text-muted-foreground/70">
+                          {t(
+                            usesMergeRequests(task)
+                              ? "detailFilesIncludesMr"
+                              : "detailFilesIncludesPr"
+                          )}
                         </span>
                       ) : null}
                     </h3>
@@ -1176,7 +1190,7 @@ export function TaskDetailSheet({
                         type="button"
                         size="sm"
                         variant="ghost"
-                        className="h-6 gap-1 px-2 text-[0.6875rem] text-muted-foreground"
+                        className="h-6 shrink-0 gap-1 px-2 text-[0.6875rem] text-muted-foreground"
                         onClick={() => setDiffFile(null)}
                       >
                         <FileDiff className="size-3" aria-hidden="true" />
@@ -1246,9 +1260,10 @@ export function TaskDetailSheet({
           {/* Footer: everything that does NOT advance the task's state — the
               status's own actions live in the action zone / acceptance panel
               above. Left: session viewer, edit (while editable), cleanup
-              retry; right: the worktree a finished task is still holding, then
-              the destructive delete (`merging` cannot be deleted), which takes
-              the worktree along as a checkbox in its own confirm. */}
+              retry; right: the worktree a settled (done / canceled) task is
+              still holding, then the destructive delete (`merging` cannot be
+              deleted), which takes the worktree along as a checkbox in its own
+              confirm. */}
           {task.conversation_id != null ||
           canEdit ||
           task.status !== "merging" ? (
@@ -1279,9 +1294,9 @@ export function TaskDetailSheet({
               ) : null}
               <div className="flex-1" />
               {/* Beside "delete", because that is the other way to be rid of
-                  this worktree — and glyph-only, because a done task's leftover
-                  checkout is a housekeeping detail, not a decision the drawer
-                  should press on the user every time they open it. */}
+                  this worktree — and glyph-only, because a settled task's
+                  leftover checkout is a housekeeping detail, not a decision the
+                  drawer should press on the user every time they open it. */}
               {canRemoveWorktree(task) ? (
                 <FooterIconAction
                   icon={FolderX}
@@ -1657,6 +1672,7 @@ const EVENT_KIND_KEYS = {
   preflight_result: "eventPreflight",
   cleanup_failed: "eventCleanupFailed",
   resume_fallback: "eventResumeFallback",
+  context_compact: "eventContextCompact",
   user_action: "eventUserAction",
   diff_stat: "eventDiffStat",
   forge_writeback: "eventForgeWriteback",
@@ -1823,6 +1839,22 @@ function timelineDetail(event: WorkTaskEvent): string | null {
     }
     case "cleanup_failed":
       return str("error")
+    case "context_compact": {
+      const status = str("status")
+      const pct = (k: string) =>
+        typeof p[k] === "number" ? `${(p[k] as number).toFixed(1)}%` : null
+      const before = pct("before_percent")
+      const after = pct("after_percent")
+      // The pair is the whole story ("91.2% → 34.8%"); a run that never got
+      // to compact shows why instead.
+      const span =
+        before && after ? `${before} → ${after}` : (before ?? str("reason"))
+      return (
+        [status, span, str("detail"), str("error")]
+          .filter(Boolean)
+          .join(" · ") || null
+      )
+    }
     case "user_action": {
       const action = str("action")
       const feedback = str("feedback")

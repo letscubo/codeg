@@ -22,6 +22,10 @@ const SIDE_PANELS = [
   "src/components/message/sub-agent-session-dialog.tsx",
   "src/components/message/subagent-session-dialog.tsx",
   "src/components/forge/forge-issue-detail-sheet.tsx",
+  "src/components/canvas/canvas-conversation-drawer.tsx",
+  // Opens over any of the transcript viewers above (a file badge clicked in
+  // one), so it is part of the same stack.
+  "src/components/files/file-viewer-drawer.tsx",
 ]
 
 /** The `<DrawerContent …>` opening tag — where a width would be declared. */
@@ -59,7 +63,7 @@ describe("transcript inside a side panel", () => {
   /**
    * The gutter belongs to the message list, and only to it. A wrapper that adds
    * its own doubles it — 32px a side instead of 16 — which the full-width chat
-   * column absorbs unnoticed and a 32rem drawer very much does not.
+   * column absorbs unnoticed and a 36rem drawer very much does not.
    */
   it("does not re-pad a transcript the virtualizer already insets", () => {
     // The layer that owns the gutter, and the reason the wrapper must not.

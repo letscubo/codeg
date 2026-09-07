@@ -10,25 +10,13 @@ use crate::db::service::{conversation_service, folder_service, import_service, t
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
 use crate::models::*;
-use crate::parsers::acp_native::AcpNativeParser;
-use crate::parsers::claude::ClaudeParser;
-use crate::parsers::cline::ClineParser;
-use crate::parsers::codebuddy::CodeBuddyParser;
+// Concrete parser type only for `load_thread_name_index`, which is codex's own
+// index reader and not part of the `AgentParser` trait. Every history read goes
+// through `build_agent_parser`.
 use crate::parsers::codex::CodexParser;
-use crate::parsers::deepseek::DeepSeekParser;
-use crate::parsers::antigravity::AntigravityParser;
-use crate::parsers::qoder::QoderParser;
-use crate::parsers::gemini::GeminiParser;
-use crate::parsers::cursor::CursorParser;
-use crate::parsers::grok::GrokParser;
-use crate::parsers::hermes::HermesParser;
-use crate::parsers::kimi_code::KimiCodeParser;
-use crate::parsers::pi::PiParser;
-use crate::parsers::openclaw::OpenClawParser;
-use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::{
-    folder_name_from_path, normalize_path_for_matching, path_eq_for_matching, AgentParser,
-    ParseError,
+    build_agent_parser, folder_name_from_path, normalize_path_for_matching, path_eq_for_matching,
+    AgentParser, ParseError,
 };
 use crate::web::event_bridge::{
     emit_event, ConversationChange, ConversationsBulkChanged, EventEmitter, ImportScanProgress,
@@ -236,27 +224,18 @@ fn list_conversations_sync(
     let mut all_conversations = Vec::new();
     let mut seen_keys = HashSet::new();
 
-    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
-        (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
-        (AgentType::Codex, Box::new(CodexParser::new())),
-        (AgentType::OpenCode, Box::new(OpenCodeParser::new())),
-        (AgentType::Gemini, Box::new(GeminiParser::new())),
-        (AgentType::OpenClaw, Box::new(OpenClawParser::new())),
-        (AgentType::Cline, Box::new(ClineParser::new())),
-        (AgentType::Hermes, Box::new(HermesParser::new())),
-        (AgentType::CodeBuddy, Box::new(CodeBuddyParser::new())),
-        (AgentType::KimiCode, Box::new(KimiCodeParser::new())),
-        (AgentType::Pi, Box::new(PiParser::new())),
-        (AgentType::Grok, Box::new(GrokParser::new())),
-        (AgentType::Cursor, Box::new(CursorParser::new())),
-        (AgentType::DeepSeek, Box::new(DeepSeekParser::new())),
-        (AgentType::Qoder, Box::new(QoderParser::new())),
-        (AgentType::Antigravity, Box::new(AntigravityParser::new())),
-    ];
+    // BUILTIN_AGENT_TYPES, not `registry::builtin_acp_agents()`: the two differ
+    // in ORDER, and this list's order is the sidebar's tie-break for two
+    // conversations that compare equal on the active sort.
+    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> =
+        crate::models::agent::BUILTIN_AGENT_TYPES
+            .iter()
+            .map(|&at| (at, build_agent_parser(at)))
+            .collect();
     // Registered custom agents read back from codeg's own ACP transcripts, so
     // their sessions participate in folder grouping and stats like any other.
     for custom in crate::acp::custom_registry::all() {
-        parsers.push((custom, Box::new(AcpNativeParser::new(custom))));
+        parsers.push((custom, build_agent_parser(custom)));
     }
 
     for (at, parser) in &parsers {
@@ -353,28 +332,7 @@ pub async fn get_conversation(
     conversation_id: String,
 ) -> Result<ConversationDetail, AppCommandError> {
     tokio::task::spawn_blocking(move || -> Result<ConversationDetail, AppCommandError> {
-        let parser: Box<dyn AgentParser> = match agent_type {
-            AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-            AgentType::Codex => Box::new(CodexParser::new()),
-            AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-            AgentType::Gemini => Box::new(GeminiParser::new()),
-            AgentType::OpenClaw => Box::new(OpenClawParser::new()),
-            AgentType::Cline => Box::new(ClineParser::new()),
-            AgentType::Hermes => Box::new(HermesParser::new()),
-            AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-            AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-            AgentType::Pi => Box::new(PiParser::new()),
-            AgentType::Grok => Box::new(GrokParser::new()),
-            AgentType::Cursor => Box::new(CursorParser::new()),
-            AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
-            AgentType::Qoder => Box::new(QoderParser::new()),
-            AgentType::Antigravity => Box::new(AntigravityParser::new()),
-            // Custom ACP agents have no native store to reverse-engineer;
-            // their history is codeg's own ACP transcript.
-            AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
-        };
-
-        parser
+        build_agent_parser(agent_type)
             .get_conversation(&conversation_id)
             .map_err(parse_error_to_app_error)
     })
@@ -830,6 +788,7 @@ pub(crate) async fn import_selected_from_summaries(
         imported: 0,
         updated: 0,
         skipped: 0,
+        restored: 0,
         not_found,
         failed: 0,
         created_folders: 0,
@@ -869,11 +828,23 @@ pub(crate) async fn import_selected_from_summaries(
         {
             Ok(entry) => {
                 let folder_id = entry.id;
+                // `DeletedPolicy::Restore`: every item here is a session the
+                // user explicitly checked in the picker, which badges a
+                // soft-deleted row as such — so a deleted one in this list is a
+                // deliberate "bring it back", not a sweep. (The whole-folder
+                // import and the scan's drive-by refresh both stay on `Skip`.)
                 let (tally, _updated_ids, failed_in_group) =
-                    import_service::import_summaries_resilient(conn, folder_id, &items).await;
+                    import_service::import_summaries_resilient(
+                        conn,
+                        folder_id,
+                        &items,
+                        import_service::DeletedPolicy::Restore,
+                    )
+                    .await;
                 result.imported += tally.imported;
                 result.updated += tally.updated;
                 result.skipped += tally.skipped;
+                result.restored += tally.restored;
                 result.failed += failed_in_group;
                 if created {
                     result.created_folders += 1;
@@ -886,6 +857,7 @@ pub(crate) async fn import_selected_from_summaries(
                     imported: tally.imported,
                     updated: tally.updated,
                     skipped: tally.skipped,
+                    restored: tally.restored,
                 });
                 if failed_in_group > 0 && result.errors.len() < MAX_ERRORS {
                     result
@@ -912,8 +884,12 @@ pub(crate) async fn import_selected_from_summaries(
     }
 
     // One nudge instead of per-row upserts: clients answer with a single full
-    // refetch, which also covers refreshed titles (see the event's doc).
-    if result.imported > 0 || result.updated > 0 {
+    // refetch, which also covers refreshed titles (see the event's doc) and the
+    // rows this run brought back from a soft delete — a restore adds a row to
+    // every open sidebar just like a fresh import does, so it must fire the
+    // event too. (The counts stay faithful to their own tallies; subscribers
+    // read only the channel and answer with a full refetch.)
+    if result.imported > 0 || result.updated > 0 || result.restored > 0 {
         emit_event(
             emitter,
             CONVERSATIONS_BULK_CHANGED_EVENT,
@@ -961,9 +937,17 @@ pub async fn import_selected_sessions(
 /// Build the `meta["codeg.delegation"]` value for a delegation child loaded
 /// from the DB. Mirrors the shape produced at runtime by
 /// `acp::delegation::meta_writer::build_delegation_meta`, but only includes
-/// the fields the DB can vouch for: `status` and `child_conversation_id`.
-/// `child_connection_id` is omitted (no live connection for a historical
-/// view; the frontend's parser treats it as optional).
+/// the fields the DB can vouch for: `status`, `child_conversation_id`,
+/// `task_id`, `task_preview` and `agent_type`. `child_connection_id` is
+/// omitted (no live connection for a historical view; the frontend's parser
+/// treats it as optional).
+///
+/// The last three are pure FALLBACKS on the frontend
+/// (`use-delegation-card-model.ts` prefers the parsed `raw_input` and the live
+/// binding), so supplying them can't override a better source. They exist for
+/// the cards that have no better source: a `resume_delegation` call — whose
+/// arguments are only `{task_id, reason}` — and a `delegate_to_agent` call on a
+/// host whose announcements never carry arguments (Cursor).
 ///
 /// Status mapping:
 ///  - `in_progress` → `running` (still streaming or about to)
@@ -993,6 +977,21 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
         "child_conversation_id".into(),
         serde_json::Value::Number(child.id.into()),
     );
+    obj.insert(
+        "agent_type".into(),
+        serde_json::Value::String(child.agent_type.as_wire().into_owned()),
+    );
+    if let Some(task_id) = child.delegation_call_id.as_deref() {
+        obj.insert("task_id".into(), serde_json::Value::String(task_id.into()));
+    }
+    // The child row's title was seeded from the original task text — the same
+    // substitute the broker uses for `task_preview` when it resumes a task.
+    if let Some(title) = child.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        obj.insert(
+            "task_preview".into(),
+            serde_json::Value::String(title.into()),
+        );
+    }
     serde_json::Value::Object(obj)
 }
 
@@ -1019,20 +1018,91 @@ fn parse_delegate_task_id(output: &str) -> Option<String> {
     }
 }
 
-/// Walk every `delegate_to_agent` ToolUse block in `turns` and, when it can be
-/// matched to a child conversation in `children`, set `meta["codeg.delegation"]`
-/// to the DB-derived snapshot. Skips blocks whose meta is already populated so
-/// the live-broker write (when present) always wins. Tool-name match is by
-/// substring to cover the MCP-prefixed (`mcp__codeg-mcp__delegate_to_agent`)
-/// and bare forms the host may have emitted.
+/// Descend through wrapper envelopes looking for a `task_id` string. A wrapper
+/// value may itself be a JSON *string* (hosts that stringify nested arguments),
+/// so re-parse those. Depth-capped like the frontend walker.
 ///
-/// Matching is by `parent_tool_use_id` first, then by the broker's task id.
-/// The fallback is what covers codex: its rollout names the call `call_<id>`,
-/// while the broker — which sees the call over the ACP wire, where code mode
-/// renames every inner call — recorded `exec-<uuid>`. The two never meet, so
-/// every codex delegation card lost its `child_conversation_id` and with it the
-/// "查看会话" affordance. The task id round-trips: the broker mirrors it into
-/// `delegation_call_id`, and the ack the model received carries it verbatim.
+/// Shares `acp::lifecycle`'s key list rather than restating it: that list, its
+/// frontend twins in `delegation-card.ts` / `codeg-mcp-tool.ts`, and this
+/// walker must peel the same envelopes, or a card and the meta injected beneath
+/// it disagree about which task a call names.
+fn find_task_id_in_value(value: &serde_json::Value, depth: u8) -> Option<String> {
+    use crate::acp::lifecycle::ARGS_WRAPPER_KEYS;
+
+    if depth > 4 {
+        return None;
+    }
+    if let Some(s) = value.as_str() {
+        let nested: serde_json::Value = serde_json::from_str(s).ok()?;
+        return find_task_id_in_value(&nested, depth + 1);
+    }
+    let obj = value.as_object()?;
+    for key in ARGS_WRAPPER_KEYS {
+        if let Some(inner) = obj.get(key) {
+            if let Some(found) = find_task_id_in_value(inner, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    let id = obj.get("task_id")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The `task_id` argument of a `resume_delegation` call, read off the tool
+/// use's serialized arguments (`{"task_id": "...", "reason": "..."}`). Unlike
+/// `delegate_to_agent` — whose id only exists on the RESULT — resume names its
+/// task in the request, so this needs no cross-block correlation.
+///
+/// Two host realities stop a plain `from_str(input)["task_id"]` from finding
+/// it, and both end the same way: no binding, so the reloaded card is stuck on
+/// the `running` its own ack froze and shows no task text — the exact history
+/// gap the resume card exists to close.
+///   * NESTING. CodeBuddy routes MCP calls through `DeferExecuteTool` and
+///     persists `{"toolName": …, "params": {…}}`, deliberately leaving the
+///     wrapper on `input_preview` for readers to peel (see
+///     `parsers::codebuddy::deferred_tool_name`); Antigravity wraps in
+///     `{"arguments": {…}}`.
+///   * TRUNCATION. `input_preview` is a *preview*: parsers cap it (500 chars
+///     for OpenClaw, 2000 for Cline), so a long `reason` leaves the JSON
+///     unparseable even though `task_id` — written first in practice — is
+///     intact in what survived.
+///
+/// So: peel wrappers off well-formed JSON, else fall back to the same tolerant
+/// scan `parse_delegate_task_id` already uses on this file's sibling path. A
+/// scan that guesses wrong is harmless — the id simply matches no child in
+/// `by_task_id` and nothing is injected.
+fn parse_resume_task_id(input: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(id) = find_task_id_in_value(&value, 0) {
+            return Some(id);
+        }
+    }
+    parse_delegate_task_id(input)
+}
+
+/// Walk every `delegate_to_agent` / `resume_delegation` ToolUse block in
+/// `turns` and, when it can be matched to a child conversation in `children`,
+/// set `meta["codeg.delegation"]` to the DB-derived snapshot. Skips blocks
+/// whose meta is already populated so the live-broker write (when present)
+/// always wins. Tool-name match is by substring to cover the MCP-prefixed
+/// (`mcp__codeg-mcp__delegate_to_agent`) and bare forms the host may have
+/// emitted.
+///
+/// For `delegate_to_agent`, matching is by `parent_tool_use_id` first, then by
+/// the broker's task id. The fallback is what covers codex: its rollout names
+/// the call `call_<id>`, while the broker — which sees the call over the ACP
+/// wire, where code mode renames every inner call — recorded `exec-<uuid>`. The
+/// two never meet, so every codex delegation card lost its
+/// `child_conversation_id` and with it the "查看会话" affordance. The task id
+/// round-trips: the broker mirrors it into `delegation_call_id`, and the ack the
+/// model received carries it verbatim.
+///
+/// For `resume_delegation` the ONLY key is the task id, taken from the call's
+/// own arguments: a resume never owns a `parent_tool_use_id` (it re-binds to the
+/// ORIGINAL delegate call's id, which belongs to a different block, usually in
+/// an earlier turn). Without this the resumed card would be frozen at the
+/// `running` its ack reported, forever — the child's real outcome landed on the
+/// DB row, not on the resume result.
 fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
     if children.is_empty() {
         return;
@@ -1068,29 +1138,43 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
 
     for turn in turns.iter_mut() {
         for block in turn.blocks.iter_mut() {
-            if let ContentBlock::ToolUse {
-                tool_use_id: Some(tu),
+            let ContentBlock::ToolUse {
+                tool_use_id,
                 tool_name,
+                input_preview,
                 meta,
                 ..
             } = block
-            {
-                if meta.is_some() {
+            else {
+                continue;
+            };
+            if meta.is_some() {
+                continue;
+            }
+            let child: Option<&DbConversationSummary> =
+                if tool_name.contains("delegate_to_agent") {
+                    tool_use_id.as_deref().and_then(|tu| {
+                        by_parent_tool_use_id
+                            .get(tu)
+                            .or_else(|| {
+                                task_id_by_call
+                                    .get(tu)
+                                    .and_then(|task_id| by_task_id.get(task_id.as_str()))
+                            })
+                            .copied()
+                    })
+                } else if tool_name.contains("resume_delegation") {
+                    input_preview
+                        .as_deref()
+                        .and_then(parse_resume_task_id)
+                        .and_then(|task_id| by_task_id.get(task_id.as_str()).copied())
+                } else {
                     continue;
-                }
-                if !tool_name.contains("delegate_to_agent") {
-                    continue;
-                }
-                let child = by_parent_tool_use_id.get(tu.as_str()).or_else(|| {
-                    task_id_by_call
-                        .get(tu.as_str())
-                        .and_then(|task_id| by_task_id.get(task_id.as_str()))
-                });
-                if let Some(child) = child {
-                    *meta = Some(serde_json::json!({
-                        "codeg.delegation": build_historical_delegation_meta(child),
-                    }));
-                }
+                };
+            if let Some(child) = child {
+                *meta = Some(serde_json::json!({
+                    "codeg.delegation": build_historical_delegation_meta(child),
+                }));
             }
         }
     }
@@ -1140,7 +1224,7 @@ pub async fn get_folder_conversation_core(
             // id-exact source; fall through to the native parser only when no
             // transcript exists (conversations that predate recording).
             if at == AgentType::OpenClaw {
-                let native = AcpNativeParser::new(at);
+                let native = crate::parsers::acp_native::AcpNativeParser::new(at);
                 if let Ok(d) = native.get_conversation(&eid) {
                     return Ok((
                         d.turns,
@@ -1152,24 +1236,7 @@ pub async fn get_folder_conversation_core(
                     ));
                 }
             }
-            let parser: Box<dyn AgentParser> = match at {
-                AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-                AgentType::Codex => Box::new(CodexParser::new()),
-                AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-                AgentType::Gemini => Box::new(GeminiParser::new()),
-                AgentType::OpenClaw => Box::new(OpenClawParser::new()),
-                AgentType::Cline => Box::new(ClineParser::new()),
-                AgentType::Hermes => Box::new(HermesParser::new()),
-                AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-                AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-                AgentType::Pi => Box::new(PiParser::new()),
-                AgentType::Grok => Box::new(GrokParser::new()),
-                AgentType::Cursor => Box::new(CursorParser::new()),
-                AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
-                AgentType::Qoder => Box::new(QoderParser::new()),
-                AgentType::Antigravity => Box::new(AntigravityParser::new()),
-                AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
-            };
+            let parser = build_agent_parser(at);
             match parser.get_conversation(&eid) {
                 Ok(d) => Ok((
                     d.turns,
@@ -1263,11 +1330,17 @@ pub async fn get_folder_conversation_core(
     // The transcript is the richer source for the session's model. Codex is
     // the concrete case: an ACP-driven row is created before any
     // `turn_context` names a model, so the DB column can stay NULL forever
-    // while the rollout file knows the answer. Fill the *returned* summary
-    // only — the row itself is left alone — so the usage sync's
-    // session-model fallback and the detail view both see it.
-    if summary.model.is_none() {
-        summary.model = parsed_model;
+    // while the rollout file knows the answer.
+    //
+    // The parse WINS over the column rather than merely filling a hole in it.
+    // `seed_model_if_empty` now persists the first model a session is seen
+    // using, so "fill only when NULL" would pin this summary — and with it the
+    // details dialog, which reads `summary.model` ahead of the turns — to that
+    // first value for the life of the conversation, and a mid-session `/model`
+    // switch would never show. The stored value stays as the fallback for a
+    // transcript that names no model at all.
+    if let Some(parsed) = parsed_model.filter(|m| !m.trim().is_empty()) {
+        summary.model = Some(parsed);
     }
 
     // Historical recovery for the read-only sub-agent viewer: JSONL parsers
@@ -1513,6 +1586,11 @@ pub async fn get_folder_conversation_with_live_core(
     // hand. `refresh_auto_title` re-checks the lock and equality, so once the
     // title converges this becomes a cheap no-op on every later turn. The
     // pre-check here just avoids the extra DB round-trip in the common case.
+    //
+    // One upsert for the whole fetch: the title and the model can both land on
+    // the same open, and the sidebar has no use for two broadcasts of the same
+    // row a microsecond apart.
+    let mut upserted = false;
     if !detail.summary.title_locked {
         if let Some(parsed) = parsed_title.as_deref().map(str::trim) {
             if !parsed.is_empty() && detail.summary.title.as_deref() != Some(parsed) {
@@ -1525,7 +1603,7 @@ pub async fn get_folder_conversation_with_live_core(
                 {
                     Ok(true) => {
                         detail.summary.title = Some(parsed.to_string());
-                        emit_conversation_upsert(emitter, conn, conversation_id).await;
+                        upserted = true;
                         chat_channel_manager
                             .sync_conversation_title(conn, conversation_id, parsed)
                             .await;
@@ -1537,6 +1615,25 @@ pub async fn get_folder_conversation_with_live_core(
                 }
             }
         }
+    }
+
+    // Session-model backfill, the sibling of the auto-title above and for the
+    // same reason: the row was inserted before any model was named, and the
+    // sidebar reads the row rather than the transcript this parse just walked.
+    // `seed_model_if_empty` re-checks emptiness in SQL, so once a session has a
+    // model this is a no-op that writes nothing.
+    if let Some(model) = detail.summary.model.clone() {
+        match conversation_service::seed_model_if_empty(conn, conversation_id, &model).await {
+            Ok(true) => upserted = true,
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                "[conversations] session-model backfill failed for {conversation_id}: {e}"
+            ),
+        }
+    }
+
+    if upserted {
+        emit_conversation_upsert(emitter, conn, conversation_id).await;
     }
 
     if let Some((pending, started_at)) = manager
@@ -2357,6 +2454,11 @@ pub async fn delete_conversation_with_cleanup_core(
         emit_conversation_upsert(emitter, conn, parent_id).await;
     }
     cleanup_tabs_for_deleted_conversation(emitter, conn, conversation_id).await;
+    // Canvas references (pinned cards, custom-region memberships) survive the
+    // soft delete for the same reason tabs do — no FK cascade ever fires — so
+    // they get the same explicit scrub, at the same funnel.
+    crate::commands::canvas::cleanup_canvas_for_deleted_conversation(emitter, conn, conversation_id)
+        .await;
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     }
@@ -2468,13 +2570,21 @@ mod tests {
     }
 
     fn tool_use_turn(tool_use_id: Option<&str>, tool_name: &str) -> MessageTurn {
+        tool_use_turn_with_input(tool_use_id, tool_name, None)
+    }
+
+    fn tool_use_turn_with_input(
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input_preview: Option<&str>,
+    ) -> MessageTurn {
         MessageTurn {
             id: "t1".into(),
             role: TurnRole::Assistant,
             blocks: vec![ContentBlock::ToolUse {
                 tool_use_id: tool_use_id.map(String::from),
                 tool_name: tool_name.into(),
-                input_preview: None,
+                input_preview: input_preview.map(String::from),
                 status: None,
                 meta: None,
             }],
@@ -2483,6 +2593,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }
     }
 
@@ -2521,6 +2632,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }
     }
 
@@ -2539,6 +2651,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: completed.then_some(ts),
+        agent_message_id: None,
         }
     }
 
@@ -2667,6 +2780,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         };
         let pending_image = |message_id: &str, data: &str| {
             crate::acp::session_state::PendingUserMessage {
@@ -2796,6 +2910,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }
     }
 
@@ -2838,6 +2953,111 @@ mod tests {
         assert!(
             first_block_meta(&turns[0]).is_none(),
             "a different task's child must not be bound"
+        );
+    }
+
+    /// `resume_delegation` names its task in its own ARGUMENTS, and owns no
+    /// `parent_tool_use_id` (it re-binds to the original delegate call's id,
+    /// which lives in an earlier block). Without this injection the resumed
+    /// card would be stuck on the `running` its ack reported, because the
+    /// child's real outcome only ever landed on the DB row.
+    #[test]
+    fn inject_delegation_meta_binds_a_resume_call_by_its_task_id_argument() {
+        let mut turns = vec![tool_use_turn_with_input(
+            Some("tu-resume"),
+            "mcp__codeg-mcp__resume_delegation",
+            Some(r#"{"task_id":"b0858712-9257","reason":"the app was killed"}"#),
+        )];
+        let mut child = summary_child(9, "tu-original-delegate", "completed");
+        child.delegation_call_id = Some("b0858712-9257".into());
+        child.title = Some("Build the /test4 sandbox page".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        let inner = first_block_meta(&turns[0])
+            .and_then(|m| m.get("codeg.delegation").cloned())
+            .expect("meta should be set");
+        // The CHILD's real status, not the `running` the resume ack froze.
+        assert_eq!(inner["status"], "completed");
+        assert_eq!(inner["child_conversation_id"], 9);
+        assert_eq!(inner["task_id"], "b0858712-9257");
+        assert_eq!(inner["agent_type"], "codex");
+        assert_eq!(inner["task_preview"], "Build the /test4 sandbox page");
+    }
+
+    #[test]
+    fn inject_delegation_meta_does_not_bind_a_resume_call_to_a_foreign_task() {
+        let mut turns = vec![tool_use_turn_with_input(
+            Some("tu-resume"),
+            "resume_delegation",
+            Some(r#"{"task_id":"aaaa"}"#),
+        )];
+        let mut child = summary_child(9, "tu-x", "completed");
+        child.delegation_call_id = Some("bbbb".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "a different task's child must not be bound to this resume"
+        );
+    }
+
+    #[test]
+    fn parse_resume_task_id_reads_the_argument_object() {
+        assert_eq!(
+            parse_resume_task_id(r#"{"task_id":"abc-123","reason":"crashed"}"#).as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(parse_resume_task_id(r#"{"task_id":"  "}"#), None);
+        assert_eq!(parse_resume_task_id(r#"{"reason":"crashed"}"#), None);
+        assert_eq!(parse_resume_task_id("not json"), None);
+    }
+
+    /// Hosts don't all persist the bare argument object, and a preview is
+    /// allowed to be cut off. Every shape here reaches `inject_delegation_meta`
+    /// in practice, and each one that fails to yield an id leaves the reloaded
+    /// resume card frozen on its own ack with no task text.
+    #[test]
+    fn parse_resume_task_id_peels_host_wrappers_and_survives_truncation() {
+        // CodeBuddy's DeferExecuteTool wrapper — `parsers::codebuddy` leaves
+        // `params` on `input_preview` on purpose, for readers to peel.
+        assert_eq!(
+            parse_resume_task_id(
+                r#"{"toolName":"mcp__codeg-mcp__resume_delegation","params":{"task_id":"abc-123"}}"#
+            )
+            .as_deref(),
+            Some("abc-123")
+        );
+        // Antigravity's `{"arguments": {...}}`.
+        assert_eq!(
+            parse_resume_task_id(r#"{"arguments":{"task_id":"abc-123","reason":"x"}}"#).as_deref(),
+            Some("abc-123")
+        );
+        // Cursor's `{providerIdentifier, toolName, args}`.
+        assert_eq!(
+            parse_resume_task_id(
+                r#"{"providerIdentifier":"codeg-mcp","toolName":"resume_delegation","args":{"task_id":"abc-123"}}"#
+            )
+            .as_deref(),
+            Some("abc-123")
+        );
+        // …and the same wrapper with the arguments stringified.
+        assert_eq!(
+            parse_resume_task_id(r#"{"arguments":"{\"task_id\":\"abc-123\"}"}"#).as_deref(),
+            Some("abc-123")
+        );
+        // A long `reason` pushes past the parsers' preview cap, so the JSON
+        // never closes — but the id, written first, survived.
+        assert_eq!(
+            parse_resume_task_id(r#"{"task_id":"abc-123","reason":"the app was ki"#).as_deref(),
+            Some("abc-123")
+        );
+        // A wrapper key present but carrying something unreadable must not
+        // shadow a usable top-level id.
+        assert_eq!(
+            parse_resume_task_id(r#"{"params":"not json","task_id":"abc-123"}"#).as_deref(),
+            Some("abc-123")
         );
     }
 
@@ -2949,6 +3169,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);
@@ -5223,7 +5444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_import_never_resurrects_a_deleted_conversation() {
+    async fn batch_import_restores_a_deleted_conversation_in_place() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
             Set};
         let db = fresh_in_memory_db().await;
@@ -5251,10 +5472,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let original_id = row.id;
         let mut active = row.into_active_model();
         active.deleted_at = Set(Some(chrono::Utc::now()));
         active.update(&db.conn).await.unwrap();
 
+        // Deleting a conversation is a soft delete, so re-picking the session
+        // in the import window brings the ORIGINAL row back rather than
+        // inserting a second one — every selection here is a session the user
+        // checked while it was badged "deleted".
         let again = import_selected_from_summaries(
             &db.conn,
             &EventEmitter::Noop,
@@ -5263,15 +5489,64 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(again.imported, 0);
-        assert_eq!(again.skipped, 1);
+        assert_eq!(again.imported, 0, "restored, not re-imported");
+        assert_eq!(again.restored, 1);
+        assert_eq!(again.skipped, 0);
+        assert_eq!(again.folders[0].restored, 1);
 
         let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate row");
+        assert_eq!(rows[0].id, original_id);
+        assert!(rows[0].deleted_at.is_none(), "back in the sidebar");
+    }
+
+    #[tokio::test]
+    async fn whole_folder_import_still_never_resurrects_a_deleted_conversation() {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+            Set};
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/proj-sweep").await;
+        let items = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/proj-sweep"),
+            at(0),
+        )];
+
+        import_service::import_summaries(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await
+        .unwrap();
+        let row = conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.eq("s1"))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.update(&db.conn).await.unwrap();
+
+        // The legacy sweep imports a whole FOLDER, not sessions the user picked
+        // one by one, so it must not bring back everything they ever deleted
+        // under it.
+        let (tally, _ids) = import_service::import_summaries(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tally.restored, 0);
+        assert_eq!(tally.skipped, 1);
+        let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].deleted_at.is_some(),
-            "a deleted conversation stays deleted"
-        );
+        assert!(rows[0].deleted_at.is_some(), "stays deleted");
     }
 
     #[tokio::test]
@@ -5409,7 +5684,13 @@ mod tests {
         ];
 
         let (tally, updated_ids, failed) =
-            import_service::import_summaries_resilient(&db.conn, 999_999, &items).await;
+            import_service::import_summaries_resilient(
+                &db.conn,
+                999_999,
+                &items,
+                import_service::DeletedPolicy::Skip,
+            )
+            .await;
         assert_eq!(failed, 2, "both rows fail the folder FK and are counted");
         assert_eq!(tally.imported, 0);
         assert_eq!(tally.updated, 0);
@@ -5419,7 +5700,13 @@ mod tests {
         // not corrupt state or leave a half-open transaction.
         let folder_id = seed_folder(&db, "/tmp/x").await;
         let (tally2, _ids, failed2) =
-            import_service::import_summaries_resilient(&db.conn, folder_id, &items).await;
+            import_service::import_summaries_resilient(
+                &db.conn,
+                folder_id,
+                &items,
+                import_service::DeletedPolicy::Skip,
+            )
+            .await;
         assert_eq!(failed2, 0);
         assert_eq!(tally2.imported, 2);
     }
@@ -5438,9 +5725,14 @@ mod tests {
             at(0),
         )];
         assert!(
-            import_service::import_summaries(&db.conn, 999_999, &items)
-                .await
-                .is_err(),
+            import_service::import_summaries(
+                &db.conn,
+                999_999,
+                &items,
+                import_service::DeletedPolicy::Skip
+            )
+            .await
+            .is_err(),
             "a row FK violation must propagate through the strict importer"
         );
     }

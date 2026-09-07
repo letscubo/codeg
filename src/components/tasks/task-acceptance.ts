@@ -27,10 +27,18 @@ export function worktreeWasRemoved(task: WorkTask): boolean {
 
 /**
  * Whether the drawer should offer to remove the worktree on its own — a task
- * that FINISHED still sitting on the checkout it ran in. Both acceptances
- * (merge, complete) offer to take the worktree along and both let the user say
- * no, so a `done` task can keep a checkout nobody will open again; this is how
- * that disk is reclaimed without deleting the task itself.
+ * that STOPPED still sitting on the checkout it ran in. Every way of stopping
+ * offers to take the worktree along and every one of them lets the user say no
+ * (the acceptances' checkbox, the cancel dialog's), so a settled task can keep
+ * a checkout nobody will open again; this is how that disk is reclaimed without
+ * deleting the task itself.
+ *
+ * Two statuses qualify, for the same reason from opposite ends: `done` (the
+ * work landed, or there was none) and `canceled` (the work was abandoned). A
+ * canceled task can still be requeued, which is why the removal stays an
+ * explicit, separate gesture here rather than something the cancel does on its
+ * own — but leaving it unofferable meant the only way to reclaim that disk was
+ * to delete the task, losing the record of why it was stopped.
  *
  * Two exclusions, both about not offering the same call twice:
  * - a worktree already gone (`isWorktreeGone`) has nothing to remove — the card
@@ -41,7 +49,7 @@ export function worktreeWasRemoved(task: WorkTask): boolean {
  */
 export function canRemoveWorktree(task: WorkTask): boolean {
   return (
-    task.status === "done" &&
+    (task.status === "done" || task.status === "canceled") &&
     !isWorktreeGone(task) &&
     task.cleanup_state !== "failed"
   )
@@ -50,10 +58,15 @@ export function canRemoveWorktree(task: WorkTask): boolean {
 /**
  * Whether a reviewed task has no merge to offer, so "complete" takes the
  * primary slot instead:
- * - the run settled with an empty diff against the recorded base — only `0`
- *   counts; `null` means the engine could not read the stats, and merging
- *   stays the safe default there. The engine re-runs the same diff before it
- *   finishes the task, so a stale card cannot drop work;
+ * - the run produced nothing — only `0` counts; `null` means the engine could
+ *   not read the stats, and merging stays the safe default there. The engine
+ *   re-runs the same diff before it finishes the task, so a stale card cannot
+ *   drop work. `files_changed` counts what the TASK wrote, measured from the
+ *   commit its worktree was checked out at — which is not always the diff the
+ *   drawer lists: a task triggered from a pull request is checked out ON that
+ *   pull request, and its files are the material under review, not this task's
+ *   work (a review-only task must offer "complete", not a delivery that would
+ *   push nothing);
  * - or the worktree is gone (see `isWorktreeGone`) — a merge could only fail,
  *   and completing is the one acceptance left. The engine preserves a work
  *   branch that still holds unlanded commits.
@@ -74,12 +87,28 @@ export function isMergeQueued(task: WorkTask): boolean {
 }
 
 /**
- * Whether a merge of this task's project is running right now. Merges are
- * serial per project (one base branch, one landing at a time), so this is what
- * turns the merge button's "merge" into "queue".
+ * Whether a merge of this task's project is running right now — ANOTHER task's,
+ * never `task`'s own. Merges are serial per project (one base branch, one
+ * landing at a time), so this is what turns the merge button's "merge" into
+ * "queue".
+ *
+ * Excluding the subject is the whole point, not a detail: the engine flips
+ * review→merging and BROADCASTS it before the dispatch call returns (launching
+ * the merge session takes seconds), so a plain "is any task of this folder
+ * merging" goes true for the very task the user just accepted. That is a lie
+ * with a nasty shape — for the width of their own dispatch it tells them the
+ * project is busy with some other task and that their merge went into a queue.
  */
-export function isFolderMerging(tasks: WorkTask[], folderId: number): boolean {
-  return tasks.some((t) => t.folder_id === folderId && t.status === "merging")
+export function isAnotherTaskMerging(
+  tasks: WorkTask[],
+  task: WorkTask
+): boolean {
+  return tasks.some(
+    (t) =>
+      t.id !== task.id &&
+      t.folder_id === task.folder_id &&
+      t.status === "merging"
+  )
 }
 
 /**

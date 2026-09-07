@@ -6,7 +6,7 @@
 //! a clean "engine not running" error.
 
 use crate::app_error::AppCommandError;
-use crate::commands::folders::{get_folder_core, git_diff_with_branch};
+use crate::commands::folders::get_folder_core;
 use crate::db::entities::work_task::WorkTaskStatus;
 use crate::db::error::DbError;
 use crate::db::service::work_task_service;
@@ -384,8 +384,24 @@ pub async fn work_task_delete_core(
         // Read from THIS pass, not from a stale first look: a run that started
         // and was cancelled above has a worktree the first snapshot never saw.
         if delete_worktree && task.worktree_folder_id.is_some() {
-            if let Err(e) = engine()?.cleanup_task(id).await {
-                tracing::warn!("[work_task] cleanup during delete of task {id}: {e}");
+            if let Err(blocked) = engine()?.cleanup_task(id).await {
+                if blocked.holds_work {
+                    // STOP, rather than the `warn!` a mere failure gets. The
+                    // tombstone below is what makes this different from every
+                    // other swallowed cleanup: it takes the card, its
+                    // `cleanup_state` and its retry entry in one write, so the
+                    // worktree the user was told would be deleted would be left
+                    // on disk with nothing anywhere left to say why. Refusing
+                    // the delete keeps both the files and the way out.
+                    return Err(DbError::Validation(crate::work_task::worktree_kept(
+                        "Remove them, or clear \"also delete its worktree\" to delete just the \
+                         task.",
+                    )));
+                }
+                tracing::warn!(
+                    "[work_task] cleanup during delete of task {id}: {}",
+                    blocked.message
+                );
             }
         }
         if work_task_service::soft_delete(&db.conn, id, task.status).await? {
@@ -534,11 +550,46 @@ pub async fn work_task_return_core(
 
 /// Stop a task. `reason` is the user's optional note about WHY — it lands on
 /// the `canceled` entry of the progress timeline and nowhere else.
-pub async fn work_task_cancel_core(id: i32, reason: Option<String>) -> Result<(), DbError> {
-    engine()?
-        .cancel(id, reason)
-        .await
-        .map_err(DbError::Validation)
+///
+/// `delete_worktree` takes the checkout along, the same offer the acceptances
+/// make — except here it also destroys the work branch (`cleanup_task` deletes
+/// it outright), so a canceled task that was cleaned up has nothing left to
+/// requeue INTO; the requeued run starts from a fresh worktree. The dialog
+/// defaults the box to off for exactly that reason.
+///
+/// Cleanup runs AFTER the cancel returns, not inside it: the removal refuses
+/// while the task still has a live agent connection, and shedding that
+/// connection is the last thing [`Engine::cancel`] does. The gap that opens
+/// between the two calls is `cleanup_task`'s own problem, not this one's — it
+/// re-reads the row under the task lock precisely so a requeue landing in here
+/// cannot have its fresh checkout deleted.
+///
+/// Best-effort, like the delete path — a git failure flags a retryable
+/// `cleanup_state` on the card rather than turning a stop that already happened
+/// into an error. Refusals are swallowed here too, and both of them leave the
+/// worktree standing (fail-safe) with the reason visible on the board rather
+/// than in this return value: either the task was re-claimed while we were
+/// stopping it — the requeue that saved the checkout is itself on the board —
+/// or it still holds uncommitted files, which `cleanup_task` flags as a
+/// retryable `cleanup_state`. A stop interrupts a working agent, so the second
+/// is the common one, and turning it into an error would report the stop that
+/// already happened as failed.
+pub async fn work_task_cancel_core(
+    id: i32,
+    reason: Option<String>,
+    delete_worktree: bool,
+) -> Result<(), DbError> {
+    let engine = engine()?;
+    engine.cancel(id, reason).await.map_err(DbError::Validation)?;
+    if delete_worktree {
+        if let Err(blocked) = engine.cleanup_task(id).await {
+            tracing::warn!(
+                "[work_task] cleanup during cancel of task {id}: {}",
+                blocked.message
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Dispatch the merge generation: the agent lands the task in its session and
@@ -593,13 +644,19 @@ pub async fn work_task_merge_unqueue_core(
 /// REST calls, no agent — so both success and failure land in the caller's
 /// dialog. Every gate is inside the engine, where a direct API call cannot
 /// route around it.
+///
+/// `delete_worktree` takes the checkout along once the delivery lands, the
+/// same offer the merge and complete acceptances make. It never changes the
+/// result: a removal that fails leaves a retryable `cleanup_state` on the card
+/// and the delivered URL still comes back.
 pub async fn work_task_deliver_pr_core(
     id: i32,
     pr_title: Option<String>,
     draft: bool,
+    delete_worktree: bool,
 ) -> Result<String, DbError> {
     engine()?
-        .deliver_pr(id, pr_title, draft)
+        .deliver_pr(id, pr_title, draft, delete_worktree)
         .await
         .map_err(DbError::Validation)
 }
@@ -638,11 +695,20 @@ pub async fn work_task_archive_core(
 }
 
 pub async fn work_task_cleanup_core(id: i32) -> Result<(), DbError> {
-    engine()?.cleanup_task(id).await.map_err(DbError::Validation)
+    engine()?
+        .cleanup_task(id)
+        .await
+        .map_err(|blocked| DbError::Validation(blocked.message))
 }
 
 /// Diff of the task worktree vs. its recorded base (`base_sha`, so the view is
 /// stable even when the base branch advances). `file = None` → full patch.
+///
+/// Uncommitted work is part of it: nothing makes the agent commit before the
+/// task reaches review (the merge generation commits the leftovers itself), so
+/// a review that showed only committed work would be reviewing half the task.
+/// New files therefore render as `new file mode` hunks rather than as an empty
+/// diff — see [`crate::work_task::git::diff_patch_with_untracked`].
 pub async fn work_task_diff_core(
     db: &AppDatabase,
     id: i32,
@@ -662,9 +728,12 @@ pub async fn work_task_diff_core(
     let wt = get_folder_core(db, wt_id)
         .await
         .map_err(AppCommandError::from)?;
-    git_diff_with_branch(wt.path, base, file).await
+    crate::work_task::git::diff_patch_with_untracked(&wt.path, &base, file.as_deref()).await
 }
 
+/// The file list behind that diff — same base, same "uncommitted work counts"
+/// rule, so the drawer's list and the row's counters cannot tell two different
+/// stories about the same task.
 pub async fn work_task_changed_files_core(
     db: &AppDatabase,
     id: i32,
@@ -681,7 +750,7 @@ pub async fn work_task_changed_files_core(
     let wt = get_folder_core(db, wt_id)
         .await
         .map_err(AppCommandError::from)?;
-    crate::work_task::git::diff_numstat(&wt.path, &base).await
+    crate::work_task::git::diff_numstat_with_untracked(&wt.path, &base).await
 }
 
 pub async fn work_task_settings_get_core(
@@ -933,8 +1002,12 @@ pub async fn work_task_return(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn work_task_cancel(id: i32, reason: Option<String>) -> Result<(), DbError> {
-    work_task_cancel_core(id, reason).await
+pub async fn work_task_cancel(
+    id: i32,
+    reason: Option<String>,
+    delete_worktree: Option<bool>,
+) -> Result<(), DbError> {
+    work_task_cancel_core(id, reason, delete_worktree.unwrap_or(false)).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -964,8 +1037,9 @@ pub async fn work_task_deliver_pr(
     id: i32,
     pr_title: Option<String>,
     draft: bool,
+    delete_worktree: bool,
 ) -> Result<String, DbError> {
-    work_task_deliver_pr_core(id, pr_title, draft).await
+    work_task_deliver_pr_core(id, pr_title, draft, delete_worktree).await
 }
 
 #[cfg(feature = "tauri-runtime")]

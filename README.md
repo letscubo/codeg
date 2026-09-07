@@ -64,7 +64,14 @@ It aggregates your sessions from every supported agent CLI into one searchable w
       <a href="https://console.lqapi.xyz/sign-up?aff=KPy9" target="_blank"><img src="./docs/images/lq-router.png" alt="LQ router" width="160" /></a><br/>
       <strong><a href="https://console.lqapi.xyz/sign-up?aff=KPy9">LQ router</a></strong>
     </td>
-    <td>Thanks to the LQ router relay service for sponsoring this project! LQ router is an enterprise-grade API aggregation gateway for independent developers and technical teams. It provides access to leading models including GPT, Claude, Grok, and Gemini, is compatible with existing clients and the OpenAI SDK, and uses a dynamic account pool for intelligent routing; one endpoint handles all your model calls. <a href="https://console.lqapi.xyz/sign-up?aff=KPy9">Sign up through the official website to receive $1 in trial credit</a>.</td>
+    <td>Thanks to LQ router 中转站 for sponsoring this project! LQ router is an enterprise-grade API aggregation gateway for independent developers and technical teams. It provides access to leading models including GPT, Claude, Grok, and Gemini, is compatible with existing clients and the OpenAI SDK, and uses a dynamic account pool for intelligent routing; one endpoint handles all your model calls. <a href="https://console.lqapi.xyz/sign-up?aff=KPy9">Sign up through the official website to receive $1 in trial credit</a>.</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://go.apimart.ai/gh-codeg" target="_blank"><img src="./docs/images/apimart-ai.png" alt="APIMart" width="200" /></a><br/>
+      <strong><a href="https://go.apimart.ai/gh-codeg">APIMart</a></strong>
+    </td>
+    <td>Thanks to APIMart for sponsoring this project! APIMart is a low-cost API platform for AI image & video generation — GPT-Image-2 from $0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — <a href="https://go.apimart.ai/gh-codeg">sign up here</a> to get started.</td>
   </tr>
 </table>
 

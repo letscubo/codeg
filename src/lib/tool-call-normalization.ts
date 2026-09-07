@@ -110,6 +110,7 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   mcp__codeg__delegate_to_agent: "delegate_to_agent",
   get_delegation_status: "get_delegation_status",
   cancel_delegation: "cancel_delegation",
+  resume_delegation: "resume_delegation",
   // codeg-mcp workbench companions (session lookup, work-task reporting, chat
   // authoring). Listed explicitly because the freeform `^task(\b|[_\s:-])` rule
   // below would otherwise collapse `task_progress` / `task_complete` into the
@@ -506,6 +507,7 @@ export function normalizeToolName(toolName: string): string {
   if (/[^a-z0-9]get_delegation_status$/.test(canonical))
     return "get_delegation_status"
   if (/[^a-z0-9]cancel_delegation$/.test(canonical)) return "cancel_delegation"
+  if (/[^a-z0-9]resume_delegation$/.test(canonical)) return "resume_delegation"
   if (/[^a-z0-9]create_goal$/.test(canonical)) return "create_goal"
   if (/[^a-z0-9]update_goal$/.test(canonical)) return "update_goal"
 
@@ -542,13 +544,17 @@ export function normalizeToolName(toolName: string): string {
   return trimmed
 }
 
-// Canonical names of the codeg-mcp delegation companion tools. Each has a
-// dedicated card renderer, so its identity must win over input-shape
-// heuristics during live streaming (see `inferLiveToolName`).
+// Canonical names of the codeg-mcp delegation companion tools. Their identity
+// must win over input-shape heuristics during live streaming (see
+// `inferLiveToolName`): most have a dedicated card renderer, and
+// `resume_delegation`'s `{task_id, reason}` input would otherwise be
+// misclassified by `inferFromInput` exactly like `cancel_delegation`'s
+// `{task_id}` (generic "task" tool).
 const DELEGATION_COMPANION_TOOLS: ReadonlySet<string> = new Set([
   "delegate_to_agent",
   "get_delegation_status",
   "cancel_delegation",
+  "resume_delegation",
 ])
 
 export function inferLiveToolName(params: {
@@ -829,6 +835,39 @@ export function extractClaudeCodeSkillName(
   if (typeof skill !== "string") return null
   const trimmed = skill.trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * Whether the agent has moved this tool call's process into the background —
+ * JetBrains AIR's `_meta.jetbrains.air.asyncTasks.backgrounded` marker
+ * (codex-acp 1.10+, published only because `build_client_capabilities`
+ * advertises the `asyncTasks` capability).
+ *
+ * It arrives on a `tool_call_update` that carries NOTHING else: no status, no
+ * content, no output — just the id and this flag, immediately before the
+ * matching `async_task_spawned`. That is the point of reading it: the launching
+ * `execute` call stays `in_progress` for the rest of the connection (codex only
+ * completes it when the process finally exits or a stop lands), so without the
+ * marker the card is indistinguishable from a command that hung.
+ *
+ * Two shape notes, both load-bearing:
+ *   - there is NO `version` key inside this `air` block — unlike its
+ *     `sessionFailure` sibling — so nothing here may gate on one;
+ *   - the flag is only ever published as `true`; the adapter withdraws it by
+ *     settling the tool call, never by sending `false`. Strict equality anyway,
+ *     so a future `false` reads as "not backgrounded" rather than truthy.
+ */
+export function toolCallMovedToBackground(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const jetbrains = (meta as Record<string, unknown>).jetbrains
+  if (!jetbrains || typeof jetbrains !== "object") return false
+  const air = (jetbrains as Record<string, unknown>).air
+  if (!air || typeof air !== "object") return false
+  const asyncTasks = (air as Record<string, unknown>).asyncTasks
+  if (!asyncTasks || typeof asyncTasks !== "object") return false
+  return (asyncTasks as Record<string, unknown>).backgrounded === true
 }
 
 /**

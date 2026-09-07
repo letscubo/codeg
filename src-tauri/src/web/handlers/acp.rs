@@ -346,6 +346,10 @@ pub struct AcpForkParams {
     pub conversation_id: Option<i32>,
     #[serde(default)]
     pub folder_id: Option<i32>,
+    /// "Fork from here": the rendered turn to fork at. Absent = fork at the
+    /// tail, the composer's fork-send behaviour.
+    #[serde(default)]
+    pub fork_from_turn_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -453,6 +457,7 @@ pub async fn acp_fork(
             &params.connection_id,
             params.conversation_id,
             params.folder_id,
+            params.fork_from_turn_id,
         )
         .await
         .map_err(|e| {
@@ -468,6 +473,27 @@ pub async fn acp_fork(
             }
         })?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpStopAsyncTaskParams {
+    pub connection_id: String,
+    pub task_id: String,
+}
+
+/// `Ok(false)` = the adapter declined to stop the task — a real answer, not a
+/// failure, so it is a 200 with `false` rather than an error status.
+pub async fn acp_stop_async_task(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpStopAsyncTaskParams>,
+) -> Result<Json<bool>, AppCommandError> {
+    let stopped = state
+        .connection_manager
+        .stop_async_task(&params.connection_id, &params.task_id)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(stopped))
 }
 
 #[derive(Deserialize)]
@@ -940,6 +966,53 @@ pub async fn acp_sync_antigravity_settings(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpAntigravityLoginStartParams {
+    pub method_id: String,
+}
+
+pub async fn acp_antigravity_login_start(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpAntigravityLoginStartParams>,
+) -> Result<Json<crate::acp::antigravity_login::AntigravityLoginStart>, AppCommandError> {
+    let result = acp_commands::acp_antigravity_login_start_core(&state.db, params.method_id)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpAntigravityLoginFinishParams {
+    pub handle: String,
+    pub redirect: String,
+}
+
+pub async fn acp_antigravity_login_finish(
+    Json(params): Json<AcpAntigravityLoginFinishParams>,
+) -> Result<Json<crate::acp::antigravity_login::AntigravityLoginOutcome>, AppCommandError> {
+    let result = acp_commands::acp_antigravity_login_finish_core(params.handle, params.redirect)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpAntigravityLoginCancelParams {
+    pub handle: String,
+}
+
+pub async fn acp_antigravity_login_cancel(
+    Json(params): Json<AcpAntigravityLoginCancelParams>,
+) -> Result<Json<()>, AppCommandError> {
+    acp_commands::acp_antigravity_login_cancel_core(params.handle)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpPiProjectTrustStateParams {
     pub workspace: String,
 }
@@ -1342,4 +1415,55 @@ pub async fn acp_add_registry_agent(
 
 pub async fn acp_current_platform() -> Json<String> {
     Json(custom_agent_commands::acp_current_platform_core())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    use crate::acp::agent_mentions::append_agent_routes;
+
+    #[test]
+    fn prompt_params_deserialize_camel_case_fields() {
+        let params: AcpPromptParams = serde_json::from_value(serde_json::json!({
+            "connectionId": "conn-1",
+            "blocks": [{"type": "text", "text": "delegate this"}],
+            "folderId": 7,
+            "conversationId": 9,
+            "clientMessageId": "optimistic-1"
+        }))
+        .unwrap();
+
+        assert_eq!(params.connection_id, "conn-1");
+        assert_eq!(params.folder_id, Some(7));
+        assert_eq!(params.client_message_id.as_deref(), Some("optimistic-1"));
+    }
+
+    #[test]
+    fn an_older_clients_agent_mentions_sidecar_is_ignored_not_rejected() {
+        // The sidecar was removed; a client that still posts it must keep
+        // working, since routing now comes from the prompt's own visible link.
+        let params: AcpPromptParams = serde_json::from_value(serde_json::json!({
+            "connectionId": "conn-1",
+            "blocks": [{
+                "type": "text",
+                "text": "ask [@Antigravity](codeg://agent/antigravity)"
+            }],
+            "agentMentions": [{"agentType": "codex", "proof": "whatever"}]
+        }))
+        .expect("an unknown field must not fail the request");
+
+        let mut blocks = params.blocks;
+        append_agent_routes(&mut blocks, true);
+
+        // The frame follows the VISIBLE link, so the stale sidecar's `codex`
+        // has no effect either way.
+        assert_eq!(blocks.len(), 2);
+        let crate::acp::types::PromptInputBlock::Text { text } = &blocks[1] else {
+            panic!("expected a routing text block");
+        };
+        assert!(text.contains(r#"{"agentType":"antigravity"}"#));
+        assert!(!text.contains("codex"));
+    }
 }

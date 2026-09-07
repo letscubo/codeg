@@ -54,6 +54,7 @@ import { normalizeMcpType } from "@/lib/mcp-types"
 import { cn } from "@/lib/utils"
 import type {
   LocalMcpServer,
+  LocalMcpSourceWarning,
   McpAppType,
   McpMarketplaceItem,
   McpMarketplaceInstallOption,
@@ -103,6 +104,21 @@ const APP_OPTIONS: { value: McpAppType; label: string }[] = [
   { value: "qoder", label: "Qoder" },
   { value: "antigravity", label: "Google Antigravity" },
 ]
+
+// The backend SCANS one more agent than it lets you assign to: OpenClaw is read
+// back so existing entries survive, but is not an assignable target (see the
+// note in APP_OPTIONS). A scan warning can still name it, so it needs a label.
+const SCAN_ONLY_APP_LABELS: Partial<Record<McpAppType, string>> = {
+  open_claw: "OpenClaw",
+}
+
+function appLabel(app: McpAppType): string {
+  return (
+    APP_OPTIONS.find((option) => option.value === app)?.label ??
+    SCAN_ONLY_APP_LABELS[app] ??
+    app
+  )
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
@@ -338,6 +354,9 @@ export function McpSettings() {
   const [selection, setSelection] = useState<Selection>(null)
 
   const [installedServers, setInstalledServers] = useState<LocalMcpServer[]>([])
+  const [sourceWarnings, setSourceWarnings] = useState<LocalMcpSourceWarning[]>(
+    []
+  )
   const [localFilter, setLocalFilter] = useState("")
 
   const [providers, setProviders] = useState<McpMarketplaceProvider[]>([])
@@ -409,6 +428,13 @@ export function McpSettings() {
     [localSpecText]
   )
 
+  // A scan that could not read every agent is fine to LIST from but not to
+  // reassign from: the app checkboxes it seeds drive removals, so an agent
+  // missing only because its file was unreadable would be stripped. The
+  // backend refuses such a save; the UI blocks composing one, which also stops
+  // the draft outliving the repair (fix the file, hit Refresh, then edit).
+  const scanDegraded = sourceWarnings.length > 0
+
   const filteredLocalServers = useMemo(() => {
     const q = localFilter.trim().toLowerCase()
     if (!q) return installedServers
@@ -420,9 +446,10 @@ export function McpSettings() {
   }, [installedServers, localFilter, mcpT])
 
   const refreshLocalServers = useCallback(async () => {
-    const servers = await mcpScanLocal()
-    setInstalledServers(servers)
-    return servers
+    const scan = await mcpScanLocal()
+    setInstalledServers(scan.servers)
+    setSourceWarnings(scan.warnings)
+    return scan.servers
   }, [])
 
   const loadInitial = useCallback(async () => {
@@ -430,18 +457,19 @@ export function McpSettings() {
     setLoadingError(null)
 
     try {
-      const [servers, marketProviders] = await Promise.all([
+      const [scan, marketProviders] = await Promise.all([
         mcpScanLocal(),
         mcpListMarketplaces(),
       ])
-      setInstalledServers(servers)
+      setInstalledServers(scan.servers)
+      setSourceWarnings(scan.warnings)
       setProviders(marketProviders)
       setSelectedProvider(
         (current) => current || marketProviders[0]?.id || "official_registry"
       )
 
-      if (servers[0]) {
-        setSelection({ kind: "local", id: servers[0].id })
+      if (scan.servers[0]) {
+        setSelection({ kind: "local", id: scan.servers[0].id })
       }
     } catch (err) {
       const message = toLocalizedErrorMessage(err, mcpT)
@@ -983,7 +1011,7 @@ export function McpSettings() {
                           />
                         )}
                         {field.description ? (
-                          <div className="text-[11px] text-muted-foreground leading-5">
+                          <div className="text-2xs text-muted-foreground leading-5">
                             {field.description}
                           </div>
                         ) : null}
@@ -1048,7 +1076,7 @@ export function McpSettings() {
         </DialogContent>
       </Dialog>
 
-      <div className="h-full min-h-0 grid grid-cols-1 gap-4 p-3 md:p-4 lg:grid-cols-[360px_1fr]">
+      <div className="h-full min-h-0 grid grid-cols-1 gap-4 p-3 md:p-4 lg:grid-cols-[22.5rem_1fr]">
         <section className="min-h-0 rounded-xl border bg-card p-3">
           <Tabs
             value={leftTab}
@@ -1081,6 +1109,21 @@ export function McpSettings() {
                   {t("local.loadFailed", { message: loadingError })}
                 </div>
               ) : null}
+
+              {/* One agent's config being unreadable hides only that agent's
+                  servers — the rest of the list below is still real, so this
+                  is a warning beside it rather than an error instead of it. */}
+              {sourceWarnings.map((warning) => (
+                <div
+                  key={warning.app}
+                  className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-500 break-all"
+                >
+                  {t("local.sourceUnreadable", {
+                    app: appLabel(warning.app),
+                    message: warning.message,
+                  })}
+                </div>
+              ))}
 
               <div className="flex-1 min-h-0 overflow-auto space-y-1">
                 {filteredLocalServers.length === 0 ? (
@@ -1160,8 +1203,15 @@ export function McpSettings() {
               </div>
             </TabsContent>
 
-            <TabsContent value="market" className="h-full min-h-0 pt-2">
-              <div className="space-y-2 pb-2">
+            {/* Flex column rather than `h-[calc(100% - <header>)]` on the list:
+                the header above is sized by its own controls (rem-driven, so it
+                grows with the zoom level) and the error banner appears and
+                disappears, neither of which a hardcoded subtrahend can track. */}
+            <TabsContent
+              value="market"
+              className="flex h-full min-h-0 flex-col pt-2"
+            >
+              <div className="shrink-0 space-y-2 pb-2">
                 <Select
                   value={selectedProvider}
                   onValueChange={setSelectedProvider}
@@ -1222,12 +1272,12 @@ export function McpSettings() {
               </div>
 
               {searchError ? (
-                <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
+                <div className="shrink-0 rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
                   {t("market.searchFailed", { message: searchError })}
                 </div>
               ) : null}
 
-              <div className="h-[calc(100%-106px)] overflow-auto space-y-1">
+              <div className="min-h-0 flex-1 overflow-auto space-y-1">
                 {searching ? (
                   <div className="h-full min-h-24 rounded-md border border-dashed flex items-center justify-center gap-2 text-xs text-muted-foreground">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1271,7 +1321,7 @@ export function McpSettings() {
                                     className="h-full w-full object-cover"
                                   />
                                 ) : (
-                                  <div className="h-full w-full flex items-center justify-center text-[10px] text-muted-foreground">
+                                  <div className="h-full w-full flex items-center justify-center text-3xs text-muted-foreground">
                                     MCP
                                   </div>
                                 )}
@@ -1291,29 +1341,23 @@ export function McpSettings() {
                                 <Badge
                                   key={`${item.server_id}-${protocol}`}
                                   variant="secondary"
-                                  className="text-[10px]"
+                                  className="text-3xs"
                                 >
                                   {protocolBadgeLabel(protocol, mcpT)}
                                 </Badge>
                               ))}
                               {item.latest_version ? (
-                                <Badge
-                                  variant="outline"
-                                  className="text-[10px]"
-                                >
+                                <Badge variant="outline" className="text-3xs">
                                   v{item.latest_version}
                                 </Badge>
                               ) : null}
                               {item.verified ? (
-                                <Badge className="text-[10px]">
+                                <Badge className="text-3xs">
                                   {t("badges.verified")}
                                 </Badge>
                               ) : null}
                               {typeof item.downloads === "number" ? (
-                                <Badge
-                                  variant="outline"
-                                  className="text-[10px]"
-                                >
+                                <Badge variant="outline" className="text-3xs">
                                   {t("badges.uses", { count: item.downloads })}
                                 </Badge>
                               ) : null}
@@ -1400,13 +1444,22 @@ export function McpSettings() {
                 <Textarea
                   value={draftSpecText}
                   onChange={(event) => setDraftSpecText(event.target.value)}
-                  className="min-h-[360px] font-mono text-xs"
+                  className="min-h-[22.5rem] font-mono text-xs"
                 />
               </div>
 
               {draftEnvOnRemote ? (
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
                   {t("local.envOnRemoteWarning")}
+                </div>
+              ) : null}
+
+              {/* Creating writes through the same command, which refuses while
+                  any agent's config is unreadable — an id that already exists
+                  in the unread one would be assigned away from it. */}
+              {scanDegraded ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                  {t("local.saveBlockedByUnreadableSource")}
                 </div>
               ) : null}
 
@@ -1424,7 +1477,10 @@ export function McpSettings() {
                       console.error("[Settings] create local MCP failed:", err)
                     })
                   }}
-                  disabled={Boolean(runningAction?.startsWith("create:"))}
+                  disabled={
+                    scanDegraded ||
+                    Boolean(runningAction?.startsWith("create:"))
+                  }
                 >
                   {runningAction?.startsWith("create:") ? (
                     <>
@@ -1506,13 +1562,25 @@ export function McpSettings() {
                 <Textarea
                   value={localSpecText}
                   onChange={(event) => setLocalSpecText(event.target.value)}
-                  className="min-h-[360px] font-mono text-xs"
+                  className="min-h-[22.5rem] font-mono text-xs"
                 />
               </div>
 
               {localEnvOnRemote ? (
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
                   {t("local.envOnRemoteWarning")}
+                </div>
+              ) : null}
+
+              {/* The checkboxes above were seeded from a scan that could not
+                  read every agent, so an agent that holds this server may be
+                  showing as unchecked — and saving means "remove it from every
+                  unchecked agent". The backend refuses such a save too; this
+                  keeps the user from composing one whose stale draft would
+                  still be accepted once they repair the file out of band. */}
+              {scanDegraded ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                  {t("local.saveBlockedByUnreadableSource")}
                 </div>
               ) : null}
 
@@ -1523,7 +1591,9 @@ export function McpSettings() {
                       console.error("[Settings] save local MCP failed:", err)
                     })
                   }}
-                  disabled={runningAction === `save:${selectedLocal.id}`}
+                  disabled={
+                    scanDegraded || runningAction === `save:${selectedLocal.id}`
+                  }
                 >
                   {runningAction === `save:${selectedLocal.id}` ? (
                     <>
@@ -1668,7 +1738,7 @@ export function McpSettings() {
                         ))}
                       </SelectContent>
                     </Select>
-                    <div className="text-[11px] text-muted-foreground">
+                    <div className="text-2xs text-muted-foreground">
                       {t("market.currentOptionParameterCount", {
                         count: selectedInstallOption?.parameters.length ?? 0,
                       })}
@@ -1685,7 +1755,7 @@ export function McpSettings() {
                         setMarketSpecText(event.target.value)
                         setMarketSpecDirty(true)
                       }}
-                      className="min-h-[360px] font-mono text-xs"
+                      className="min-h-[22.5rem] font-mono text-xs"
                     />
                   </div>
                 </>

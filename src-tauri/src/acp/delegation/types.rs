@@ -73,6 +73,37 @@ pub struct DelegationRequest {
     pub external_handle: Option<String>,
 }
 
+/// Everything the broker needs to resume one interrupted delegation task.
+///
+/// Deliberately carries NO task text: `resume_delegation` continues the
+/// ORIGINAL task in the child's own (resumed) session and must not become a
+/// side-channel for new instructions — the only free-form field is `reason`,
+/// which is bounded and framed as interruption context in the continuation
+/// prompt (see `broker::build_resume_prompt`).
+///
+/// `parent_connection_id` / `parent_conversation_id` identify the CALLER —
+/// after a parent-session restart this is a different connection id than the
+/// one that originally delegated, but the same conversation row, which is what
+/// the ownership check scopes on (`ChildResumeContext::parent_id`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeDelegationRequest {
+    pub parent_connection_id: String,
+    pub parent_conversation_id: i32,
+    /// The broker `call_id` of the task to resume — the same id
+    /// `delegate_to_agent` returned and the child row persists as
+    /// `delegation_call_id`. The resumed task keeps this id, so
+    /// `get_delegation_status` / `cancel_delegation` keep working unchanged.
+    pub task_id: String,
+    /// Optional context on WHY the task is being resumed (e.g. "the app was
+    /// killed mid-run"). Interruption context only — never new work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Companion-minted cancel handle, same contract as
+    /// [`DelegationRequest::external_handle`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_handle: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input: u64,
@@ -119,6 +150,15 @@ pub enum DelegationError {
     /// as `empty` by the connection loop's "silent EndTurn" guard).
     #[error("subagent produced no output")]
     ChildEmpty,
+    /// Child's agent refused the prompt with ACP's `authRequired` (synthesized
+    /// as `auth_required` by the connection loop). Distinct from
+    /// [`Self::ChildUnknown`] because it names an action the user can take —
+    /// and because this message ships to the parent LLM, which would otherwise
+    /// read "unrecognized stop reason" for a reason codeg recognizes perfectly
+    /// well. The child's session survives it, so signing in and re-delegating
+    /// works.
+    #[error("subagent's agent needs you to sign in again")]
+    ChildAuthRequired,
     #[error("subagent ended with unrecognized stop reason: {0}")]
     ChildUnknown(String),
     #[error("canceled: {reason}")]
@@ -259,6 +299,7 @@ impl DelegationOutcome {
             DelegationError::ChildMaxTokens => "child_max_tokens",
             DelegationError::ChildMaxTurnRequests => "child_max_turn_requests",
             DelegationError::ChildEmpty => "child_empty",
+            DelegationError::ChildAuthRequired => "child_auth_required",
             DelegationError::ChildUnknown(_) => "child_unknown",
             DelegationError::Canceled { .. } => "canceled",
             DelegationError::ParentSessionGone => "canceled",
@@ -268,5 +309,54 @@ impl DelegationOutcome {
             message: err.to_string(),
             child_conversation_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `code` strings ship to the parent LLM and to the status badge's
+    /// i18n switch, and `from_err`'s comment declares them stable — so pin
+    /// them here rather than trusting the comment. A renamed code silently
+    /// falls through to the badge's `default` ("failed") and hands the LLM a
+    /// label it has never seen; a NEW variant that forgets its arm would be
+    /// caught by the compiler, but a new variant sharing an existing code
+    /// (the mistake `ChildAuthRequired` was one edit away from) would not.
+    #[test]
+    fn error_codes_are_stable_and_distinct_per_child_failure() {
+        let cases = [
+            (DelegationError::ChildRefusal, "child_refusal"),
+            (DelegationError::ChildMaxTokens, "child_max_tokens"),
+            (
+                DelegationError::ChildMaxTurnRequests,
+                "child_max_turn_requests",
+            ),
+            (DelegationError::ChildEmpty, "child_empty"),
+            (DelegationError::ChildAuthRequired, "child_auth_required"),
+            (
+                DelegationError::ChildUnknown("whatever".into()),
+                "child_unknown",
+            ),
+        ];
+        for (err, expected) in cases {
+            let display = err.to_string();
+            let DelegationOutcome::Err { code, message, .. } = DelegationOutcome::from_err(err, None)
+            else {
+                panic!("from_err must produce an Err outcome");
+            };
+            assert_eq!(code, expected);
+            assert_eq!(message, display);
+        }
+
+        // A sign-out is a recognized reason with an action attached, so it
+        // must NOT reach the parent wearing `ChildUnknown`'s "unrecognized
+        // stop reason" wording.
+        let DelegationOutcome::Err { message, .. } =
+            DelegationOutcome::from_err(DelegationError::ChildAuthRequired, None)
+        else {
+            unreachable!()
+        };
+        assert!(message.contains("sign in"), "message was {message:?}");
     }
 }
