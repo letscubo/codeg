@@ -1,5 +1,15 @@
 //! MyClaw 平台下发的技能 —— 定时**主动拉取**同步到中心库并链接到各 agent。
 //!
+//! # ⚠️ 这条通道已冻结(2026-09-07)
+//!
+//! 平台侧决定不再维护 `myclaw_skills` 表的内容,技能改由 MyClaw 的**身份层**
+//! (`vm_skill` / `vm_agent_skill`)下发 —— 那套按 agent 授权,而这套是「装了就
+//! 全局可见」,两者的粒度对不上。
+//!
+//! **没有直接把它关掉**是有意的:关掉后同步会把 `myclaw-office` 从**所有**存量
+//! 实例上卸载,包括 openclaw / hermes 类型的生产实例。冻结 = 不再往表里加内容,
+//! 代码保持能跑,存量实例上的技能原样留着。
+//!
 //! ## 与 experts/science 的关系
 //!
 //! 那两个包是 `include_dir!` 编译期嵌进二进制的只读内容,内容与二进制版本绑死。
@@ -39,7 +49,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -216,6 +226,38 @@ fn agent_link(agent: AgentType, slug: &str) -> Option<PathBuf> {
         .map(|d| d.join(slug))
 }
 
+/// 跨 agent 共用的 `~/.agents/skills` —— Codex / Gemini / Cline 的首选全局目录
+/// 都解析到这里(见 experts.rs 里 unlink_one_locked 的注释)。
+fn shared_agents_skills_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agents")
+        .join("skills")
+}
+
+/// 这条链接是不是落在共享的 `~/.agents/skills` 里。
+///
+/// ## 为什么本模块不再往那里链
+///
+/// 那个目录**不属于任何一个 agent**,是好几个 agent 共读的约定位置,而且读它的
+/// 远不止 codeg 认识的那几个:
+///
+///   · pi        `join(getHomeDir(), ".agents", "skills")` —— 硬编码,没有环境变量
+///   · deepseek  `$DSH_AGENTS_HOME/skills`,默认 `~/.agents`
+///
+/// MyClaw 的身份层(vm_agent)给每个身份一个私有 home,靠环境变量把 agent 指过去,
+/// 从而做到「没关联的技能加载不到」。但 `~/.agents/skills` 绕过了那层覆盖 ——
+/// 链到这里的技能对**每一个**身份都可见,绑不绑都在,严格白名单直接失效
+/// (2026-09-07 实测:pi 与 deepseek 两边都列出了本模块下发的 myclaw-office)。
+///
+/// 少链一个目录的代价是 Codex / Gemini / Cline 拿不到平台下发的技能 —— 平台侧
+/// 已决定这条下发通道不再维护,由身份层的技能库接管,所以这个代价是接受的。
+fn is_shared_agents_link(link: &Path) -> bool {
+    link.parent()
+        .map(|p| p == shared_agents_skills_dir())
+        .unwrap_or(false)
+}
+
 /// 把 slug 链接到所有**目录能解析出来**的 agent。
 ///
 /// 不去判断"这个 agent 装没装" —— 解析不出目录的 agent 自然会被 `agent_link`
@@ -224,6 +266,15 @@ fn link_everywhere(slug: &str, report: &mut SyncReport) {
     let truth = skill_dir(slug);
     for agent in BUILTIN_AGENT_TYPES.iter().copied() {
         let Some(link) = agent_link(agent, slug) else { continue };
+        if is_shared_agents_link(&link) {
+            // 不再往共享目录链(见 is_shared_agents_link);顺手把旧版留下的那条
+            // 收掉 —— 否则老实例上它会一直在,策略改了也生效不了。
+            // 只收**软链**:真实目录可能是用户自己放的,不是我们的产物。
+            if path_is_symlink(&link) {
+                let _ = fs::remove_file(&link);
+            }
+            continue;
+        }
         if path_is_symlink(&link) {
             continue; // 已是链接:真身路径没变,不必重建
         }
