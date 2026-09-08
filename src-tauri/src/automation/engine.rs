@@ -383,6 +383,10 @@ impl AutomationEngine {
             config_values: cfg.config_values.clone(),
             label_snapshot: cfg.label_snapshot.clone(),
             deliverable: None,
+            // An enqueueing automation hands its overlay down to the task it
+            // creates — the task is this automation's run, so it targets the
+            // same sub-agent.
+            runtime_env: cfg.runtime_env.clone(),
         };
         let draft = crate::models::WorkTaskDraft {
             folder_id,
@@ -469,7 +473,7 @@ impl AutomationEngine {
 
         // Recompute env from current settings (never snapshotted); hard-fail
         // visibly if the agent is disabled or not installed.
-        let runtime_env = build_session_runtime_env(
+        let mut runtime_env = build_session_runtime_env(
             &self.db,
             agent_type,
             resume_session_id.as_deref(),
@@ -477,6 +481,10 @@ impl AutomationEngine {
         )
         .await
         .map_err(|e| e.to_string())?;
+        // The automation's own overlay wins over the agent-setting env (see
+        // `AutomationConfig::runtime_env`) — same precedence as acp_connect's
+        // per-connection overlay: a per-launch key belongs to the launch.
+        runtime_env.extend(cfg.runtime_env.clone());
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;

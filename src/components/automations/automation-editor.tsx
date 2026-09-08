@@ -299,6 +299,10 @@ export function AutomationEditor({
               // Not editable here; carry it through so saving from this editor
               // can't silently reset a continuous-thread automation.
               reuse_session: automation?.config?.reuse_session ?? false,
+              // Same carry-through, and it matters more: dropping the overlay
+              // un-pins the run from its sub-agent, which fails the launch
+              // outright on a multi-agent runtime.
+              runtime_env: automation?.config?.runtime_env ?? {},
             }
           : {
               action,
@@ -310,6 +314,7 @@ export function AutomationEditor({
               // Same carry-through on the normal path — `automation` is null when
               // creating, so this defaults to the per-run conversation.
               reuse_session: automation?.config?.reuse_session ?? false,
+              runtime_env: automation?.config?.runtime_env ?? {},
             },
       }
       await onSubmit(draft)

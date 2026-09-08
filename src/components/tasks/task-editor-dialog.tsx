@@ -222,6 +222,9 @@ function TaskEditorBody({
         agent_type: null,
         mode_id: null,
         config_values: {},
+        // Not editable here; carry it through, or saving from this dialog
+        // un-pins the task from its sub-agent and the next launch fails.
+        runtime_env: task?.config?.runtime_env ?? {},
       }
     }
     const snapshot = await agentOptions.ensure()
@@ -240,6 +243,7 @@ function TaskEditorBody({
         agent_label: getAgentLabel(agentType) ?? agentType,
         ...snapshotLabels(snapshot, mode_id, config_values),
       },
+      runtime_env: task?.config?.runtime_env ?? {},
     }
   }
 
@@ -311,10 +315,15 @@ function TaskEditorBody({
     }
     setTemplateBusy(true)
     try {
+      const templateConfig = await buildConfig()
+      // A template is reusable across tasks, so the per-task env overlay must
+      // not ride along — a baked-in sub-agent session key would hand every task
+      // made from this template the same session.
+      delete templateConfig.runtime_env
       await workTaskTemplateSave({
         name: title.trim(),
         title: title.trim(),
-        config: await buildConfig(),
+        config: templateConfig,
       })
       setTemplates(await workTaskTemplateList())
     } catch (e) {

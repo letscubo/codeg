@@ -174,6 +174,13 @@ pub struct WorkTaskConfig {
     /// config written by a newer build must still launch here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliverable: Option<String>,
+    /// Per-LAUNCH env overlay, merged over the agent-setting env at spawn —
+    /// the work-task twin of `AutomationConfig::runtime_env`. Per-task only
+    /// (never inherited from folder settings): a key like
+    /// `OPENCLAW_SESSION_KEY` names which sub-agent *this* task drives, and a
+    /// folder-wide value would hand every task in the folder the same session.
+    #[serde(default)]
+    pub runtime_env: std::collections::BTreeMap<String, String>,
 }
 
 /// The one recognized [`WorkTaskConfig::deliverable`] value.

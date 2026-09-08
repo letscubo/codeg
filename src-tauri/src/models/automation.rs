@@ -106,4 +106,12 @@ pub struct AutomationConfig {
     /// deserializes as the legacy default and nothing queries automations by it.
     #[serde(default)]
     pub reuse_session: bool,
+    /// Per-RUN env overlay, merged over the agent-setting env at spawn — the
+    /// automation-side twin of `AcpConnectParams::runtime_env`, carried for the
+    /// same reason. A value like `OPENCLAW_SESSION_KEY` names *which* sub-agent
+    /// this automation drives; one runtime can host several, so the agent-type
+    /// env cannot express it — putting it there pins every spawn of that agent
+    /// type (channel bridges included) to one sub-agent.
+    #[serde(default)]
+    pub runtime_env: std::collections::BTreeMap<String, String>,
 }

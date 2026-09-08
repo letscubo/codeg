@@ -1217,10 +1217,14 @@ impl TaskEngine {
             }
         };
 
-        let runtime_env =
+        let mut runtime_env =
             build_session_runtime_env(&self.db, agent_type, resume_session_id.as_deref(), &self.data_dir)
                 .await
                 .map_err(|e| e.to_string())?;
+        // The task's own overlay wins over the agent-setting env (see
+        // `WorkTaskConfig::runtime_env`). Read straight off `cfg`, not through
+        // `effective_agent_config`: this is deliberately not folder-inheritable.
+        runtime_env.extend(cfg.runtime_env.clone());
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;

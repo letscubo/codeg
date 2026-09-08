@@ -1512,6 +1512,10 @@ export interface AutomationConfig {
   /** Append every run to the same conversation, resuming the agent session so it
    *  carries context across runs. Absent/false = a fresh conversation per run. */
   reuse_session?: boolean
+  /** Per-run env overlay merged over the agent-setting env at spawn. For keys
+   *  that belong to one launch — e.g. `OPENCLAW_SESSION_KEY` naming which
+   *  sub-agent this automation drives. */
+  runtime_env?: Record<string, string>
 }
 
 export interface Automation {
@@ -1596,6 +1600,9 @@ export interface WorkTaskConfig {
   mode_id?: string | null
   config_values: Record<string, string>
   label_snapshot?: AutomationLabelSnapshot | null
+  /** Per-launch env overlay merged over the agent-setting env at spawn.
+   *  Per-task only — never inherited from folder settings. */
+  runtime_env?: Record<string, string>
 }
 
 export interface WorkTask {

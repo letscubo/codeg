@@ -966,6 +966,7 @@ pub async fn work_task_create_from_forge_core(
         deliverable: scenario
             .is_report()
             .then(|| crate::models::DELIVERABLE_REPORT.to_string()),
+        runtime_env: Default::default(),
     };
     let task_draft = WorkTaskDraft {
         folder_id: draft.folder_id,
