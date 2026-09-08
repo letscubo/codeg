@@ -3446,6 +3446,23 @@ impl ConnectionManager {
         None
     }
 
+    /// The conversation a connection is bound to, if it has been linked yet.
+    ///
+    /// The forward direction of `find_connection_by_conversation_id`, and a map
+    /// lookup rather than a scan since `connection_id` is the key. `None` while
+    /// a fresh connection is still pre-`ConversationLinked`, and for a
+    /// connection that has already been torn down.
+    ///
+    /// Used by the chat-event webhook fan-out to name the conversation for
+    /// connections the channel `SessionBridge` never sees — automation and
+    /// work-task runs, which have no IM channel behind them.
+    pub async fn conversation_id_for_connection(&self, connection_id: &str) -> Option<i32> {
+        let connections = self.connections.lock().await;
+        let conn = connections.get(connection_id)?;
+        let state = conn.state.read().await;
+        state.conversation_id
+    }
+
     /// The in-flight user prompt for `conversation_id` and the instant its turn
     /// started, if a turn is currently running on its live connection. `Some`
     /// exactly between `UserMessage` and `TurnComplete` (see

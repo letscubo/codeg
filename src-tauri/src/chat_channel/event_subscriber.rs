@@ -13,6 +13,7 @@ use super::message_formatter;
 use super::session_bridge::SessionBridge;
 use super::types::RichMessage;
 use crate::acp::internal_bus::InternalEventBus;
+use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope};
 use crate::db::service::{
     app_metadata_service, chat_channel_message_log_service, chat_channel_service,
@@ -202,6 +203,7 @@ pub fn spawn_event_subscriber(
     manager: ChatChannelManager,
     db_conn: DatabaseConnection,
     bridge: Arc<Mutex<SessionBridge>>,
+    conn_mgr: ConnectionManager,
 ) -> JoinHandle<()> {
     // Subscribe synchronously before the spawn so the broadcast buffer
     // catches any events emitted in the gap between `start_background`
@@ -251,6 +253,7 @@ pub fn spawn_event_subscriber(
                 &config,
                 &mut last_push,
                 &webhook_client,
+                &conn_mgr,
             )
             .await;
         }
@@ -272,6 +275,9 @@ async fn process_envelope(
     config: &EventConfigCache,
     last_push: &mut HashMap<(i32, String), Instant>,
     webhook_client: &reqwest::Client,
+    // Only consulted for the webhook context, and only when the bridge has no
+    // session for this connection — see the fallback in the webhook fan-out.
+    conn_mgr: &ConnectionManager,
 ) {
     let Some((event_type, msg)) = parse_acp_event(&envelope.payload, config.lang) else {
         return;
@@ -333,16 +339,43 @@ async fn process_envelope(
                     None
                 };
                 super::webhook::WebhookEventContext {
-                    channel_id: session.channel_id,
+                    channel_id: Some(session.channel_id),
                     channel_type,
                     conversation_id: session.conversation_id,
-                    sender_id: session.sender_id.clone(),
+                    sender_id: Some(session.sender_id.clone()),
                     chat_id: session.target.chat_id.clone(),
                     thread_key: session.target.thread_key.clone(),
                     thread_kind: session.target.thread_kind.clone(),
                     scope,
                 }
             })
+        };
+        /*
+         * The bridge only holds IM-channel sessions, so an automation or
+         * work-task run resolved to None above and its payload went out with no
+         * conversation at all — leaving a consumer unable to tell WHICH
+         * conversation the event belonged to, which is precisely what a
+         * scheduled-run consumer needs. Fall back to the connection's own
+         * binding: same conversation_id, channel fields simply absent.
+         *
+         * Deliberately after the block above, not inside it: the bridge guard is
+         * dropped first, so this never holds two locks at once.
+         */
+        let context = match context {
+            Some(c) => Some(c),
+            None => conn_mgr
+                .conversation_id_for_connection(&envelope.connection_id)
+                .await
+                .map(|conversation_id| super::webhook::WebhookEventContext {
+                    channel_id: None,
+                    channel_type: None,
+                    conversation_id,
+                    sender_id: None,
+                    chat_id: None,
+                    thread_key: None,
+                    thread_kind: None,
+                    scope: None,
+                }),
         };
         let payload = super::webhook::build_webhook_payload_with_context(
             &event_type,
@@ -706,6 +739,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -737,6 +771,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -765,6 +800,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -790,6 +826,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
         process_envelope(
@@ -800,6 +837,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -843,6 +881,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
         process_envelope(
@@ -853,6 +892,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -891,6 +931,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
         process_envelope(
@@ -901,6 +942,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -937,6 +979,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -965,6 +1008,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -997,6 +1041,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
         process_envelope(
@@ -1007,6 +1052,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1036,6 +1082,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1062,6 +1109,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1097,6 +1145,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1134,6 +1183,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1178,6 +1228,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1218,6 +1269,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1261,6 +1313,7 @@ mod permission_push_tests {
                 &config,
                 &mut last_push,
                 &test_client(),
+                &ConnectionManager::new(),
             )
             .await;
         }
@@ -1394,6 +1447,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1472,6 +1526,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1507,6 +1562,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1616,6 +1672,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1648,6 +1705,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1676,6 +1734,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
         process_envelope(
@@ -1686,6 +1745,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1715,6 +1775,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 
@@ -1747,6 +1808,7 @@ mod permission_push_tests {
             &config,
             &mut last_push,
             &test_client(),
+            &ConnectionManager::new(),
         )
         .await;
 

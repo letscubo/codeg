@@ -16,12 +16,20 @@ use serde::{Deserialize, Serialize};
 
 use super::types::RichMessage;
 
+/// Who/where an event came from, as far as the webhook consumer is concerned.
+///
+/// `conversation_id` is the only REQUIRED field: it is what lets a consumer say
+/// which conversation an event belongs to, and every connection has one once
+/// linked. The channel fields are `Option` because a connection need not sit
+/// behind an IM channel at all — an automation or work-task run has a
+/// conversation but no channel, sender or chat. Before those were optional such
+/// a run got no context at all, and so no `conversation_id` on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookEventContext {
-    pub channel_id: i32,
+    pub channel_id: Option<i32>,
     pub channel_type: Option<String>,
     pub conversation_id: i32,
-    pub sender_id: String,
+    pub sender_id: Option<String>,
     pub chat_id: Option<String>,
     pub thread_key: Option<String>,
     pub thread_kind: Option<String>,
@@ -220,10 +228,10 @@ mod tests {
     #[test]
     fn payload_includes_chat_session_correlation() {
         let context = WebhookEventContext {
-            channel_id: 7,
+            channel_id: Some(7),
             channel_type: Some("telegram".to_string()),
             conversation_id: 42,
-            sender_id: "1001".to_string(),
+            sender_id: Some("1001".to_string()),
             chat_id: Some("1001".to_string()),
             thread_key: Some("1001".to_string()),
             thread_kind: Some("telegram_direct".to_string()),
@@ -244,6 +252,39 @@ mod tests {
         assert_eq!(payload["scope"], "direct");
         assert!(payload["event_id"].as_str().is_some());
         assert!(payload["occurred_at"].as_str().is_some());
+    }
+
+    /// A run with no IM channel behind it — an automation or work task — still
+    /// has to say WHICH conversation the event belongs to. Before the channel
+    /// fields were optional such a run produced no context at all, so its
+    /// payload carried no `conversation_id` and a consumer could not correlate
+    /// the event with anything; a scheduled-run consumer was left unable to act.
+    #[test]
+    fn payload_carries_conversation_without_a_channel() {
+        let context = WebhookEventContext {
+            channel_id: None,
+            channel_type: None,
+            conversation_id: 56,
+            sender_id: None,
+            chat_id: None,
+            thread_key: None,
+            thread_kind: None,
+            scope: None,
+        };
+
+        let payload = build_webhook_payload_with_context(
+            "turn_complete",
+            "conn-automation",
+            &sample_msg(),
+            Some(&context),
+        );
+
+        assert_eq!(payload["conversation_id"], 56);
+        // Present-but-null, not absent: the consumer's channel branch must read
+        // "no channel", and `null` is what distinguishes that from "unknown".
+        assert!(payload["channel_id"].is_null());
+        assert!(payload["channel_type"].is_null());
+        assert!(payload["sender_id"].is_null());
     }
 
     #[test]
