@@ -16,7 +16,8 @@ use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope};
 use crate::db::service::{
-    app_metadata_service, chat_channel_message_log_service, chat_channel_service,
+    app_metadata_service, automation_service, chat_channel_message_log_service,
+    chat_channel_service,
 };
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 
@@ -347,6 +348,9 @@ async fn process_envelope(
                     thread_key: session.target.thread_key.clone(),
                     thread_kind: session.target.thread_kind.clone(),
                     scope,
+                    // Filled in below — the lookup needs the DB and this closure
+                    // runs under the bridge lock.
+                    timezone: None,
                 }
             })
         };
@@ -375,8 +379,33 @@ async fn process_envelope(
                     thread_key: None,
                     thread_kind: None,
                     scope: None,
+                    timezone: None,
                 }),
         };
+        /*
+         * The automation's own cron timezone, stamped on so a consumer can render
+         * this run's time as the user thinks of it. Both branches above leave it
+         * None: the channel branch builds its context under the bridge lock (no
+         * awaiting a query there), and the fallback branch knows only the
+         * connection. Resolved once here, after the lock is dropped, off the one
+         * field both branches do have — the conversation id.
+         *
+         * A miss is the normal case, not a failure: a conversation that no
+         * automation produced (every IM-channel and desktop session) has no
+         * schedule and therefore no timezone to speak of. A query error is
+         * likewise not worth failing an event over — the payload simply goes out
+         * without the field, exactly as it did before this existed.
+         */
+        let mut context = context;
+        if let Some(ctx) = context.as_mut() {
+            match automation_service::timezone_for_conversation(db_conn, ctx.conversation_id).await {
+                Ok(tz) => ctx.timezone = tz,
+                Err(e) => tracing::warn!(
+                    "[ChatChannel] webhook: could not resolve timezone for conversation {}: {e}",
+                    ctx.conversation_id
+                ),
+            }
+        }
         let payload = super::webhook::build_webhook_payload_with_context(
             &event_type,
             &envelope.connection_id,

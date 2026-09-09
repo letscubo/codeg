@@ -402,6 +402,40 @@ pub async fn has_active_run(
     Ok(count > 0)
 }
 
+/// The owning automation's IANA timezone for a conversation an automation run
+/// produced, or `None` when the conversation isn't an automation's.
+///
+/// Exists for the chat-event webhook: a consumer rendering "when did this run"
+/// otherwise has to pick a timezone with nothing to go on, and every candidate is
+/// wrong — the platform side stores no user timezone at all, so it would either
+/// hardcode one (wrong for every other tenant) or fall back to UTC (silently
+/// 8 hours off for a user in Asia/Shanghai). The automation's own cron timezone
+/// is the one timezone that is definitionally right: it is the clock the user
+/// wrote the schedule against.
+///
+/// Newest run wins. A resumed run reuses the previous run's conversation, so one
+/// conversation maps to many runs; they share an automation, hence a timezone, so
+/// the ordering only matters for the pathological case of a conversation adopted
+/// across automations. Indexed by `idx_automation_run_conversation` — this is on
+/// the per-event webhook path.
+pub async fn timezone_for_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Option<String>, DbError> {
+    let Some(run) = automation_run::Entity::find()
+        .filter(automation_run::Column::ConversationId.eq(conversation_id))
+        .order_by_desc(automation_run::Column::Id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(automation::Entity::find_by_id(run.automation_id)
+        .one(conn)
+        .await?
+        .map(|a| a.timezone))
+}
+
 /// Insert a fresh `running` run row at launch.
 pub async fn start_run(
     conn: &DatabaseConnection,
@@ -737,6 +771,88 @@ mod tests {
 
         // Legacy configs (no action field) stay valid without a folder.
         assert!(create(&db.conn, draft("classic", None)).await.is_ok());
+    }
+
+    /// The chat-event webhook stamps this onto every payload so a consumer can
+    /// render a run's time as the user thinks of it. The interesting half is the
+    /// miss: a conversation no automation produced must come back `None` rather
+    /// than some default, because "no timezone" and "UTC" mean different things
+    /// to the consumer — the latter would have it print a wall clock it has no
+    /// business claiming.
+    #[tokio::test]
+    async fn timezone_for_conversation_resolves_through_the_run() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/automation-tz").await;
+        let conv_id = crate::db::test_helpers::seed_conversation(
+            &db,
+            folder_id,
+            crate::models::AgentType::ClaudeCode,
+        )
+        .await;
+        let orphan_conv = crate::db::test_helpers::seed_conversation(
+            &db,
+            folder_id,
+            crate::models::AgentType::ClaudeCode,
+        )
+        .await;
+
+        let mut d = draft("nightly", Some("0 0 * * *"));
+        d.timezone = "Asia/Shanghai".to_string();
+        let a = create(&db.conn, d).await.expect("create");
+        let run = start_run(&db.conn, a.id, "schedule", None).await.expect("run");
+        attach_run_runtime(&db.conn, run.id, Some(conv_id), None, None)
+            .await
+            .expect("attach");
+
+        assert_eq!(
+            timezone_for_conversation(&db.conn, conv_id).await.expect("lookup"),
+            Some("Asia/Shanghai".to_string()),
+        );
+        assert_eq!(
+            timezone_for_conversation(&db.conn, orphan_conv).await.expect("lookup"),
+            None,
+            "a conversation no automation produced has no timezone",
+        );
+    }
+
+    /// A resumed run reuses the previous run's conversation (Continuous thread
+    /// on), so one conversation legitimately maps to many runs. The lookup must
+    /// still answer, not trip over the duplicate.
+    #[tokio::test]
+    async fn timezone_survives_a_conversation_shared_by_several_runs() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/automation-tz2").await;
+        let conv_id = crate::db::test_helpers::seed_conversation(
+            &db,
+            folder_id,
+            crate::models::AgentType::ClaudeCode,
+        )
+        .await;
+
+        let mut d = draft("hourly", Some("0 * * * *"));
+        d.timezone = "Europe/Berlin".to_string();
+        let a = create(&db.conn, d).await.expect("create");
+        for _ in 0..3 {
+            let run = start_run(&db.conn, a.id, "schedule", None).await.expect("run");
+            attach_run_runtime(&db.conn, run.id, Some(conv_id), None, None)
+                .await
+                .expect("attach");
+            settle_run(
+                &db.conn,
+                run.id,
+                AutomationRunStatus::Succeeded,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("settle");
+        }
+
+        assert_eq!(
+            timezone_for_conversation(&db.conn, conv_id).await.expect("lookup"),
+            Some("Europe/Berlin".to_string()),
+        );
     }
 
     #[tokio::test]

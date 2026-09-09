@@ -34,6 +34,16 @@ pub struct WebhookEventContext {
     pub thread_key: Option<String>,
     pub thread_kind: Option<String>,
     pub scope: Option<String>,
+    /// IANA timezone of the automation that produced this conversation (e.g.
+    /// "Asia/Shanghai"); `None` when the conversation isn't an automation's.
+    ///
+    /// Every other timestamp on the wire is UTC and stays UTC — this is not a
+    /// second opinion about `occurred_at`, it is the clock the user wrote the
+    /// schedule against, shipped so a consumer can render a run's time as the
+    /// user thinks of it. Without it a consumer has to guess: the platform side
+    /// stores no user timezone anywhere, leaving it to hardcode one (wrong for
+    /// every other tenant) or print UTC (silently 8 hours off in Asia/Shanghai).
+    pub timezone: Option<String>,
 }
 
 /// One configured webhook sink. Persisted (as a JSON array) under the
@@ -105,6 +115,7 @@ pub fn build_webhook_payload_with_context(
         payload["thread_key"] = serde_json::json!(context.thread_key);
         payload["thread_kind"] = serde_json::json!(context.thread_kind);
         payload["scope"] = serde_json::json!(context.scope);
+        payload["timezone"] = serde_json::json!(context.timezone);
     }
 
     payload
@@ -236,6 +247,7 @@ mod tests {
             thread_key: Some("1001".to_string()),
             thread_kind: Some("telegram_direct".to_string()),
             scope: Some("direct".to_string()),
+            timezone: None,
         };
 
         let payload = build_webhook_payload_with_context(
@@ -270,6 +282,7 @@ mod tests {
             thread_key: None,
             thread_kind: None,
             scope: None,
+            timezone: Some("Asia/Shanghai".to_string()),
         };
 
         let payload = build_webhook_payload_with_context(
@@ -285,6 +298,65 @@ mod tests {
         assert!(payload["channel_id"].is_null());
         assert!(payload["channel_type"].is_null());
         assert!(payload["sender_id"].is_null());
+    }
+
+    /// The automation's own cron timezone rides along so a consumer can render
+    /// the run's time as the user thinks of it. Without it the consumer has
+    /// nothing to go on — the platform side stores no user timezone anywhere —
+    /// and must either hardcode one (wrong for every other tenant) or print UTC,
+    /// which reads 8 hours off for a schedule written in Asia/Shanghai.
+    #[test]
+    fn payload_carries_the_automations_timezone() {
+        let context = WebhookEventContext {
+            channel_id: None,
+            channel_type: None,
+            conversation_id: 57,
+            sender_id: None,
+            chat_id: None,
+            thread_key: None,
+            thread_kind: None,
+            scope: None,
+            timezone: Some("Asia/Shanghai".to_string()),
+        };
+
+        let payload = build_webhook_payload_with_context(
+            "turn_complete",
+            "conn-automation",
+            &sample_msg(),
+            Some(&context),
+        );
+
+        assert_eq!(payload["timezone"], "Asia/Shanghai");
+        // `occurred_at` stays UTC — the timezone is a rendering hint about the
+        // schedule, never a second opinion about when the event happened.
+        assert!(payload["occurred_at"].as_str().unwrap().ends_with("+00:00"));
+    }
+
+    /// A conversation no automation produced (every IM-channel and desktop
+    /// session) has no schedule, so it has no timezone. Present-but-null, like
+    /// the channel fields: the consumer reads "no timezone", not "unknown".
+    #[test]
+    fn timezone_is_null_for_a_conversation_no_automation_produced() {
+        let context = WebhookEventContext {
+            channel_id: Some(7),
+            channel_type: Some("telegram".to_string()),
+            conversation_id: 42,
+            sender_id: Some("1001".to_string()),
+            chat_id: Some("1001".to_string()),
+            thread_key: Some("1001".to_string()),
+            thread_kind: Some("telegram_direct".to_string()),
+            scope: Some("direct".to_string()),
+            timezone: None,
+        };
+
+        let payload = build_webhook_payload_with_context(
+            "turn_complete",
+            "conn-abc",
+            &sample_msg(),
+            Some(&context),
+        );
+
+        assert!(payload["timezone"].is_null());
     }
 
     #[test]
