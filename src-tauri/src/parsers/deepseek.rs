@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,48 @@ fn resolve_dsh_home_from(dsh_home_env: Option<OsString>, home_dir: Option<PathBu
 /// logs.
 pub(crate) fn resolve_dsh_home_dir() -> PathBuf {
     resolve_dsh_home_from(std::env::var_os("DSH_HOME"), dirs::home_dir())
+}
+
+/// The DeepSeek Harness home **as the launched agent will see it** — resolved
+/// from a connection's `runtime_env` rather than codeg's own process
+/// environment.
+///
+/// The two differ whenever a launch relocates the harness: a host that runs
+/// several DeepSeek identities under one codeg gives each its own `DSH_HOME`
+/// through `runtime_env`, and everything keyed off that home (skills,
+/// credentials, and codeg's own `mcp.json` store) must follow the *child's*
+/// value, not whatever codeg itself inherited. Reading the process env here
+/// would silently hand every identity the same store — the bug this exists to
+/// close.
+///
+/// Precedence mirrors how the child process ends up seeing the variable:
+/// `runtime_env` wins when it names the key (a blank value means "removed",
+/// which upstream treats as unset — see [`resolve_dsh_home_from`]); an absent
+/// key inherits codeg's process value; and `~` / the default `~/.dsh` expand
+/// against the child's `HOME` when the launch overrides that too.
+pub(crate) fn resolve_dsh_home_dir_for_launch(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+    resolve_dsh_home_for_launch_from(
+        runtime_env.get("DSH_HOME").map(OsString::from),
+        std::env::var_os("DSH_HOME"),
+        crate::acp::file_system_runtime::child_home_dir(runtime_env).or_else(dirs::home_dir),
+    )
+}
+
+/// Pure core of [`resolve_dsh_home_dir_for_launch`]: `launch` is the
+/// `runtime_env` entry (`Some("")` = explicitly removed), `inherited` is
+/// codeg's own process value, `home_dir` is the child's home.
+fn resolve_dsh_home_for_launch_from(
+    launch: Option<OsString>,
+    inherited: Option<OsString>,
+    home_dir: Option<PathBuf>,
+) -> PathBuf {
+    match launch {
+        // Present in the launch env: it is authoritative, blank included —
+        // blank means the key is removed for the child, so the child falls
+        // back to `~/.dsh` regardless of what codeg inherited.
+        Some(value) => resolve_dsh_home_from(Some(value), home_dir),
+        None => resolve_dsh_home_from(inherited, home_dir),
+    }
 }
 
 /// Resolve the shared cross-agent home the way `dsh-skill-filesystem` does:
@@ -1144,6 +1186,40 @@ fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn launch_dsh_home_beats_inherited_and_blank_means_removed() {
+        let home = Some(PathBuf::from("/home/child"));
+        // The launch names the key → that value, even though codeg inherited another.
+        assert_eq!(
+            resolve_dsh_home_for_launch_from(
+                Some(OsString::from("/home/child/.myclaw/agents/a1/dsh-home")),
+                Some(OsString::from("/opt/codeg-dsh")),
+                home.clone(),
+            ),
+            PathBuf::from("/home/child/.myclaw/agents/a1/dsh-home")
+        );
+        // Absent from the launch → codeg's own process value is what the child inherits.
+        assert_eq!(
+            resolve_dsh_home_for_launch_from(None, Some(OsString::from("/opt/codeg-dsh")), home.clone()),
+            PathBuf::from("/opt/codeg-dsh")
+        );
+        // Blank in the launch = removed for the child → default under the CHILD's home,
+        // not codeg's inherited value.
+        assert_eq!(
+            resolve_dsh_home_for_launch_from(
+                Some(OsString::new()),
+                Some(OsString::from("/opt/codeg-dsh")),
+                home.clone(),
+            ),
+            PathBuf::from("/home/child/.dsh")
+        );
+        // `~` in the launch value expands against the child's home.
+        assert_eq!(
+            resolve_dsh_home_for_launch_from(Some(OsString::from("~/dsh-x")), None, home),
+            PathBuf::from("/home/child/dsh-x")
+        );
+    }
 
     #[test]
     fn resolve_home_prefers_env_override() {

@@ -2459,6 +2459,16 @@ fn deepseek_mcp_json_path() -> PathBuf {
     crate::parsers::deepseek::resolve_dsh_home_dir().join("mcp.json")
 }
 
+/// The DeepSeek MCP store a *specific launch* should be fed from: the same
+/// `mcp.json` name, but under the `DSH_HOME` that launch's `runtime_env`
+/// gives the harness — not codeg's own. A host running several DeepSeek
+/// identities under one codeg relocates each one's home this way, and the
+/// wire forward in `connection.rs` must read the store beside the identity it
+/// is launching or every identity gets the same servers.
+pub(crate) fn deepseek_mcp_json_path_for_launch(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+    crate::parsers::deepseek::resolve_dsh_home_dir_for_launch(runtime_env).join("mcp.json")
+}
+
 /// Write the DeepSeek MCP store with owner-only permissions.
 ///
 /// Every other agent's store is created by the agent itself, with whatever
@@ -2538,7 +2548,7 @@ fn read_deepseek_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
     read_deepseek_servers_at(&deepseek_mcp_json_path())
 }
 
-fn read_deepseek_servers_at(path: &Path) -> Result<BTreeMap<String, Value>, AppCommandError> {
+pub(crate) fn read_deepseek_servers_at(path: &Path) -> Result<BTreeMap<String, Value>, AppCommandError> {
     let root = read_json_file(path)?;
     let mut out = BTreeMap::new();
 

@@ -2043,6 +2043,14 @@ pub async fn spawn_agent_connection(
     // per-agent `runtime_env`, which does not survive into `run_connection`.
     let host_tools = HostToolsPolicy::from_env(&runtime_env);
 
+    // DeepSeek's MCP servers travel over the wire from codeg's own
+    // `$DSH_HOME/mcp.json`; resolve that path against THIS launch's
+    // `DSH_HOME` (not codeg's process env) for the same reason as above —
+    // a launch that relocates the harness home must read the store that
+    // lives beside it, or every relocated identity is fed the same servers.
+    let deepseek_mcp_store = (agent_type == AgentType::DeepSeek)
+        .then(|| crate::commands::mcp::deepseek_mcp_json_path_for_launch(&runtime_env));
+
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
     // This makes `git fetch`/`git push` issued through the ACP
@@ -2135,6 +2143,7 @@ pub async fn spawn_agent_connection(
             delegation_injection,
             fs_policy,
             host_tools,
+            deepseek_mcp_store,
             stderr_tail,
         )
         .await;
@@ -4145,7 +4154,15 @@ fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
 /// Load MCP servers configured for `agent_type` and convert them into the
 /// ACP wire format. Errors and unsupported entries are logged and skipped so
 /// a single malformed entry never blocks a session from starting.
-fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
+/// `deepseek_mcp_store` is the per-launch `$DSH_HOME/mcp.json` resolved by
+/// `spawn_agent_connection` from the connection's `runtime_env` (see
+/// `commands::mcp::deepseek_mcp_json_path_for_launch`). `None` for every other
+/// agent; for DeepSeek it replaces the process-env store so a launch that
+/// relocates `DSH_HOME` reads the store beside the identity it runs as.
+fn load_mcp_servers_for_agent(
+    agent_type: AgentType,
+    deepseek_mcp_store: Option<&Path>,
+) -> Vec<McpServer> {
     // Hermes, Kimi Code, Grok, and Cursor each read their own native MCP
     // config at launch — Hermes from `~/.hermes/config.yaml` (`mcp_servers`,
     // registered as `mcp-<name>` toolsets), Kimi Code from
@@ -4183,7 +4200,13 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
     ) {
         return Vec::new();
     }
-    let entries = match crate::commands::mcp::read_servers_for_agent_type(agent_type) {
+    let entries = match (agent_type, deepseek_mcp_store) {
+        (AgentType::DeepSeek, Some(store)) => {
+            crate::commands::mcp::read_deepseek_servers_at(store)
+        }
+        _ => crate::commands::mcp::read_servers_for_agent_type(agent_type),
+    };
+    let entries = match entries {
         Ok(map) => map,
         Err(err) => {
             tracing::error!(
@@ -4742,6 +4765,11 @@ async fn run_connection(
     delegation_injection: Option<DelegationInjection>,
     fs_policy: FsAccessPolicy,
     host_tools: HostToolsPolicy,
+    // Per-launch DeepSeek MCP store (`$DSH_HOME/mcp.json` under the launch's
+    // own `DSH_HOME`), resolved in `spawn_agent_connection` for the same
+    // reason as `fs_policy`: it needs the full `runtime_env`. `None` unless
+    // the agent is DeepSeek.
+    deepseek_mcp_store: Option<PathBuf>,
     // Connection-scoped agent stderr buffer, shared with the `with_debug`
     // callback installed by `build_agent`. Read only when a turn ends without
     // agent output, to attach evidence to the synthesized error.
@@ -5235,7 +5263,7 @@ async fn run_connection(
             // ACP spec; HTTP/SSE are gated on `mcp_capabilities.{http,sse}`.
             let mut mcp_servers: Vec<McpServer> = if agent_supports_mcp {
                 let mcp_caps = &init_resp.agent_capabilities.mcp_capabilities;
-                load_mcp_servers_for_agent(agent_type)
+                load_mcp_servers_for_agent(agent_type, deepseek_mcp_store.as_deref())
                     .into_iter()
                     .filter(|s| match s {
                         McpServer::Stdio(_) => true,
@@ -18014,6 +18042,29 @@ mod tests {
             "sessionId must serialize in camelCase"
         );
         assert!(json.get("cwd").is_some());
+    }
+
+    #[test]
+    fn deepseek_wire_forward_reads_the_launch_store_not_the_process_one() {
+        // The store handed in is the per-launch `$DSH_HOME/mcp.json`; the
+        // forward must read exactly that file. A missing file is an empty
+        // list, not a fallback to codeg's own process-env store — falling
+        // back would re-open the "every relocated identity gets the same
+        // servers" hole this parameter exists to close.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("mcp.json");
+        std::fs::write(
+            &store,
+            r#"{"mcpServers":{"probe":{"type":"stdio","command":"node","args":["s.mjs"],"env":{"K":"v"}}}}"#,
+        )
+        .expect("write store");
+
+        let got = load_mcp_servers_for_agent(AgentType::DeepSeek, Some(&store));
+        assert_eq!(got.len(), 1);
+        assert!(matches!(&got[0], McpServer::Stdio(s) if s.name == "probe"));
+
+        let missing = dir.path().join("nope").join("mcp.json");
+        assert!(load_mcp_servers_for_agent(AgentType::DeepSeek, Some(&missing)).is_empty());
     }
 
     #[test]
