@@ -1207,6 +1207,34 @@ fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
     if agent_type == AgentType::OpenClaw {
         return Some(registry::registry_id_for(agent_type));
     }
+    // DeepSeek records here too, for a different reason than OpenClaw: its
+    // transcript IS id-addressable, but the adapter does not always write it.
+    //
+    // `deepseek-acp`'s teardown settles every live session as `cancelled`
+    // without checking whether its turn already finished, and the record that
+    // commits a turn's reply — `assistant/message` — is only written on the
+    // normal-completion path. So a turn that ends and is immediately followed
+    // by a disconnect leaves the reply out of `~/.dsh/sessions`, which is
+    // exactly what `parsers::deepseek` reads.
+    //
+    // Measured 2026-09-10 on A1, same machine/model/prompt, the only variable
+    // being whether the pipe is closed after `end_turn`:
+    //   · left open      → assistant/message written, turn/end `completed`
+    //   · stdin closed   → neither written (no signal needed; closing suffices)
+    // Automation is the only path that closes right after every turn ("one
+    // prompt, one turn, then disconnect"), so it lost every reply while chat —
+    // which holds the connection open — never did. Four other runtimes (pi,
+    // claude_code, hermes, openclaw) survive the same treatment.
+    //
+    // codeg already receives the full reply over the wire (`agent_message_chunk`
+    // arrives before the turn ends; verified in a stdio capture), so recording
+    // it makes history depend on what we saw rather than on whether a
+    // third-party adapter chose to flush. The read path prefers this transcript
+    // and falls back to the native parser, so pre-existing conversations keep
+    // resolving.
+    if agent_type == AgentType::DeepSeek {
+        return Some(registry::registry_id_for(agent_type));
+    }
     agent_type
         .custom_id()
         .map(|_| registry::registry_id_for(agent_type))
@@ -13497,6 +13525,38 @@ async fn emit_conversation_update(
 mod tests {
     use super::*;
     use sacp::schema::{Diff, SessionConfigId};
+
+    /// codeg must record DeepSeek's wire itself rather than trust the adapter's
+    /// own store.
+    ///
+    /// `deepseek-acp`'s teardown settles every live session as `cancelled`
+    /// without checking whether its turn had already finished, and the record
+    /// that commits a reply (`assistant/message`) is only written on the
+    /// normal-completion path. Closing the pipe right after `end_turn` — which
+    /// automation does after every single turn — therefore leaves the reply out
+    /// of `~/.dsh/sessions`, the very file `parsers::deepseek` reads. Measured
+    /// on A1 with the pipe as the only variable: left open the reply is written,
+    /// closed it is not, no signal required.
+    ///
+    /// Dropping DeepSeek from this list would silently restore that: scheduled
+    /// runs would go back to showing the prompt with no answer, with nothing
+    /// failing anywhere — the turn still reports `end_turn` over ACP.
+    #[test]
+    fn deepseek_wire_is_recorded_by_codeg() {
+        assert!(
+            transcript_dir_for(AgentType::DeepSeek).is_some(),
+            "DeepSeek must be recorded: its adapter drops the reply when the connection closes after a turn",
+        );
+        // OpenClaw is recorded for its own reason (its gateway writes under a
+        // different session id, so its parser can never resolve one of ours).
+        assert!(transcript_dir_for(AgentType::OpenClaw).is_some());
+        // Agents whose own store is trustworthy stay unrecorded — recording
+        // them would double the storage and risk two disagreeing histories.
+        assert!(
+            transcript_dir_for(AgentType::ClaudeCode).is_none(),
+            "built-ins with a reliable native store must not be double-recorded",
+        );
+    }
 
     /// Unwrap a select selector. The Grok synthesizers below only ever build
     /// selects, so any other kind is a test failure rather than a branch to

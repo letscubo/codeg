@@ -1223,7 +1223,20 @@ pub async fn get_folder_conversation_core(
             // (live + session/load replay hydration), that transcript is the
             // id-exact source; fall through to the native parser only when no
             // transcript exists (conversations that predate recording).
-            if at == AgentType::OpenClaw {
+            // DeepSeek joins OpenClaw here, for a different reason: its native
+            // store IS id-addressable, but `deepseek-acp` skips the record that
+            // commits a turn's reply whenever the connection closes right after
+            // that turn — its teardown settles every live session as
+            // `cancelled` without asking whether the turn had already finished.
+            // Automation closes after every turn, so every scheduled run came
+            // back with the prompt and no answer (measured on A1: same machine,
+            // model and prompt, losing the reply iff the pipe was closed).
+            //
+            // codeg saw the whole reply on the wire, so preferring its own
+            // transcript makes history depend on that rather than on the
+            // adapter's flush. Falling through on a miss keeps every
+            // conversation that predates recording resolvable.
+            if at == AgentType::OpenClaw || at == AgentType::DeepSeek {
                 let native = crate::parsers::acp_native::AcpNativeParser::new(at);
                 if let Ok(d) = native.get_conversation(&eid) {
                     return Ok((
