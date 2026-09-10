@@ -158,7 +158,11 @@ pub fn spawn_webhook_delivery(
 /// query and any userinfo — webhook URLs frequently embed credentials there
 /// (e.g. Slack/Discord tokens) which must not reach logs. Unparseable input
 /// collapses to a non-revealing placeholder.
-fn redact_url(url: &str) -> String {
+///
+/// `pub(crate)` for `myclaw_route`, which logs failures against a URL derived
+/// from this same webhook config and therefore carrying the same secret. One
+/// implementation rather than two: a second copy is a second thing to forget.
+pub(crate) fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(u) => match (u.host_str(), u.port()) {
             (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),

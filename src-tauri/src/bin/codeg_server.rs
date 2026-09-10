@@ -559,6 +559,24 @@ async fn async_main() -> ExitCode {
         tracing::info!("  {}", addr);
     }
 
+    // 公网入口自举:向平台重报本容器的 IP:port,让它改写 preview KV 路由。
+    //
+    // KV 里存的是**容器 IP**,而容器每次重启都会换 IP —— 全站却只在开通时注册过
+    // 一次,于是任何一次重启都会让实例整个 502,且无自愈、无告警(2026-09-09 实测:
+    // A1 与同批 D6/D10/D11 全中,库里仍显示 RUNNING)。
+    //
+    // **位置是有讲究的**:必须在 listener 绑定之后。早先它挂在 db 初始化旁边,那是
+    // 在宣告「我在这个地址」的时候还没开始监听 —— KV 写完 + CF 边缘生效只要几秒,
+    // 而那之后还要初始化 AppState、装路由,窗口内进来的请求会吃到连接被拒。先能
+    // 服务,再对外报到。
+    //
+    // 平台地址取自本机已配置的出站 webhook(与 myclaw_skills 同源),所以同样要在
+    // db 之后。调用方向是出站的,不依赖那条已经坏掉的入站路由 —— 这正是它能自救
+    // 的原因。
+    codeg_lib::commands::myclaw_route::spawn_startup_registration(codeg_lib::db::AppDatabase {
+        conn: state.db.conn.clone(),
+    });
+
     // Start serving
     if let Err(e) = axum::serve(listener, router).await {
         tracing::error!("[SERVER] Server error: {}", e);
