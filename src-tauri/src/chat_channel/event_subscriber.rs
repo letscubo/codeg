@@ -350,6 +350,7 @@ async fn process_envelope(
                     scope,
                     // Filled in below — the lookup needs the DB and this closure
                     // runs under the bridge lock.
+                    reuse_session: None,
                     timezone: None,
                 }
             })
@@ -379,13 +380,16 @@ async fn process_envelope(
                     thread_key: None,
                     thread_kind: None,
                     scope: None,
+                    reuse_session: None,
                     timezone: None,
                 }),
         };
         /*
-         * The automation's own cron timezone, stamped on so a consumer can render
-         * this run's time as the user thinks of it. Both branches above leave it
-         * None: the channel branch builds its context under the bridge lock (no
+         * What the platform needs to know about the automation behind this
+         * conversation: its cron timezone (so a consumer renders the run's time on
+         * the clock the user wrote the schedule against) and whether runs share one
+         * conversation (so it knows whether same-named siblings exist to tell
+         * apart). Both branches above leave these None: the channel branch builds its context under the bridge lock (no
          * awaiting a query there), and the fallback branch knows only the
          * connection. Resolved once here, after the lock is dropped, off the one
          * field both branches do have — the conversation id.
@@ -398,10 +402,18 @@ async fn process_envelope(
          */
         let mut context = context;
         if let Some(ctx) = context.as_mut() {
-            match automation_service::timezone_for_conversation(db_conn, ctx.conversation_id).await {
-                Ok(tz) => ctx.timezone = tz,
+            match automation_service::automation_for_conversation(db_conn, ctx.conversation_id).await
+            {
+                Ok(Some(auto)) => {
+                    ctx.timezone = Some(auto.timezone);
+                    ctx.reuse_session = Some(auto.reuse_session);
+                }
+                // No automation produced this conversation — every IM-channel and
+                // desktop session. Both fields stay absent, which the consumer
+                // reads as "not a scheduled run".
+                Ok(None) => {}
                 Err(e) => tracing::warn!(
-                    "[ChatChannel] webhook: could not resolve timezone for conversation {}: {e}",
+                    "[ChatChannel] webhook: could not resolve automation for conversation {}: {e}",
                     ctx.conversation_id
                 ),
             }

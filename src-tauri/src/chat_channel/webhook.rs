@@ -34,6 +34,16 @@ pub struct WebhookEventContext {
     pub thread_key: Option<String>,
     pub thread_kind: Option<String>,
     pub scope: Option<String>,
+    /// Whether the automation behind this conversation appends every run to the
+    /// SAME conversation; `None` when no automation produced it.
+    ///
+    /// The consumer names a run's session after the task and disambiguates
+    /// same-named siblings with a timestamp. Siblings exist only when this is
+    /// `Some(false)`: with reuse on there is exactly one conversation, so a
+    /// timestamp adds nothing and goes stale — frozen at the thread's first run
+    /// while the thread keeps going. `None` likewise means no timestamp: a
+    /// channel or desktop conversation has no siblings to tell apart either.
+    pub reuse_session: Option<bool>,
     /// IANA timezone of the automation that produced this conversation (e.g.
     /// "Asia/Shanghai"); `None` when the conversation isn't an automation's.
     ///
@@ -116,6 +126,7 @@ pub fn build_webhook_payload_with_context(
         payload["thread_kind"] = serde_json::json!(context.thread_kind);
         payload["scope"] = serde_json::json!(context.scope);
         payload["timezone"] = serde_json::json!(context.timezone);
+        payload["reuse_session"] = serde_json::json!(context.reuse_session);
     }
 
     payload
@@ -251,6 +262,7 @@ mod tests {
             thread_key: Some("1001".to_string()),
             thread_kind: Some("telegram_direct".to_string()),
             scope: Some("direct".to_string()),
+            reuse_session: None,
             timezone: None,
         };
 
@@ -286,6 +298,7 @@ mod tests {
             thread_key: None,
             thread_kind: None,
             scope: None,
+            reuse_session: Some(false),
             timezone: Some("Asia/Shanghai".to_string()),
         };
 
@@ -320,6 +333,7 @@ mod tests {
             thread_key: None,
             thread_kind: None,
             scope: None,
+            reuse_session: Some(false),
             timezone: Some("Asia/Shanghai".to_string()),
         };
 
@@ -350,6 +364,7 @@ mod tests {
             thread_key: Some("1001".to_string()),
             thread_kind: Some("telegram_direct".to_string()),
             scope: Some("direct".to_string()),
+            reuse_session: None,
             timezone: None,
         };
 

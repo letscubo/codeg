@@ -402,26 +402,45 @@ pub async fn has_active_run(
     Ok(count > 0)
 }
 
-/// The owning automation's IANA timezone for a conversation an automation run
-/// produced, or `None` when the conversation isn't an automation's.
+/// What the platform needs to know about the automation behind a conversation.
 ///
-/// Exists for the chat-event webhook: a consumer rendering "when did this run"
-/// otherwise has to pick a timezone with nothing to go on, and every candidate is
-/// wrong — the platform side stores no user timezone at all, so it would either
-/// hardcode one (wrong for every other tenant) or fall back to UTC (silently
-/// 8 hours off for a user in Asia/Shanghai). The automation's own cron timezone
-/// is the one timezone that is definitionally right: it is the clock the user
-/// wrote the schedule against.
+/// `None` from the lookup = no automation produced this conversation (every IM
+/// channel and desktop session), which is the common case, not a failure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationAutomation {
+    /// IANA timezone of the automation's cron.
+    ///
+    /// Exists for the chat-event webhook: a consumer rendering "when did this
+    /// run" otherwise has to pick a timezone with nothing to go on, and every
+    /// candidate is wrong — the platform side stores no user timezone at all, so
+    /// it would either hardcode one (wrong for every other tenant) or fall back
+    /// to UTC (silently 8 hours off for a user in Asia/Shanghai). The
+    /// automation's own cron timezone is definitionally right: it is the clock
+    /// the user wrote the schedule against.
+    pub timezone: String,
+    /// Whether every run appends to the SAME conversation.
+    ///
+    /// The consumer names a run's session after the task, and disambiguates
+    /// same-named siblings with a timestamp. Siblings only exist when this is
+    /// false — with it on there is exactly one conversation, so a timestamp adds
+    /// nothing and goes stale besides: it would freeze at the thread's first run
+    /// while the thread keeps going, leaving a name that reads weeks old next to
+    /// a "3 minutes ago" in the same row.
+    pub reuse_session: bool,
+}
+
+/// The automation behind a conversation one of its runs produced, or `None` when
+/// the conversation isn't an automation's.
 ///
 /// Newest run wins. A resumed run reuses the previous run's conversation, so one
-/// conversation maps to many runs; they share an automation, hence a timezone, so
-/// the ordering only matters for the pathological case of a conversation adopted
-/// across automations. Indexed by `idx_automation_run_conversation` — this is on
-/// the per-event webhook path.
-pub async fn timezone_for_conversation(
+/// conversation maps to many runs; they share an automation, hence the same
+/// answer, so the ordering only matters for the pathological case of a
+/// conversation adopted across automations. Indexed by
+/// `idx_automation_run_conversation` — this is on the per-event webhook path.
+pub async fn automation_for_conversation(
     conn: &DatabaseConnection,
     conversation_id: i32,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<ConversationAutomation>, DbError> {
     let Some(run) = automation_run::Entity::find()
         .filter(automation_run::Column::ConversationId.eq(conversation_id))
         .order_by_desc(automation_run::Column::Id)
@@ -430,10 +449,20 @@ pub async fn timezone_for_conversation(
     else {
         return Ok(None);
     };
-    Ok(automation::Entity::find_by_id(run.automation_id)
-        .one(conn)
-        .await?
-        .map(|a| a.timezone))
+    let Some(auto) = automation::Entity::find_by_id(run.automation_id).one(conn).await? else {
+        return Ok(None);
+    };
+    // `reuse_session` lives in the config blob, not a column (see
+    // `AutomationConfig`). An unparseable blob falls back to the field's own
+    // default (false) rather than failing the lookup: the timezone is still
+    // worth reporting, and false is the historical behaviour.
+    let reuse_session = serde_json::from_str::<AutomationConfig>(&auto.config)
+        .map(|c| c.reuse_session)
+        .unwrap_or(false);
+    Ok(Some(ConversationAutomation {
+        timezone: auto.timezone,
+        reuse_session,
+    }))
 }
 
 /// Insert a fresh `running` run row at launch.
@@ -780,7 +809,7 @@ mod tests {
     /// to the consumer — the latter would have it print a wall clock it has no
     /// business claiming.
     #[tokio::test]
-    async fn timezone_for_conversation_resolves_through_the_run() {
+    async fn automation_for_conversation_resolves_through_the_run() {
         let db = fresh_in_memory_db().await;
         let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/automation-tz").await;
         let conv_id = crate::db::test_helpers::seed_conversation(
@@ -804,22 +833,62 @@ mod tests {
             .await
             .expect("attach");
 
+        let found = automation_for_conversation(&db.conn, conv_id)
+            .await
+            .expect("lookup")
+            .expect("produced by an automation");
+        assert_eq!(found.timezone, "Asia/Shanghai");
+        // Default when the config blob doesn't say otherwise — a fresh
+        // conversation per run, the historical behaviour.
+        assert!(!found.reuse_session);
         assert_eq!(
-            timezone_for_conversation(&db.conn, conv_id).await.expect("lookup"),
-            Some("Asia/Shanghai".to_string()),
-        );
-        assert_eq!(
-            timezone_for_conversation(&db.conn, orphan_conv).await.expect("lookup"),
+            automation_for_conversation(&db.conn, orphan_conv).await.expect("lookup"),
             None,
-            "a conversation no automation produced has no timezone",
+            "a conversation no automation produced has no automation context",
         );
+    }
+
+    /// `reuse_session` decides whether the consumer stamps a timestamp onto the
+    /// session name: with reuse on there is exactly one conversation, so there are
+    /// no same-named siblings to tell apart and a timestamp would only go stale.
+    /// It lives in the config blob, so it has to survive the round trip through
+    /// JSON — a silent `false` here would put a stale date on every continuous
+    /// thread.
+    #[tokio::test]
+    async fn reuse_session_is_read_out_of_the_config_blob() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/automation-reuse").await;
+        let conv_id = crate::db::test_helpers::seed_conversation(
+            &db,
+            folder_id,
+            crate::models::AgentType::ClaudeCode,
+        )
+        .await;
+
+        let mut d = draft("continuous", Some("0 * * * *"));
+        d.config = serde_json::json!({
+            "display_text": "do the thing",
+            "prompt_blocks": [],
+            "reuse_session": true,
+        });
+        let a = create(&db.conn, d).await.expect("create");
+        let run = start_run(&db.conn, a.id, "schedule", None).await.expect("run");
+        attach_run_runtime(&db.conn, run.id, Some(conv_id), None, None)
+            .await
+            .expect("attach");
+
+        let found = automation_for_conversation(&db.conn, conv_id)
+            .await
+            .expect("lookup")
+            .expect("produced by an automation");
+        assert!(found.reuse_session, "reuse_session lost on the way out of config");
     }
 
     /// A resumed run reuses the previous run's conversation (Continuous thread
     /// on), so one conversation legitimately maps to many runs. The lookup must
     /// still answer, not trip over the duplicate.
     #[tokio::test]
-    async fn timezone_survives_a_conversation_shared_by_several_runs() {
+    async fn automation_survives_a_conversation_shared_by_several_runs() {
         let db = fresh_in_memory_db().await;
         let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/automation-tz2").await;
         let conv_id = crate::db::test_helpers::seed_conversation(
@@ -850,7 +919,10 @@ mod tests {
         }
 
         assert_eq!(
-            timezone_for_conversation(&db.conn, conv_id).await.expect("lookup"),
+            automation_for_conversation(&db.conn, conv_id)
+                .await
+                .expect("lookup")
+                .map(|a| a.timezone),
             Some("Europe/Berlin".to_string()),
         );
     }
