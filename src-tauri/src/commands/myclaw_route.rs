@@ -39,7 +39,7 @@
 //! This container never holds a Cloudflare token. It reports; the platform, which
 //! already holds the credential, writes. Authentication reuses the outbound
 //! webhook's `vmId + s`, and the endpoint is derived from that same configured
-//! webhook URL — the identical trick `myclaw_skills` uses for skill sync, and for
+//! webhook URL — the same trick the (now removed) platform skill sync used, and for
 //! the identical reason: the origin, the vm id and the secret are all already in
 //! that one URL, so nothing new has to be configured and existing instances work
 //! the moment they are upgraded.
@@ -55,7 +55,7 @@ use crate::chat_channel::webhook::{redact_url, WebhookConfig};
 use crate::db::AppDatabase;
 
 /// Path of the configured outbound webhook — the anchor everything is derived
-/// from. Kept byte-identical to `myclaw_skills::EVENTS_PATH`; both read the same
+/// from. The platform webhook path, read from the same stored webhook config;
 /// stored config.
 const EVENTS_PATH: &str = "/api/codeg/events";
 /// Path this module posts to. The platform route lives at

@@ -543,15 +543,6 @@ mod tauri_app {
                     });
                 });
 
-                // MyClaw 平台下发的技能:启动跑一次,之后每 10~15 分钟随机拉一次。
-                // 取代了原先 include_dir! 内嵌的 experts/science 两包 —— 内容改由
-                // 平台维护,改一句文案不必发版;拉取失败一律保持现状,绝不把网络
-                // 问题当成删除指令。
-                crate::commands::myclaw_skills::spawn_sync_loop(db::AppDatabase {
-                    conn: app.state::<db::AppDatabase>().conn.clone(),
-                });
-
-
 
                 // Reclaim orphaned chat scratch dirs (pre-send drafts that never
                 // bound to a conversation, plus dirs left behind by deleted chat
