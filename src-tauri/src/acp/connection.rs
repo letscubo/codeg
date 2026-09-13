@@ -3250,16 +3250,46 @@ async fn set_grok_model(
     model_id: String,
     reasoning_effort: Option<String>,
 ) -> Result<(), sacp::Error> {
-    let params = build_grok_set_model_params(
-        session_id.0.as_ref(),
-        &model_id,
-        reasoning_effort.as_deref(),
-    );
+    send_set_session_model(cx, session_id, &model_id, reasoning_effort.as_deref()).await
+}
+
+/// Send the standard ACP `session/set_model`. Shared by Grok (which may carry a
+/// `_meta.reasoningEffort` override) and Hermes (a pure model switch). Untyped
+/// for the reason documented on [`set_grok_model`].
+async fn send_set_session_model(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    model_id: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<(), sacp::Error> {
+    let params = build_grok_set_model_params(session_id.0.as_ref(), model_id, reasoning_effort);
     let untyped_req = UntypedMessage::new("session/set_model", params).map_err(|e| {
         sacp::util::internal_error(format!("Failed to build set_model request: {e}"))
     })?;
     cx.send_request_to(Agent, untyped_req).block_task().await?;
     Ok(())
+}
+
+/// Split Hermes' model preference out of the generic preferred config values.
+///
+/// Hermes publishes its model through the ACP `models` state, not as a config
+/// option: `session/set_config_option` for `model` is accepted but only stored
+/// (its handler writes the value into a dict and answers an empty option list),
+/// so the model never changes. The switch has to go through `session/set_model`,
+/// whose handler rebuilds the agent on the new model and persists it to Hermes'
+/// `state.db` — which is what makes a later `session/load` resume on it.
+///
+/// Returns the non-blank model preference (if any) and the remaining values,
+/// with `model` removed either way so it is never also sent as a no-op
+/// `set_config_option`.
+fn split_hermes_model_preference(
+    preferred_config_values: &BTreeMap<String, String>,
+) -> (Option<String>, BTreeMap<String, String>) {
+    let mut rest = preferred_config_values.clone();
+    let model = rest
+        .remove(MODEL_CONFIG_OPTION_ID)
+        .filter(|m| !m.trim().is_empty());
+    (model, rest)
 }
 
 /// Build the `session/set_model` params. A reasoning-effort override rides in
@@ -3722,6 +3752,30 @@ async fn apply_and_emit_session_config_options(
         // No x.ai/sessionConfig (unexpected): fall through to the standard path,
         // which for Grok emits an empty list (no selectors) — same as before.
     }
+    // Hermes: apply the model preference with `session/set_model` (see
+    // `split_hermes_model_preference` for why `set_config_option` cannot). Sent
+    // unconditionally when a preference is present rather than compared against
+    // the session's current model: `session/load` is a typed send that does not
+    // capture Hermes' `models` state, and the switch is idempotent and cheap on
+    // Hermes' side (it rebuilds the agent in-process — ~0.1s measured). This is
+    // the establishment path for new, loaded and resumed sessions alike, so a
+    // conversation always runs on the model the client asked for at connect.
+    let hermes_remaining_values;
+    let preferred_config_values = if agent_type == AgentType::Hermes {
+        let (model, rest) = split_hermes_model_preference(preferred_config_values);
+        if let Some(model) = model {
+            let session_id = session.session_id().clone();
+            if let Err(e) = send_set_session_model(cx, &session_id, &model, None).await {
+                tracing::error!(
+                    "[ACP] failed to apply preferred hermes model '{model}' on connect: {e}"
+                );
+            }
+        }
+        hermes_remaining_values = rest;
+        &hermes_remaining_values
+    } else {
+        preferred_config_values
+    };
     let updated = apply_preferred_session_options(
         cx,
         session,
@@ -9545,6 +9599,14 @@ async fn run_conversation_loop<'a>(
                                             &cx, &sid, state, emitter, config_id, value_id,
                                         )
                                         .await
+                                    } else if agent_type == AgentType::Hermes
+                                        && config_id == MODEL_CONFIG_OPTION_ID
+                                    {
+                                        // Hermes ignores a `model` config option;
+                                        // only `session/set_model` switches (and
+                                        // persists) it — see
+                                        // `split_hermes_model_preference`.
+                                        send_set_session_model(&cx, &sid, &value_id, None).await
                                     } else {
                                         set_session_config_option(
                                             &cx, &sid, state, emitter, config_id, value_id,
@@ -18255,6 +18317,41 @@ mod tests {
             synthesize_grok_config_options(Some(&meta), &HashMap::new()).expect("should synthesize");
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, GROK_MODEL_OPTION_ID);
+    }
+
+    #[test]
+    fn hermes_model_preference_is_split_out_of_generic_config_values() {
+        let mut prefs = BTreeMap::new();
+        prefs.insert("model".to_string(), "claude-sonnet-5".to_string());
+        prefs.insert("mode".to_string(), "default".to_string());
+        let (model, rest) = split_hermes_model_preference(&prefs);
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
+        // The model must never ALSO go out as a (no-op) set_config_option.
+        assert!(!rest.contains_key("model"));
+        assert_eq!(rest.get("mode").map(String::as_str), Some("default"));
+
+        // A blank preference switches nothing, and is still removed.
+        let mut blank = BTreeMap::new();
+        blank.insert("model".to_string(), "   ".to_string());
+        let (model, rest) = split_hermes_model_preference(&blank);
+        assert!(model.is_none());
+        assert!(rest.is_empty());
+
+        // No preference at all leaves everything else untouched.
+        let mut other = BTreeMap::new();
+        other.insert("mode".to_string(), "plan".to_string());
+        let (model, rest) = split_hermes_model_preference(&other);
+        assert!(model.is_none());
+        assert_eq!(rest, other);
+    }
+
+    #[test]
+    fn hermes_set_model_params_are_a_pure_model_switch() {
+        // Hermes never gets an effort override: no `_meta` on the request.
+        let p = build_grok_set_model_params("s1", "claude-haiku-4.5", None);
+        assert_eq!(p["sessionId"], "s1");
+        assert_eq!(p["modelId"], "claude-haiku-4.5");
+        assert!(p.get("_meta").is_none());
     }
 
     #[test]

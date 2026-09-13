@@ -1181,7 +1181,18 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // console script, so `hermes acp` is the same adapter the official
             // install runs. Keep the pin EXACT on version bumps and re-audit
             // the wrapper diff — the exact pin is what bounds the third-party
-            // trust surface. 0.21.0 audited, and this bump is the cheap kind
+            // trust surface.
+            //
+            // 0.21.2 (upstream v2026.9.11) is pinned for ACP `session/set_model`:
+            // it carries upstream #107281 / #107366, so a bare model id on a
+            // `custom` provider stays on that provider instead of being
+            // auto-detected onto OpenRouter (verified in a container on
+            // 2026-09-13: 0.21.0 re-routed `claude-sonnet-5` / `kimi-k3` to
+            // openrouter; 0.21.2 keeps all of them on `custom`). The WRAPPER DIFF
+            // FOR THIS BUMP HAS NOT BEEN RE-AUDITED YET — do that before a stable
+            // release. The audit notes below describe the 0.21.0 review.
+            //
+            // 0.21.0 audited, and this bump is the cheap kind
             // (same as 0.20.4→0.20.5→0.20.6): every file in the tarball EXCEPT
             // `package.json` is byte-identical to the fully-read 0.20.4 wrapper
             // — `bin/`, the whole `lib/` (incl. `runtime-checkout.js`), and
@@ -1198,8 +1209,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // naturally outranks the npm-managed copy; the npm global install
             // is the managed/one-click channel codeg's Install button drives.
             distribution: AgentDistribution::Npx {
-                version: "0.21.0",
-                package: "hermes-agent@0.21.0",
+                version: "0.21.2",
+                package: "hermes-agent@0.21.2",
                 cmd: "hermes",
                 args: &["acp"],
                 env: &[],
@@ -2070,8 +2081,8 @@ mod tests {
         // audited wrapper code is only what the pinned version ships.
         assert_npx_version(
             AgentType::Hermes,
-            "0.21.0",
-            "hermes-agent@0.21.0",
+            "0.21.2",
+            "hermes-agent@0.21.2",
             Some("20.0.0"),
         );
     }
