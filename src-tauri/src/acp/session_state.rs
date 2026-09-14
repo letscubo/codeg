@@ -1135,6 +1135,16 @@ impl SessionState {
                 self.status = ConnectionStatus::Connected;
             }
             AcpEvent::UserMessage { message_id, blocks } => {
+                // A user message only ever opens a turn (the send gate admits one
+                // prompt per connection, and the loop emits this right BEFORE the
+                // prompt goes out), so whatever sits in `live_message` now is not
+                // this turn's reply: it is `session/load` history replay (a
+                // resumed session re-streams every past assistant message as
+                // content deltas) or a turn that never settled. Left in place it
+                // is folded into this turn's `last_assistant_text` at
+                // TurnComplete — an automation on a continuous thread recorded
+                // "ok", "okok", "okokokok" as its per-run summaries.
+                self.live_message = None;
                 // Capture the in-flight user prompt so a client attaching
                 // mid-turn renders the user turn from the snapshot (the
                 // one-shot event won't replay for it). Cleared on TurnComplete.
@@ -3788,6 +3798,32 @@ mod tests {
             agent_type: "codex".into(),
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
+    }
+
+    #[test]
+    fn user_message_drops_replayed_history_from_last_assistant_text() {
+        // A resumed session replays past assistant messages before the new
+        // prompt; the turn's result must be only what the agent says after it.
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "ok from an earlier run".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::UserMessage {
+            message_id: "u1".into(),
+            blocks: vec![],
+        });
+        s.turn_in_flight = true;
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "ok".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "ext".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "hermes".into(),
+        });
+        assert_eq!(s.last_assistant_text.as_deref(), Some("ok"));
     }
 
     #[test]
