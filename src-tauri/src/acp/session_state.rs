@@ -236,6 +236,18 @@ pub struct PendingUserMessage {
     pub blocks: Vec<crate::acp::types::UserMessageBlock>,
 }
 
+/// fork(letscubo)专属: which process model drives a connection. `Acp` is the
+/// long-lived ACP adapter; `Cli` is the per-turn `claude -p` driver in
+/// `acp::cli`. Both share the manager map, `SessionState` and the event
+/// pipeline — only the consumer of `cmd_tx` differs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionTransport {
+    #[default]
+    Acp,
+    Cli,
+}
+
 /// 后端权威的会话状态。每个 AgentConnection 持有一个 Arc<RwLock<SessionState>>。
 ///
 /// 字段范围：仅当前 turn 的 in-flight 数据 + 元信息 + 协商出的能力。
@@ -257,6 +269,11 @@ pub struct SessionState {
     pub working_dir: Option<PathBuf>,
     pub owner_window_label: String,
     pub folder_id: Option<i32>,
+    /// fork(letscubo)专属: process model behind this connection.
+    pub transport: ConnectionTransport,
+    /// fork(letscubo)专属: `--model` for the next CLI turn (`None` = CLI
+    /// default). Unused by ACP connections.
+    pub cli_model: Option<String>,
 
     // 状态
     pub status: ConnectionStatus,
@@ -630,6 +647,8 @@ impl SessionState {
             working_dir,
             owner_window_label,
             folder_id,
+            transport: ConnectionTransport::Acp,
+            cli_model: None,
             status: ConnectionStatus::Connecting,
             live_message: None,
             active_tool_calls: BTreeMap::new(),

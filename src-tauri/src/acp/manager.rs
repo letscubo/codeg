@@ -790,6 +790,10 @@ impl ConnectionManager {
                 continue;
             }
             let state = conn.state.read().await;
+            // fork(letscubo): a CLI-transport connection never serves an ACP reuse.
+            if state.transport != crate::acp::session_state::ConnectionTransport::Acp {
+                continue;
+            }
             if state.external_id.as_deref() != Some(session_id) {
                 continue;
             }

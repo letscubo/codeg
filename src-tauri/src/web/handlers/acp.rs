@@ -183,6 +183,12 @@ pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPromptParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "transport_mismatch",
+    )
+    .await?;
     state
         .connection_manager
         .send_prompt_linked_with_message_id(
@@ -363,6 +369,12 @@ pub async fn acp_set_mode(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpSetModeParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "unsupported_for_cli",
+    )
+    .await?;
     let manager = &state.connection_manager;
     manager
         .set_mode(&params.connection_id, params.mode_id)
@@ -383,6 +395,12 @@ pub async fn acp_set_config_option(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpSetConfigOptionParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "unsupported_for_cli",
+    )
+    .await?;
     let manager = &state.connection_manager;
     manager
         .set_config_option(&params.connection_id, params.config_id, params.value_id)
@@ -402,6 +420,12 @@ pub async fn acp_goal_control(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpGoalControlParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "unsupported_for_cli",
+    )
+    .await?;
     let manager = &state.connection_manager;
     manager
         .goal_control(&state.db.conn, &params.connection_id, params.action)
@@ -438,6 +462,12 @@ pub async fn acp_cancel(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpConnectionIdParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "transport_mismatch",
+    )
+    .await?;
     let manager = &state.connection_manager;
     manager
         .cancel(&state.db.conn, &params.connection_id)
@@ -450,6 +480,12 @@ pub async fn acp_fork(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpForkParams>,
 ) -> Result<Json<ForkResultInfo>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "unsupported_for_cli",
+    )
+    .await?;
     let manager = &state.connection_manager;
     let result = manager
         .fork_session(
@@ -488,6 +524,12 @@ pub async fn acp_stop_async_task(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpStopAsyncTaskParams>,
 ) -> Result<Json<bool>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "unsupported_for_cli",
+    )
+    .await?;
     let stopped = state
         .connection_manager
         .stop_async_task(&params.connection_id, &params.task_id)
@@ -508,6 +550,12 @@ pub async fn acp_respond_permission(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpRespondPermissionParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::web::handlers::cli::reject_cli_connection(
+        &state.connection_manager,
+        &params.connection_id,
+        "unsupported_for_cli",
+    )
+    .await?;
     let manager = &state.connection_manager;
     manager
         .respond_permission(&params.connection_id, &params.request_id, &params.option_id)

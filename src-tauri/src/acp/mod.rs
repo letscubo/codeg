@@ -3,6 +3,8 @@ pub mod antigravity_login;
 pub mod background_watch;
 pub mod binary_cache;
 pub mod chat_authoring;
+// fork(letscubo)专属: Claude Code CLI transport (cli_prompt / cli_cancel).
+pub mod cli;
 pub mod codex_catalog_source;
 pub mod codex_goal;
 pub mod codex_model_catalog;
@@ -38,7 +40,7 @@ pub mod work_task_tools;
 pub use idle_sweep::{idle_sweep_task, idle_timeout_from_env, SWEEP_INTERVAL_SECS};
 pub use internal_bus::{EventBusMetrics, EventBusMetricsSnapshot, InternalEventBus};
 pub use lifecycle::lifecycle_subscriber_task;
-pub use session_state::{LiveSessionSnapshot, SessionState};
+pub use session_state::{ConnectionTransport, LiveSessionSnapshot, SessionState};
 // Re-export the inner types of LiveSessionSnapshot for downstream consumers; not all are
 // directly named in Rust today (they ride along through the snapshot struct), so silence
 // dead-import warnings rather than dropping them.

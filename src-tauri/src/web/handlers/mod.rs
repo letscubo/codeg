@@ -6,6 +6,8 @@ pub mod background;
 pub mod backup;
 pub mod chat_authoring;
 pub mod chat_channel;
+// fork(letscubo)专属: Claude Code CLI transport.
+pub mod cli;
 pub mod conversations;
 pub mod custom_skills;
 pub mod delegation;

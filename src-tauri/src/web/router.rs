@@ -768,6 +768,9 @@ pub fn build_router(
             post(handlers::acp::acp_describe_agent_options),
         )
         .route("/acp_cancel", post(handlers::acp::acp_cancel))
+        // ─── fork(letscubo)专属: Claude Code CLI transport ───
+        .route("/cli_prompt", post(handlers::cli::cli_prompt))
+        .route("/cli_cancel", post(handlers::cli::cli_cancel))
         .route("/acp_fork", post(handlers::acp::acp_fork))
         .route(
             "/acp_stop_async_task",
