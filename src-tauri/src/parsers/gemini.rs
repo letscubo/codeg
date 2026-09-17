@@ -811,6 +811,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+                outcome: None,
             });
             i += 1;
             continue;
@@ -827,6 +828,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+                outcome: None,
             });
             i += 1;
             continue;
@@ -871,6 +873,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
             model,
             completed_at,
         agent_message_id: None,
+            outcome: None,
         });
     }
 

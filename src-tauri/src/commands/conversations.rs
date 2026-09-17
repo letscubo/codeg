@@ -1103,6 +1103,45 @@ fn parse_resume_task_id(input: &str) -> Option<String> {
 /// an earlier turn). Without this the resumed card would be frozen at the
 /// `running` its ack reported, forever — the child's real outcome landed on the
 /// DB row, not on the resume result.
+/// Copy per-turn token usage (and a model the transcript lacks) from a
+/// built-in's native store onto turns read from codeg's own ACP transcript.
+///
+/// The wire carries no per-turn usage (`usage_update` reports context
+/// occupancy, not a turn's tokens), while claude_code / hermes / pi write it
+/// to their own stores. Copied turn by turn only when the native parser
+/// resolves the same conversation with the same number of assistant turns; any
+/// mismatch copies nothing rather than mislabelling a turn. OpenClaw's parser
+/// can never resolve one of codeg's ids (see `transcript_dir_for`), and custom
+/// agents have no native store, so both are skipped outright.
+fn merge_native_turn_usage(turns: &mut [MessageTurn], at: AgentType, external_id: &str) {
+    if at.custom_id().is_some() || at == AgentType::OpenClaw {
+        return;
+    }
+    let Ok(native) = build_agent_parser(at).get_conversation(external_id) else {
+        return;
+    };
+    let theirs: Vec<&MessageTurn> = native
+        .turns
+        .iter()
+        .filter(|t| matches!(t.role, TurnRole::Assistant))
+        .collect();
+    let ours: Vec<&mut MessageTurn> = turns
+        .iter_mut()
+        .filter(|t| matches!(t.role, TurnRole::Assistant))
+        .collect();
+    if ours.len() != theirs.len() {
+        return;
+    }
+    for (o, n) in ours.into_iter().zip(theirs) {
+        if o.usage.is_none() {
+            o.usage = n.usage.clone();
+        }
+        if o.model.is_none() {
+            o.model = n.model.clone();
+        }
+    }
+}
+
 fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
     if children.is_empty() {
         return;
@@ -1236,9 +1275,13 @@ pub async fn get_folder_conversation_core(
             // transcript makes history depend on that rather than on the
             // adapter's flush. Falling through on a miss keeps every
             // conversation that predates recording resolvable.
-            if at == AgentType::OpenClaw || at == AgentType::DeepSeek {
+            // Every built-in codeg records (OpenClaw, DeepSeek and the other
+            // kind=all runtimes — see `transcript_dir_for`) reads its own
+            // transcript first, for the same id-exact / wire-faithful reasons.
+            if crate::acp::connection::transcript_dir_for(at).is_some() {
                 let native = crate::parsers::acp_native::AcpNativeParser::new(at);
-                if let Ok(d) = native.get_conversation(&eid) {
+                if let Ok(mut d) = native.get_conversation(&eid) {
+                    merge_native_turn_usage(&mut d.turns, at, &eid);
                     return Ok((
                         d.turns,
                         d.session_stats,
@@ -2607,6 +2650,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         }
     }
 
@@ -2646,6 +2690,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         }
     }
 
@@ -2665,6 +2710,7 @@ mod tests {
             model: None,
             completed_at: completed.then_some(ts),
         agent_message_id: None,
+            outcome: None,
         }
     }
 
@@ -2794,6 +2840,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         };
         let pending_image = |message_id: &str, data: &str| {
             crate::acp::session_state::PendingUserMessage {
@@ -2924,6 +2971,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         }
     }
 
@@ -3183,6 +3231,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);

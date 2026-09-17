@@ -1189,10 +1189,14 @@ fn pi_launch_preflight(runtime_env: &BTreeMap<String, String>) -> Option<String>
 /// Transcript directory for an agent that codeg must record itself, or `None`
 /// for agents with their own store parser.
 ///
-/// Only custom ACP agents are recorded: every built-in has a dedicated parser
-/// reading the agent's native transcript, and recording those too would double
-/// the storage while risking two disagreeing histories.
-fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
+/// Custom ACP agents are always recorded (they have no native store). Among
+/// built-ins, only the runtimes MyClaw hosts as kind=all (OpenClaw, DeepSeek,
+/// claude_code, hermes, pi) record here — their history has to match what the
+/// live stream showed, and the native parsers keep neither full tool
+/// input/output, nor the user's attachments, nor the turn's stop reason. Every
+/// other built-in stays unrecorded: recording it would double the storage
+/// while risking two disagreeing histories.
+pub(crate) fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
     // OpenClaw records here too, despite being a built-in with its own parser.
     // It is a bridge: `openclaw acp` mints an ACP session id while the actual
     // transcript is written by its resident gateway under a DIFFERENT session
@@ -1233,6 +1237,20 @@ fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
     // and falls back to the native parser, so pre-existing conversations keep
     // resolving.
     if agent_type == AgentType::DeepSeek {
+        return Some(registry::registry_id_for(agent_type));
+    }
+    // claude_code / hermes / pi: the remaining kind=all runtimes. Their native
+    // stores are trustworthy but lossy for what a MyClaw chat needs — claude.rs
+    // caps tool input and output at 500 chars, none of the three keeps the
+    // prompt's attachments, and no native store carries a stop reason or the
+    // error codeg surfaced. The wire codeg relayed live is the only source that
+    // reproduces the live view exactly. The read path prefers this transcript
+    // and copies per-turn token usage back from the native store, which is the
+    // one thing the wire lacks (`merge_native_turn_usage`).
+    if matches!(
+        agent_type,
+        AgentType::ClaudeCode | AgentType::Hermes | AgentType::Pi
+    ) {
         return Some(registry::registry_id_for(agent_type));
     }
     agent_type
@@ -1348,16 +1366,15 @@ async fn record_turn_end(
     agent_type: AgentType,
     session_id: &str,
     stop_reason: &str,
-    started_at_ms: u64,
+    duration_ms: u64,
     model: Option<String>,
 ) {
     let Some(dir) = transcript_dir_for(agent_type) else {
         return;
     };
-    let now = crate::acp_transcript::now_epoch_ms();
     let mut payload = serde_json::json!({
         "stopReason": stop_reason,
-        "durationMs": now.saturating_sub(started_at_ms),
+        "durationMs": duration_ms,
     });
     // ACP puts no model on the prompt response, so the session's model selector
     // is the only honest answer at turn end — and it is the same value the
@@ -1374,6 +1391,41 @@ async fn record_turn_end(
         payload,
     );
     let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), ack).await;
+}
+
+/// Record an in-turn `Error` event to codeg's own transcript, so the history
+/// parser can attach the same failure the live stream showed to the turn it
+/// happened in. No-op for agents with their own store and for non-error events.
+/// Fire-and-forget: the writer queue is per-file FIFO, and the bound-awaited
+/// `record_turn_end` that follows every turn exit flushes it.
+fn record_turn_error(agent_type: AgentType, session_id: &str, event: &AcpEvent) {
+    if let AcpEvent::Error {
+        message,
+        code,
+        terminal,
+        ..
+    } = event
+    {
+        record_turn_error_raw(agent_type, session_id, message.clone(), code.clone(), *terminal);
+    }
+}
+
+fn record_turn_error_raw(
+    agent_type: AgentType,
+    session_id: &str,
+    message: String,
+    code: Option<String>,
+    terminal: bool,
+) {
+    let Some(dir) = transcript_dir_for(agent_type) else {
+        return;
+    };
+    let _ = crate::acp_transcript::record_entry(
+        dir,
+        session_id,
+        crate::acp_transcript::EntryKind::Error,
+        serde_json::json!({ "message": message, "code": code, "terminal": terminal }),
+    );
 }
 
 /// The model id a session's selectors currently report. Agent-agnostic: the
@@ -9045,6 +9097,12 @@ async fn run_conversation_loop<'a>(
                 // this conversation as transcript-less (see `record_prompt`).
                 record_prompt(agent_type, &sid.0, &prompt_blocks).await;
                 let turn_started_at_ms = crate::acp_transcript::now_epoch_ms();
+                // The turn's span as codeg measures it, read at each turn exit.
+                // One number feeds both the transcript's `TurnEnd` line and the
+                // live `TurnComplete` event, so a footer rendered live and one
+                // rebuilt from history show the same duration.
+                let turn_elapsed_ms =
+                    move || crate::acp_transcript::now_epoch_ms().saturating_sub(turn_started_at_ms);
                 let prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
                 // Snapshot the stderr write position BEFORE the request is
                 // dispatched. An agent that fails the moment the prompt lands
@@ -9269,6 +9327,7 @@ async fn run_conversation_loop<'a>(
                                         agent_type,
                                         empty_report.as_ref(),
                                     ) {
+                                        record_turn_error(agent_type, &sid.0, &err_event);
                                         emit_with_state(state, emitter, err_event).await;
                                     }
                                     // Clean completions only — a canceled/empty
@@ -9295,6 +9354,7 @@ async fn run_conversation_loop<'a>(
                                             session_id: sid.0.to_string(),
                                             stop_reason: reason_str.into(),
                                             agent_type: agent_type.to_string(),
+                                            duration_ms: Some(turn_elapsed_ms()),
                                         },
                                     )
                                     .await;
@@ -9397,6 +9457,7 @@ async fn run_conversation_loop<'a>(
                                         agent_type,
                                         None,
                                     ) {
+                                        record_turn_error(agent_type, &sid.0, &err_event);
                                         emit_with_state(state, emitter, err_event).await;
                                     }
                                     // Not journaled (that is `end_turn` only),
@@ -9408,7 +9469,7 @@ async fn run_conversation_loop<'a>(
                                         agent_type,
                                         &sid.0,
                                         "auth_required",
-                                        turn_started_at_ms,
+                                        turn_elapsed_ms(),
                                         current_session_model_id(state).await,
                                     )
                                     .await;
@@ -9424,6 +9485,7 @@ async fn run_conversation_loop<'a>(
                                             session_id: sid.0.to_string(),
                                             stop_reason: "auth_required".into(),
                                             agent_type: agent_type.to_string(),
+                                            duration_ms: Some(turn_elapsed_ms()),
                                         },
                                     )
                                     .await;
@@ -9437,7 +9499,21 @@ async fn run_conversation_loop<'a>(
                                     }
                                     break;
                                 }
-                                Err(e) => return Err(e),
+                                Err(e) => {
+                                    // The prompt itself failed: `?` will unwind
+                                    // the connection and emit the terminal
+                                    // `Error`, which has no session in scope —
+                                    // so record it here, while the turn is
+                                    // still known.
+                                    record_turn_error_raw(
+                                        agent_type,
+                                        &sid.0,
+                                        e.to_string(),
+                                        None,
+                                        true,
+                                    );
+                                    return Err(e);
+                                }
                             };
                             // A turn's terminal AIR failure rides on the
                             // response `_meta` (see `response_session_failure`
@@ -9490,7 +9566,8 @@ async fn run_conversation_loop<'a>(
                             if let Some(err_event) =
                                 turn_failure_error_event(reason_str, agent_type, empty_report.as_ref())
                             {
-                                emit_with_state(state, emitter, err_event).await;
+                                record_turn_error(agent_type, &sid.0, &err_event);
+                                        emit_with_state(state, emitter, err_event).await;
                             }
                             // Clean completions only — a canceled/empty turn
                             // may be unpersisted (see journal_turn_span).
@@ -9507,7 +9584,7 @@ async fn run_conversation_loop<'a>(
                                 agent_type,
                                 &sid.0,
                                 reason_str,
-                                turn_started_at_ms,
+                                turn_elapsed_ms(),
                                 current_session_model_id(state).await,
                             )
                             .await;
@@ -9522,6 +9599,7 @@ async fn run_conversation_loop<'a>(
                                     session_id: sid.0.to_string(),
                                     stop_reason: reason_str.into(),
                                     agent_type: agent_type.to_string(),
+                                    duration_ms: Some(turn_elapsed_ms()),
                                 },
                             )
                             .await;
@@ -9750,6 +9828,7 @@ async fn run_conversation_loop<'a>(
                                             session_id: sid.0.to_string(),
                                             stop_reason: "cancelled".into(),
                                             agent_type: agent_type.to_string(),
+                                            duration_ms: Some(turn_elapsed_ms()),
                                         },
                                     )
                                     .await;
@@ -13612,10 +13691,16 @@ mod tests {
         // OpenClaw is recorded for its own reason (its gateway writes under a
         // different session id, so its parser can never resolve one of ours).
         assert!(transcript_dir_for(AgentType::OpenClaw).is_some());
-        // Agents whose own store is trustworthy stay unrecorded — recording
-        // them would double the storage and risk two disagreeing histories.
+        // The other kind=all runtimes record too: their history must match the
+        // live wire (full tool input/output, attachments, stop reason).
+        for at in [AgentType::ClaudeCode, AgentType::Hermes, AgentType::Pi] {
+            assert!(transcript_dir_for(at).is_some(), "{at:?} must be recorded");
+        }
+        // Built-ins outside kind=all keep their native store as the only
+        // history — recording them would double the storage and risk two
+        // disagreeing histories.
         assert!(
-            transcript_dir_for(AgentType::ClaudeCode).is_none(),
+            transcript_dir_for(AgentType::Codex).is_none(),
             "built-ins with a reliable native store must not be double-recorded",
         );
     }
@@ -15269,14 +15354,18 @@ mod tests {
         // existing emit-then-fall-back behaviour even for custom agents.
         assert!(!recovers_load_failure_locally(custom, None));
 
-        // Built-ins read history back out of the agent's own store, so a
-        // forgotten session really is gone and must still stop with the banner.
-        for builtin in [
-            AgentType::ClaudeCode,
-            AgentType::Codex,
-            AgentType::Gemini,
-            AgentType::Cursor,
-        ] {
+        // The kind=all runtimes codeg records (see `transcript_dir_for`) can
+        // recover the same way: their history lives in codeg's transcript.
+        for recorded in [AgentType::ClaudeCode, AgentType::Hermes, AgentType::Pi] {
+            assert!(
+                recovers_load_failure_locally(recorded, Some("session_unavailable")),
+                "{recorded:?} is recorded by codeg and must recover locally"
+            );
+        }
+        // Built-ins codeg does not record read history back out of the agent's
+        // own store, so a forgotten session really is gone and must still stop
+        // with the banner.
+        for builtin in [AgentType::Codex, AgentType::Gemini, AgentType::Cursor] {
             assert!(
                 !recovers_load_failure_locally(builtin, Some("session_unavailable")),
                 "{builtin:?} has no codeg-side transcript to fall back on"

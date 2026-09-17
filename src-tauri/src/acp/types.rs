@@ -372,6 +372,12 @@ pub enum AcpEvent {
         session_id: String,
         stop_reason: String,
         agent_type: String,
+        /// Wall-clock span of the turn as codeg measured it: prompt sent →
+        /// turn ended. The same number `record_turn_end` writes to the ACP
+        /// transcript, so a live footer and a reloaded one agree. `None`
+        /// where no prompt span exists (synthesized completions).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// Session established with agent-assigned session ID
     SessionStarted { session_id: String },

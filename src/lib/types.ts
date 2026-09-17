@@ -245,6 +245,12 @@ export type ContentBlock =
     }
   | { type: "thinking"; text: string }
   /**
+   * A non-image attachment the user sent with the prompt, as recorded in
+   * codeg's own ACP transcript (`ContentBlock::ResourceLink`). The file lives
+   * at `uri`; native parsers never emit it.
+   */
+  | { type: "resource_link"; uri: string; name: string; mime_type?: string | null }
+  /**
    * Frontend-only, LIVE-stream synthetic block. It is NEVER persisted and
    * NEVER emitted by the Rust JSONL parsers — the persisted plan path is a
    * `TodoWrite` tool_use block. It exists purely so a live plan can survive
@@ -298,6 +304,13 @@ export interface MessageTurn {
    * and DeepSeek falls back to one — all resolved entirely in the backend, so
    * never gate the fork affordance on this. */
   agent_message_id?: string | null
+  /** How the turn ended, from codeg's own ACP transcript (`TurnOutcome`):
+   * the ACP stop reason plus the error codeg surfaced live, if the turn
+   * failed. Absent on turns read from an agent's native store. */
+  outcome?: {
+    stop_reason: string
+    error?: { code?: string | null; message: string } | null
+  } | null
   /** CLIENT-ONLY, never on the wire. The id the PARSER gave this turn.
    *
    * A turn produced in the current session is named

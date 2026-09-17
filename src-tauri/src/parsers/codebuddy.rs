@@ -942,6 +942,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+                outcome: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -955,6 +956,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+                outcome: None,
             });
             i += 1;
         } else {
@@ -994,6 +996,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: turn_model,
                 completed_at,
             agent_message_id: None,
+                outcome: None,
             });
         }
     }

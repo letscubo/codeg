@@ -2087,6 +2087,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -2138,6 +2139,7 @@ mod tests {
                     session_id: "ext-1".into(),
                     stop_reason: stop_reason.into(),
                     agent_type: "open_code".into(),
+                    duration_ms: None,
                 },
             };
             handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -2176,6 +2178,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "cancelled".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -2210,6 +2213,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -2490,6 +2494,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,
@@ -2599,6 +2604,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         }));
     }
 
@@ -2751,6 +2757,7 @@ mod tests {
                 session_id: "ext-final".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         }));
 
@@ -2831,6 +2838,7 @@ mod tests {
                 session_id: "ext-200".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         }));
 

@@ -363,6 +363,7 @@ impl CliDriver {
             session_id,
             stop_reason: finish.stop_reason,
             agent_type,
+            duration_ms: None,
         })
         .await;
     }

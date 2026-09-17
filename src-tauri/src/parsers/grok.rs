@@ -770,6 +770,7 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                         model: None,
                         completed_at: None,
                     agent_message_id: None,
+                        outcome: None,
                     });
                 }
             }
@@ -1649,6 +1650,7 @@ fn ensure_assistant(
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         });
     }
     assistant.as_mut().expect("assistant just set")

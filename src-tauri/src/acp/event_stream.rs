@@ -487,6 +487,12 @@ fn content_block_size(block: &crate::models::message::ContentBlock) -> usize {
             mime_type,
             uri,
         } => 64 + json_str_len(data) + json_str_len(mime_type) + opt_str_size(uri),
+        // `{"type":"resource_link","uri":…,"name":…,"mime_type":…}`
+        CB::ResourceLink {
+            uri,
+            name,
+            mime_type,
+        } => 64 + json_str_len(uri) + json_str_len(name) + opt_str_size(mime_type),
         CB::ImageGeneration {
             revised_prompt,
             image,
@@ -1019,6 +1025,7 @@ mod tests {
             model: Some("claude-sonnet-5[1m]".into()),
             completed_at: Some(chrono::Utc::now()),
         agent_message_id: None,
+            outcome: None,
         };
         let env = Arc::new(EventEnvelope {
             seq: u64::MAX,

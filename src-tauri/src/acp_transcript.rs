@@ -144,6 +144,13 @@ pub enum EntryKind {
     /// replays notifications only — where boundaries fall back to user message
     /// chunks.
     TurnEnd,
+    /// An error codeg surfaced to the live stream while a turn was running
+    /// (a turn-failure toast for `refusal` / `max_tokens` / an empty turn, a
+    /// rejected prompt, or the agent dying mid-turn). Payload:
+    /// `{"message":…, "code":…?, "terminal":bool}`. The history parser folds it
+    /// into the turn it lands in, so a reloaded conversation shows the same
+    /// failure the user saw live. Errors outside a turn are not recorded.
+    Error,
 }
 
 /// One recorded line.
@@ -671,7 +678,9 @@ fn compact_batch(pending: &[Queued], compactable: bool) -> (String, bool) {
                     match e.k {
                         EntryKind::Prompt => compactable = true,
                         EntryKind::TurnEnd => compactable = false,
-                        EntryKind::Update => {}
+                        // An error mid-turn does not end the chunk run: the
+                        // turn's `TurnEnd` still follows and closes it.
+                        EntryKind::Update | EntryKind::Error => {}
                     }
                 }
                 push_line(&mut out, &other.to_line());

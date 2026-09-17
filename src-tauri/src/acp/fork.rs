@@ -250,6 +250,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: agent_message_id.map(str::to_string),
+            outcome: None,
         }
     }
 

@@ -1779,6 +1779,7 @@ mod async_relay_dedup_tests {
                 session_id: "S1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude".into(),
+                duration_ms: None,
             },
         };
         handle_acp_envelope(&complete, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
@@ -2070,6 +2071,7 @@ mod error_terminal_gate_tests {
                     session_id: "S_SHARED".to_string(),
                     stop_reason: "end_turn".to_string(),
                     agent_type: "claude_code".to_string(),
+                    duration_ms: None,
                 },
             },
             &bridge,

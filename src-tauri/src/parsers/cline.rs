@@ -287,6 +287,7 @@ impl AgentParser for ClineParser {
                         model,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                        outcome: None,
                     });
                 }
                 "user" => {
@@ -308,6 +309,7 @@ impl AgentParser for ClineParser {
                             model: None,
                             completed_at: Some(timestamp),
                         agent_message_id: None,
+                            outcome: None,
                         });
                     }
 
@@ -324,6 +326,7 @@ impl AgentParser for ClineParser {
                             model: None,
                             completed_at: Some(timestamp),
                         agent_message_id: None,
+                            outcome: None,
                         });
                     }
                 }

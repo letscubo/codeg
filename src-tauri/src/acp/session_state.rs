@@ -2204,6 +2204,7 @@ mod tests {
             session_id: "sid".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert!(s.session_failures["t1:error"].resolved);
         assert!(!s.session_failures["s:notice"].resolved);
@@ -2462,6 +2463,7 @@ mod tests {
                 session_id: "sid".into(),
                 stop_reason: stop_reason.into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             }
         }
         let mut s = fresh_state();
@@ -2571,6 +2573,7 @@ mod tests {
             session_id: "sid".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert!(s.session_failures["notice"].resolved);
         assert!(!s.session_failures["err"].resolved);
@@ -2589,6 +2592,7 @@ mod tests {
             session_id: "sid".into(),
             stop_reason: "end_turn".into(),
             agent_type: "grok".into(),
+            duration_ms: None,
         });
         assert!(s.pending_plan_approval.is_none());
     }
@@ -2735,6 +2739,7 @@ mod tests {
             session_id: "sess".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         });
         assert!(
             s.pending_user_message.is_none(),
@@ -3321,6 +3326,7 @@ mod tests {
             session_id: "sess-1".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("final answer"));
     }
@@ -3500,6 +3506,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         });
         assert!(s.live_message.is_none());
         assert!(s.active_tool_calls.is_empty());
@@ -3589,6 +3596,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         });
 
         assert!(
@@ -3707,6 +3715,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
     }
@@ -3734,6 +3743,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("part 1 part 2"));
     }
@@ -3761,6 +3771,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -3796,6 +3807,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
     }
@@ -3822,6 +3834,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "hermes".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("ok"));
     }
@@ -3850,6 +3863,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -3874,6 +3888,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -3899,6 +3914,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "cancelled".into(),
             agent_type: "codex".into(),
+            duration_ms: None,
         };
         s.apply_event(&complete);
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer"));
@@ -4639,6 +4655,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            duration_ms: None,
         });
         // The existing `live_message = None` clear handles the new block kinds
         // automatically — they live inside live_message, not as siblings.

@@ -44,7 +44,9 @@ use crate::acp::connection::{
 use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
 use crate::models::conversation::{ConversationDetail, ConversationSummary, SessionStats};
-use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole, TurnUsage};
+use crate::models::message::{
+    ContentBlock, ImageData, MessageTurn, TurnError, TurnOutcome, TurnRole, TurnUsage,
+};
 use crate::parsers::{AgentParser, ParseError};
 
 pub struct AcpNativeParser {
@@ -199,9 +201,10 @@ fn prompt_text(payload: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-/// Blocks for a user turn recorded from a `session/prompt` payload. Text and
-/// images are kept; resource links degrade to their text form, which is what
-/// the composer serialized them from.
+/// Blocks for a user turn recorded from a `session/prompt` payload. Text,
+/// images and resource links are kept in order — a resource link is the
+/// user's attachment (name + where it lives), and dropping it left reloaded
+/// conversations without the files the live view showed.
 fn prompt_blocks(payload: &serde_json::Value) -> Vec<ContentBlock> {
     let Some(items) = payload.as_array() else {
         return Vec::new();
@@ -223,6 +226,25 @@ fn prompt_blocks(payload: &serde_json::Value) -> Vec<ContentBlock> {
                         uri: item
                             .get("uri")
                             .and_then(|u| u.as_str())
+                            .map(str::to_string),
+                    });
+                }
+            }
+            Some("resource_link") => {
+                let uri = item.get("uri").and_then(|u| u.as_str()).unwrap_or_default();
+                if !uri.is_empty() {
+                    let name = item
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(uri);
+                    blocks.push(ContentBlock::ResourceLink {
+                        uri: uri.to_string(),
+                        name: name.to_string(),
+                        mime_type: item
+                            .get("mimeType")
+                            .or_else(|| item.get("mime_type"))
+                            .and_then(|m| m.as_str())
                             .map(str::to_string),
                     });
                 }
@@ -257,6 +279,10 @@ struct PendingTurn {
     duration_ms: Option<u64>,
     model: Option<String>,
     has_content: bool,
+    /// From the `TurnEnd` line; `None` for replay-hydrated transcripts.
+    stop_reason: Option<String>,
+    /// From an `Error` line recorded while this turn was running.
+    error: Option<TurnError>,
 }
 
 impl PendingTurn {
@@ -385,12 +411,21 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                     model: None,
                     completed_at: None,
                 agent_message_id: None,
+                    outcome: None,
                 });
                 seq += 1;
                 prompt_just_recorded = true;
                 turn_start_hint = Some(entry.t);
             }
             EntryKind::TurnEnd => {
+                // A prompt that ended without the agent producing anything
+                // still gets a turn: empty blocks, the stop reason on the
+                // outcome. Live, the client saw the prompt end with no reply
+                // and reported it; history must be able to show the same
+                // rather than a prompt with nothing after it.
+                if pending.is_none() && prompt_just_recorded {
+                    pending = Some(PendingTurn::new(turn_start_hint.take().unwrap_or(entry.t)));
+                }
                 if let Some(p) = pending.as_mut() {
                     apply_turn_end(p, &entry.p);
                     p.last_at_ms = entry.t;
@@ -398,6 +433,26 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                 flush(&mut pending, &mut turns, &mut seq);
                 prompt_just_recorded = false;
                 turn_start_hint = None;
+            }
+            EntryKind::Error => {
+                // Recorded only while a turn runs (see `record_turn_error`), so
+                // it belongs to the pending turn — opened here if the agent
+                // failed before producing anything. A later error on the same
+                // turn is the terminal one: keep it.
+                let p = pending
+                    .get_or_insert_with(|| PendingTurn::new(turn_start_hint.take().unwrap_or(entry.t)));
+                p.last_at_ms = entry.t;
+                let message = entry
+                    .p
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                p.error = Some(TurnError {
+                    code: entry.p.get("code").and_then(|c| c.as_str()).map(str::to_string),
+                    message,
+                });
+                prompt_just_recorded = false;
             }
             EntryKind::Update => {
                 // Deserialized from a BORROWED `&Value`, not a cloned one: this
@@ -430,9 +485,21 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
 
 fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &mut usize) {
     let Some(p) = pending.take() else { return };
-    if !p.has_content {
+    // A turn that produced nothing but an error, or nothing at all before its
+    // recorded end, is still a turn: the live stream showed the failure (or
+    // the empty reply), so history must too. Only a turn with neither content
+    // nor a recorded ending — a replay fragment — is dropped.
+    if !p.has_content && p.error.is_none() && p.stop_reason.is_none() {
         return;
     }
+    let outcome = match (p.stop_reason, p.error) {
+        (None, None) => None,
+        (stop_reason, error) => Some(TurnOutcome {
+            stop_reason: stop_reason
+                .unwrap_or_else(|| if error.is_some() { "error".into() } else { "unknown".into() }),
+            error,
+        }),
+    };
     turns.push(MessageTurn {
         id: format!("acp-{seq}"),
         role: TurnRole::Assistant,
@@ -444,12 +511,18 @@ fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &
             .or_else(|| p.last_at_ms.checked_sub(p.started_at_ms)),
         model: p.model,
         completed_at: Some(epoch_ms_to_utc(p.last_at_ms)),
-    agent_message_id: None,
+        agent_message_id: None,
+        outcome,
     });
     *seq += 1;
 }
 
 fn apply_turn_end(pending: &mut PendingTurn, payload: &serde_json::Value) {
+    if let Some(reason) = payload.get("stopReason").and_then(|v| v.as_str()) {
+        if !reason.is_empty() {
+            pending.stop_reason = Some(reason.to_string());
+        }
+    }
     if let Some(ms) = payload.get("durationMs").and_then(|v| v.as_u64()) {
         pending.duration_ms = Some(ms);
     }
@@ -543,6 +616,7 @@ fn apply_update(
                         model: None,
                         completed_at: None,
                     agent_message_id: None,
+                        outcome: None,
                     });
                     *seq += 1;
                 }
@@ -1184,6 +1258,126 @@ mod tests {
         let stats = session_stats(&turns).expect("stats");
         assert_eq!(stats.total_tokens, Some(15));
         assert_eq!(stats.total_duration_ms, 42);
+    }
+
+    /// A recorded prompt keeps the user's attachments in order: images as
+    /// `Image`, everything else as `ResourceLink` (name + uri). Before, a
+    /// resource link vanished and a reloaded conversation showed a bare text
+    /// prompt where the live view had shown the files.
+    #[test]
+    fn prompt_attachments_survive_as_image_and_resource_link_blocks() {
+        let entries = vec![entry(
+            1,
+            EntryKind::Prompt,
+            serde_json::json!([
+                { "type": "text", "text": "look at these" },
+                { "type": "image", "data": "QUJD", "mimeType": "image/png", "uri": "https://x/a.png" },
+                { "type": "resource_link", "uri": "https://x/spec.pdf", "name": "spec.pdf", "mimeType": "application/pdf" },
+                { "type": "resource_link", "uri": "https://x/noname" },
+                { "type": "resource_link", "uri": "" },
+            ]),
+        )];
+        let turns = project_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let blocks = &turns[0].blocks;
+        assert_eq!(blocks.len(), 4, "empty uri is dropped, the rest kept: {blocks:?}");
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "look at these"));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Image { uri: Some(u), mime_type, .. } if u == "https://x/a.png" && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &blocks[2],
+            ContentBlock::ResourceLink { uri, name, mime_type: Some(m) }
+                if uri == "https://x/spec.pdf" && name == "spec.pdf" && m == "application/pdf"
+        ));
+        // No name → the uri stands in, so the block never renders nameless.
+        assert!(matches!(
+            &blocks[3],
+            ContentBlock::ResourceLink { uri, name, mime_type: None } if uri == "https://x/noname" && name == uri
+        ));
+    }
+
+    /// The `TurnEnd` stop reason and an in-turn `Error` line both land on the
+    /// turn's `outcome`, which is what lets a reloaded conversation show the
+    /// same cancelled / failed state the live stream did.
+    #[test]
+    fn stop_reason_and_in_turn_error_land_on_outcome() {
+        let entries = vec![
+            prompt(1, "hi"),
+            update(2, text_chunk("agent_message_chunk", "partial")),
+            entry(
+                3,
+                EntryKind::Error,
+                serde_json::json!({ "message": "agent died", "code": "process_exited", "terminal": true }),
+            ),
+            entry(4, EntryKind::TurnEnd, serde_json::json!({ "stopReason": "cancelled" })),
+            prompt(5, "again"),
+            update(6, text_chunk("agent_message_chunk", "fine")),
+            entry(7, EntryKind::TurnEnd, serde_json::json!({ "stopReason": "end_turn" })),
+        ];
+        let turns = project_turns(&entries);
+        assert_eq!(turns.len(), 4);
+        let failed = turns[1].outcome.as_ref().expect("failed turn has an outcome");
+        assert_eq!(failed.stop_reason, "cancelled");
+        let err = failed.error.as_ref().expect("error kept");
+        assert_eq!(err.message, "agent died");
+        assert_eq!(err.code.as_deref(), Some("process_exited"));
+        // The partial text is still there — the error is added, not substituted.
+        assert!(matches!(&turns[1].blocks[0], ContentBlock::Text { text } if text == "partial"));
+        let ok = turns[3].outcome.as_ref().expect("clean turn has an outcome too");
+        assert_eq!(ok.stop_reason, "end_turn");
+        assert!(ok.error.is_none());
+    }
+
+    /// An agent that fails before producing a single chunk still yields an
+    /// assistant turn — empty blocks, error on the outcome — instead of the
+    /// prompt hanging with no reply at all. Without a `TurnEnd` (the prompt
+    /// was rejected, so none was recorded) the stop reason defaults to
+    /// `error`; the next prompt closes the turn.
+    #[test]
+    fn error_before_any_output_still_yields_a_failed_turn() {
+        let entries = vec![
+            prompt(1, "hi"),
+            entry(2, EntryKind::Error, serde_json::json!({ "message": "prompt rejected", "terminal": true })),
+            prompt(3, "retry"),
+            update(4, text_chunk("agent_message_chunk", "ok")),
+            entry(5, EntryKind::TurnEnd, serde_json::json!({ "stopReason": "end_turn" })),
+        ];
+        let turns = project_turns(&entries);
+        assert_eq!(turns.len(), 4, "{turns:?}");
+        assert!(matches!(turns[1].role, TurnRole::Assistant));
+        assert!(turns[1].blocks.is_empty());
+        let outcome = turns[1].outcome.as_ref().expect("outcome");
+        assert_eq!(outcome.stop_reason, "error");
+        assert_eq!(outcome.error.as_ref().map(|e| e.message.as_str()), Some("prompt rejected"));
+        // The turn's span starts at the prompt, like every other turn.
+        assert_eq!(turns[1].timestamp, epoch_ms_to_utc(1));
+        assert!(turns[3].outcome.as_ref().is_some_and(|o| o.error.is_none()));
+    }
+
+    /// A prompt whose turn ended with no output at all yields an empty
+    /// assistant turn carrying the stop reason, so a reader can tell "the
+    /// agent answered nothing" from "the transcript is missing a turn".
+    #[test]
+    fn turn_end_without_output_yields_an_empty_turn_with_outcome() {
+        let entries = vec![
+            prompt(1, "hi"),
+            entry(2, EntryKind::TurnEnd, serde_json::json!({ "stopReason": "end_turn", "durationMs": 7 })),
+            prompt(3, "hello?"),
+            update(4, text_chunk("agent_message_chunk", "hi!")),
+            entry(5, EntryKind::TurnEnd, serde_json::json!({ "stopReason": "end_turn" })),
+        ];
+        let turns = project_turns(&entries);
+        assert_eq!(turns.len(), 4, "{turns:?}");
+        assert!(matches!(turns[1].role, TurnRole::Assistant));
+        assert!(turns[1].blocks.is_empty());
+        assert_eq!(turns[1].outcome.as_ref().map(|o| o.stop_reason.as_str()), Some("end_turn"));
+        assert_eq!(turns[1].duration_ms, Some(7));
+        // Replay-hydrated transcripts have no TurnEnd lines, so a trailing
+        // prompt with nothing after it still yields no phantom turn.
+        let replay = vec![prompt(1, "hi")];
+        assert_eq!(project_turns(&replay).len(), 1);
     }
 
     /// The write-side whitelist and the read-side match arms are two

@@ -164,6 +164,38 @@ pub enum ContentBlock {
     Thinking {
         text: String,
     },
+    /// A non-image attachment the user sent with a prompt, kept as the
+    /// `resource_link` block codeg forwarded (the file itself lives wherever
+    /// `uri` points). Only user turns recorded by codeg's own ACP transcript
+    /// carry it; every native parser leaves attachments out.
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
+/// How an assistant turn ended, as codeg's own ACP transcript recorded it.
+/// Native parsers leave it `None`: their stores carry no stop reason, and a
+/// guessed one would render as fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnOutcome {
+    /// ACP stop reason (`end_turn`, `cancelled`, `refusal`, `max_tokens`,
+    /// `max_turn_requests`, `auth_required`, `unknown`).
+    pub stop_reason: String,
+    /// The error codeg surfaced for this turn, when the turn failed. Recorded
+    /// from the same `Error` event the live stream carried, so a reloaded
+    /// conversation shows the failure the user saw while it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TurnError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,4 +279,8 @@ pub struct MessageTurn {
     /// synthesized turns, which name nothing the agent stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message_id: Option<String>,
+    /// How the turn ended (stop reason + surfaced error). Only assistant turns
+    /// read from codeg's own ACP transcript have it; see [`TurnOutcome`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TurnOutcome>,
 }

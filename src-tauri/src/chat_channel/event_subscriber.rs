@@ -682,6 +682,7 @@ mod permission_push_tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         }
     }
@@ -962,6 +963,7 @@ mod permission_push_tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         };
         process_envelope(
@@ -1010,6 +1012,7 @@ mod permission_push_tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                duration_ms: None,
             },
         };
         process_envelope(

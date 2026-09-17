@@ -1499,6 +1499,7 @@ mod route_sanitizer_tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+            outcome: None,
         }
     }
 
@@ -1856,6 +1857,7 @@ mod tests {
             model: None,
             completed_at: Some(base + chrono::Duration::seconds(end_s)),
         agent_message_id: None,
+            outcome: None,
         }
     }
 
@@ -2161,6 +2163,7 @@ mod tests {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+                outcome: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2177,6 +2180,7 @@ mod tests {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+                outcome: None,
             },
         ];
 
