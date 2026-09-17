@@ -141,8 +141,9 @@ pub(crate) fn resolve_deepseek_attachments_root() -> PathBuf {
 /// ```text
 /// $DSH_HOME/sessions/               (default ~/.dsh/sessions; whole root
 /// └── <munged cwd>/                  relocatable via DEEPSEEK_ACP_SESSIONS_ROOT)
-///     └── <session uuid>/
-///         └── session.jsonl.zstd    # or session.jsonl when compression=none
+///     └── <session uuid>/            # official `dsh` launcher: `session-<uuid>/`
+///         └── session.jsonl.zstd    # official launcher ≥0.1.6: session.v3.jsonl.zstd;
+///                                   # or session.jsonl when compression=none
 /// ```
 ///
 /// The `.zstd` file is a sequence of complete Zstandard frames (one appended
@@ -302,13 +303,21 @@ impl DeepSeekParser {
         }
     }
 
-    /// Locate the `<session uuid>` directory matching `conversation_id` across
-    /// the `base_dir/<munged cwd>/` buckets (two shallow levels).
+    /// Locate the session directory matching `conversation_id` across the
+    /// `base_dir/<munged cwd>/` buckets (two shallow levels). The official
+    /// launcher names the directory `session-<uuid>` while `deepseek-acp`
+    /// uses the bare uuid, so both spellings are tried for either input.
     fn find_session_dir(&self, conversation_id: &str) -> Option<PathBuf> {
+        let alternate = match conversation_id.strip_prefix(SESSION_DIR_PREFIX) {
+            Some(bare) => bare.to_string(),
+            None => format!("{SESSION_DIR_PREFIX}{conversation_id}"),
+        };
         for bucket in read_subdirs(&self.base_dir) {
-            let candidate = bucket.join(conversation_id);
-            if candidate.is_dir() {
-                return Some(candidate);
+            for name in [conversation_id, alternate.as_str()] {
+                let candidate = bucket.join(name);
+                if candidate.is_dir() {
+                    return Some(candidate);
+                }
             }
         }
         None
@@ -382,14 +391,34 @@ struct SessionParse {
     content_events: u32,
 }
 
-/// Read a session's log text: the Zstandard file when present, else the
-/// plaintext `session.jsonl` written by a `compression: "none"` deployment.
+/// Directory-name prefix the official `dsh` launcher gives a session
+/// (`session-<uuid>`); `deepseek-acp` writes the bare uuid.
+pub(crate) const SESSION_DIR_PREFIX: &str = "session-";
+
+/// Log file names in preference order: the official launcher's v3 file, the
+/// bridge's file, then the plaintext variants of a `compression: "none"`
+/// deployment. Both `.zstd` files are the same multi-frame encoding.
+const SESSION_LOG_FILE_NAMES: &[(&str, bool)] = &[
+    ("session.v3.jsonl.zstd", true),
+    ("session.jsonl.zstd", true),
+    ("session.v3.jsonl", false),
+    ("session.jsonl", false),
+];
+
+/// Read a session's log text from the first log file present.
 fn read_session_log_text(session_dir: &Path) -> Option<String> {
-    let zstd_path = session_dir.join("session.jsonl.zstd");
-    match fs::read(&zstd_path) {
-        Ok(bytes) => decode_zstd_frames_prefix(&bytes),
-        Err(_) => fs::read_to_string(session_dir.join("session.jsonl")).ok(),
+    for (name, compressed) in SESSION_LOG_FILE_NAMES {
+        let path = session_dir.join(name);
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        return if *compressed {
+            decode_zstd_frames_prefix(&bytes)
+        } else {
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        };
     }
+    None
 }
 
 /// Decode every complete Zstandard frame, KEEPING the prefix when the stream
@@ -1745,6 +1774,30 @@ mod tests {
         let total = stats.total_usage.expect("usage");
         assert_eq!(total.input_tokens, 1514 + 111);
         assert_eq!(total.output_tokens, 49 + 100);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The official `dsh` launcher (≥0.1.6): `session-<uuid>/session.v3.jsonl.zstd`.
+    #[test]
+    fn lists_and_loads_a_v3_launcher_session_under_either_id_spelling() {
+        let dir = std::env::temp_dir().join(format!("deepseek-parser-v3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bare = "0126397e-97b1-4420-a564-bffe4453915b";
+        let prefixed = format!("session-{bare}");
+        let session_dir = dir.join("--home-ubuntu-ws--").join(&prefixed);
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        let bytes = zstd::stream::encode_all(sample_log().as_bytes(), 0).expect("frame");
+        fs::write(session_dir.join("session.v3.jsonl.zstd"), bytes).expect("write v3");
+
+        let parser = DeepSeekParser::with_base_dir(dir.clone());
+        let conversations = parser.list_conversations().expect("list");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, prefixed, "the directory name is the id");
+        assert_eq!(conversations[0].message_count, 2);
+
+        assert_eq!(parser.get_conversation(&prefixed).expect("prefixed").turns.len(), 2);
+        assert_eq!(parser.get_conversation(bare).expect("bare").turns.len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

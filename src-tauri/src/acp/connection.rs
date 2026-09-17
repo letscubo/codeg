@@ -1261,7 +1261,7 @@ pub(crate) fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> 
 /// Ensure a custom agent's transcript file exists with its header. No-op for
 /// built-ins, and idempotent per session (a reconnect keeps the original
 /// header, so the session's original cwd/start time survive).
-fn record_transcript_header(agent_type: AgentType, session_id: &str, cwd: &str) {
+pub(crate) fn record_transcript_header(agent_type: AgentType, session_id: &str, cwd: &str) {
     drop(queue_transcript_header(agent_type, session_id, cwd, None));
 }
 
@@ -1339,7 +1339,7 @@ fn queue_transcript_header(
 /// end, which is the other place codeg waits). A prompt happens once per turn,
 /// so closing it costs one disk write per turn — nothing the user can perceive,
 /// against a failure that is permanent and silent.
-async fn record_prompt(agent_type: AgentType, session_id: &str, blocks: &[ContentBlock]) {
+pub(crate) async fn record_prompt(agent_type: AgentType, session_id: &str, blocks: &[ContentBlock]) {
     let Some(dir) = transcript_dir_for(agent_type) else {
         return;
     };
@@ -1362,7 +1362,7 @@ async fn record_prompt(agent_type: AgentType, session_id: &str, blocks: &[Conten
 /// right after `TurnComplete`; without it, a reopened conversation could be
 /// read before the final lines were flushed. The bound means a stalled writer
 /// delays nothing more than this.
-async fn record_turn_end(
+pub(crate) async fn record_turn_end(
     agent_type: AgentType,
     session_id: &str,
     stop_reason: &str,
@@ -1410,7 +1410,7 @@ fn record_turn_error(agent_type: AgentType, session_id: &str, event: &AcpEvent) 
     }
 }
 
-fn record_turn_error_raw(
+pub(crate) fn record_turn_error_raw(
     agent_type: AgentType,
     session_id: &str,
     message: String,
@@ -1504,7 +1504,7 @@ fn queue_transcript_update(
 ///
 /// The ack is dropped: streamed chunks must never make the live read loop wait.
 /// Turn boundaries are the only place the live path bound-waits.
-fn record_transcript_update(agent_type: AgentType, session_id: &str, update: &SessionUpdate) {
+pub(crate) fn record_transcript_update(agent_type: AgentType, session_id: &str, update: &SessionUpdate) {
     drop(queue_transcript_update(agent_type, session_id, update));
 }
 
@@ -4597,7 +4597,7 @@ fn companion_features_arg(flags: CompanionFeatureFlags) -> Option<String> {
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
 /// stash for revocation, plus whether the `check_user_feedback` tool was exposed
 /// to this agent (so the session can gate submit + UI on its real capability).
-struct CompanionInjection {
+pub(crate) struct CompanionInjection {
     token: String,
     feedback_available: bool,
     /// Whether the `delegate_to_agent` tool group was exposed this launch.
@@ -4624,6 +4624,21 @@ async fn inject_codeg_mcp(
     .await
 }
 
+/// How to launch the `codeg-mcp` companion for one connection: the binary and
+/// its argv (every identifier travels as a flag; no env is needed). Shared by
+/// the ACP path (which wraps it in an `McpServerStdio`) and the CLI transport
+/// (which writes it into the harness profile patch, `acp::cli::dsh_profile`).
+#[derive(Debug, Clone)]
+pub(crate) struct CompanionLaunchSpec {
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    /// The per-launch token registered with the delegation listener; the
+    /// owner revokes it when the connection ends.
+    pub token: String,
+    pub feedback_available: bool,
+    pub delegation_enabled: bool,
+}
+
 async fn inject_codeg_mcp_with_binary_locator<F>(
     servers: &mut Vec<McpServer>,
     injection: &DelegationInjection,
@@ -4633,6 +4648,38 @@ async fn inject_codeg_mcp_with_binary_locator<F>(
     host_tools: HostToolsPolicy,
     locate_binary: F,
 ) -> Option<CompanionInjection>
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    let spec = companion_launch_spec(
+        injection,
+        parent_connection_id,
+        working_dir,
+        tasks_enabled,
+        host_tools,
+        locate_binary,
+    )
+    .await?;
+    let server = McpServerStdio::new("codeg-mcp", spec.command.clone()).args(spec.args.clone());
+    servers.push(McpServer::Stdio(server));
+    Some(CompanionInjection {
+        token: spec.token,
+        feedback_available: spec.feedback_available,
+        delegation_enabled: spec.delegation_enabled,
+    })
+}
+
+/// Decide whether this connection gets the companion and, if so, register its
+/// token and build the launch spec. `None` when no feature is enabled or the
+/// binary is missing (both logged where they matter).
+pub(crate) async fn companion_launch_spec<F>(
+    injection: &DelegationInjection,
+    parent_connection_id: &str,
+    working_dir: &Path,
+    tasks_enabled: bool,
+    host_tools: HostToolsPolicy,
+    locate_binary: F,
+) -> Option<CompanionLaunchSpec>
 where
     F: FnOnce() -> Option<PathBuf>,
 {
@@ -4717,7 +4764,6 @@ where
             },
         )
         .await;
-    let mut server = McpServerStdio::new("codeg-mcp", binary_path.clone());
     let mut args = vec![
         "--parent-connection-id".to_string(),
         parent_connection_id.to_string(),
@@ -4743,9 +4789,9 @@ where
         args.push("--disabled-agents".to_string());
         args.push(disabled_builtins.join(","));
     }
-    server = server.args(args);
-    servers.push(McpServer::Stdio(server));
-    Some(CompanionInjection {
+    Some(CompanionLaunchSpec {
+        command: binary_path,
+        args,
         token,
         feedback_available: feedback_enabled,
         delegation_enabled: flags.delegation,
@@ -7962,7 +8008,7 @@ fn normalize_grok_image_blocks(blocks: Vec<PromptInputBlock>) -> Vec<PromptInput
         .collect()
 }
 
-fn map_prompt_blocks(blocks: Vec<PromptInputBlock>) -> Vec<ContentBlock> {
+pub(crate) fn map_prompt_blocks(blocks: Vec<PromptInputBlock>) -> Vec<ContentBlock> {
     blocks
         .into_iter()
         .map(|block| match block {

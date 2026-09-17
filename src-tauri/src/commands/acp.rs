@@ -12187,6 +12187,48 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 }
             }
 
+            // Companion packages (the DeepSeek `dsh` launcher for the CLI
+            // transport) ride along with the adapter: same pin discipline, no
+            // latest-channel fallback, and a failure fails the install because
+            // the CLI transport is the reason the package is listed.
+            for companion in registry::companion_distributions(agent_type) {
+                let registry::AgentDistribution::Npx {
+                    package: companion_package,
+                    cmd: companion_cmd,
+                    ..
+                } = companion
+                else {
+                    continue;
+                };
+                if clean_first {
+                    let name = package_name_from_spec(companion_package);
+                    emit_agent_install_event(
+                        emitter,
+                        &task_id,
+                        AgentInstallEventKind::Log,
+                        format!("$ npm uninstall -g {name} (clean reinstall)"),
+                    );
+                    if let Err(e) = uninstall_npm_global_package(companion_package).await {
+                        emit_agent_install_event(
+                            emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            format!("(warning) uninstall step failed, continuing: {e}"),
+                        );
+                    }
+                }
+                let (companion_spec, _) = npm_install_attempts(companion_package, None, false)?;
+                emit_agent_install_event(
+                    emitter,
+                    &task_id,
+                    AgentInstallEventKind::Log,
+                    format!("Installing the {companion_cmd} launcher ({companion_spec})"),
+                );
+                install_npm_global_package_streaming(&companion_spec, &task_id, emitter)
+                    .await
+                    .map_err(|e| annotate_npm_bootstrap_failure(&companion_spec, e))?;
+            }
+
             emit_agent_install_event(
                 emitter,
                 &task_id,

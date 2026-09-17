@@ -1,9 +1,13 @@
-//! fork(letscubo)专属: Claude Code CLI transport — `cli_prompt` / `cli_cancel`.
+//! fork(letscubo)专属: CLI transport (Claude Code, DeepSeek Harness) —
+//! `cli_prompt` / `cli_cancel`.
 //!
 //! `cli_prompt` folds `acp_connect` + `acp_prompt` into one call: without a
 //! `connectionId` it registers (or reuses) a CLI connection, then admits the
 //! prompt through the same manager path `acp_prompt` uses. Error messages start
 //! with a stable machine code (`transport_mismatch: …`) for callers to match.
+//! For `deepseek` the first turn has no session id yet (the harness mints
+//! `session-<uuid>` when the process starts), so `sessionId` in the result is
+//! `null` until the `session_started` event has been applied.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -12,7 +16,7 @@ use std::sync::Arc;
 use axum::{extract::Extension, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::acp::cli::{binary, CliConnectError, CliConnectRequest, CliConnection};
+use crate::acp::cli::{binary, dsh_binary, CliConnectError, CliConnectRequest, CliConnection};
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::ConnectionTransport;
@@ -40,6 +44,9 @@ pub struct CliPromptParams {
     pub client_message_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider route for `model` (deepseek: the `agent-default-model` patch).
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub runtime_env: Option<BTreeMap<String, String>>,
 }
@@ -162,7 +169,7 @@ pub(crate) async fn reject_cli_connection(
     match manager.connection_transport(connection_id).await {
         Some(ConnectionTransport::Cli) => Err(coded_invalid(
             code,
-            "this connection uses the Claude Code CLI transport; use cli_prompt / cli_cancel",
+            "this connection uses the CLI transport; use cli_prompt / cli_cancel",
         )),
         _ => Ok(()),
     }
@@ -178,10 +185,12 @@ async fn connect(
             "agentType is required when connectionId is omitted",
         )
     })?;
-    if agent_type != AgentType::ClaudeCode {
+    if !CLI_TRANSPORT_AGENTS.contains(&agent_type) {
         return Err(coded_invalid(
             "unsupported_agent",
-            format!("{agent_type} is not supported by the CLI transport; only claude_code is"),
+            format!(
+                "{agent_type} is not supported by the CLI transport; supported: claude_code, deepseek"
+            ),
         ));
     }
     let working_dir = params
@@ -203,9 +212,7 @@ async fn connect(
         ));
     }
     if let Some(session_id) = params.session_id.as_deref() {
-        if uuid::Uuid::parse_str(session_id).is_err() {
-            return Err(coded_invalid("invalid_params", "sessionId must be a UUID"));
-        }
+        validate_cli_session_id(agent_type, session_id)?;
     }
 
     let mut runtime_env = acp_commands::build_session_runtime_env(
@@ -219,9 +226,11 @@ async fn connect(
     if let Some(extra) = &params.runtime_env {
         runtime_env.extend(extra.clone());
     }
-    let executable = binary::resolve_claude_executable(&runtime_env)
-        .await
-        .map_err(|e| AppCommandError::dependency_missing(format!("cli_not_installed: {e}")))?;
+    let executable = match agent_type {
+        AgentType::DeepSeek => dsh_binary::resolve_dsh_executable(&runtime_env).await,
+        _ => binary::resolve_claude_executable(&runtime_env).await,
+    }
+    .map_err(|e| AppCommandError::dependency_missing(format!("cli_not_installed: {e}")))?;
 
     state
         .connection_manager
@@ -232,6 +241,8 @@ async fn connect(
                 session_id: params.session_id.clone(),
                 runtime_env,
                 executable,
+                provider: params.provider.clone(),
+                model: params.model.clone(),
             },
             state.emitter.clone(),
         )
@@ -240,7 +251,41 @@ async fn connect(
             CliConnectError::SessionLocked { connection_id } => AppCommandError::already_exists(
                 format!("session_locked: this session is held by connection {connection_id}"),
             ),
+            CliConnectError::ProfileWriteFailed(message) => {
+                AppCommandError::configuration_missing(format!("dsh_profile_failed: {message}"))
+            }
         })
+}
+
+/// Agents the CLI transport can drive. Adding one needs a driver in
+/// `acp::cli` and a binary resolver.
+const CLI_TRANSPORT_AGENTS: &[AgentType] = &[AgentType::ClaudeCode, AgentType::DeepSeek];
+
+/// Claude session ids are bare uuids; the official DeepSeek Harness launcher
+/// mints `session-<uuid>` and only continues an id in that exact spelling.
+fn validate_cli_session_id(agent_type: AgentType, session_id: &str) -> Result<(), AppCommandError> {
+    match agent_type {
+        AgentType::DeepSeek => {
+            let ok = session_id
+                .strip_prefix("session-")
+                .is_some_and(|rest| uuid::Uuid::parse_str(rest).is_ok());
+            if ok {
+                Ok(())
+            } else {
+                Err(coded_invalid(
+                    "invalid_params",
+                    "sessionId must be `session-<uuid>` for deepseek",
+                ))
+            }
+        }
+        _ => {
+            if uuid::Uuid::parse_str(session_id).is_ok() {
+                Ok(())
+            } else {
+                Err(coded_invalid("invalid_params", "sessionId must be a UUID"))
+            }
+        }
+    }
 }
 
 async fn ensure_cli_connection(
@@ -272,4 +317,26 @@ fn connection_not_found(connection_id: &str) -> AppCommandError {
 
 fn coded_invalid(code: &str, message: impl std::fmt::Display) -> AppCommandError {
     AppCommandError::invalid_input(format!("{code}: {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_shape_depends_on_the_agent() {
+        let uuid = "55960ec1-365e-4af9-8681-e6576043af2d";
+        assert!(validate_cli_session_id(AgentType::ClaudeCode, uuid).is_ok());
+        assert!(validate_cli_session_id(AgentType::ClaudeCode, "session-x").is_err());
+        assert!(validate_cli_session_id(AgentType::DeepSeek, &format!("session-{uuid}")).is_ok());
+        assert!(validate_cli_session_id(AgentType::DeepSeek, uuid).is_err());
+        assert!(validate_cli_session_id(AgentType::DeepSeek, "session-nope").is_err());
+    }
+
+    #[test]
+    fn cli_transport_allow_list() {
+        assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::ClaudeCode));
+        assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::DeepSeek));
+        assert!(!CLI_TRANSPORT_AGENTS.contains(&AgentType::Codex));
+    }
 }

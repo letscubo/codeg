@@ -32,15 +32,15 @@ use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessag
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
-const STDERR_TAIL_BYTES: usize = 64 * 1024;
-const MAX_CONSECUTIVE_UNPARSABLE: usize = 50;
-const PROTOCOL_SAMPLE_BYTES: usize = 2048;
+pub(super) const STDERR_TAIL_BYTES: usize = 64 * 1024;
+pub(super) const MAX_CONSECUTIVE_UNPARSABLE: usize = 50;
+pub(super) const PROTOCOL_SAMPLE_BYTES: usize = 2048;
 /// How long a CLI that already printed its `result` gets to exit on its own.
-const EXIT_WAIT: Duration = Duration::from_secs(5);
+pub(super) const EXIT_WAIT: Duration = Duration::from_secs(5);
 /// SIGTERM → SIGKILL escalation window. claude exits within ~0.5s of SIGTERM
 /// and takes its tool processes with it.
-const TERMINATE_GRACE: Duration = Duration::from_secs(3);
-const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
+pub(super) const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+pub(super) const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 const BASE_ARGS: &[&str] = &[
@@ -381,7 +381,7 @@ impl CliDriver {
     }
 }
 
-fn reject_unsupported(command: ConnectionCommand) {
+pub(super) fn reject_unsupported(command: ConnectionCommand) {
     match command {
         ConnectionCommand::GoalControl { reply, .. } => {
             if let Some(reply) = reply {
@@ -410,7 +410,7 @@ fn reject_unsupported(command: ConnectionCommand) {
 
 fn unsupported() -> AcpError {
     AcpError::Protocol(
-        "unsupported_for_cli: not available on the Claude Code CLI transport".to_string(),
+        "unsupported_for_cli: not available on the CLI transport".to_string(),
     )
 }
 
@@ -477,7 +477,7 @@ pub(crate) fn transcript_exists(claude_config_dir: &Path, session_id: &str) -> b
         .any(|entry| entry.path().join(&file_name).is_file())
 }
 
-async fn wait_or_terminate(child: &mut Child, pid: u32) -> String {
+pub(super) async fn wait_or_terminate(child: &mut Child, pid: u32) -> String {
     match tokio::time::timeout(EXIT_WAIT, child.wait()).await {
         Ok(Ok(status)) => describe_status(status),
         Ok(Err(e)) => format!("wait failed: {e}"),
@@ -488,7 +488,7 @@ async fn wait_or_terminate(child: &mut Child, pid: u32) -> String {
     }
 }
 
-async fn terminate(child: &mut Child, pid: u32) {
+pub(super) async fn terminate(child: &mut Child, pid: u32) {
     #[cfg(unix)]
     signal_group(pid, libc::SIGTERM);
     #[cfg(not(unix))]
@@ -525,7 +525,7 @@ fn signal_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-fn describe_status(status: std::process::ExitStatus) -> String {
+pub(super) fn describe_status(status: std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
         return format!("exit code {code}");
     }
@@ -539,7 +539,7 @@ fn describe_status(status: std::process::ExitStatus) -> String {
     "unknown exit status".to_string()
 }
 
-fn truncate(s: &str, max_bytes: usize) -> String {
+pub(super) fn truncate(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -551,13 +551,13 @@ fn truncate(s: &str, max_bytes: usize) -> String {
 }
 
 #[derive(Default)]
-struct OutputTail {
+pub(super) struct OutputTail {
     lines: VecDeque<String>,
     bytes: usize,
 }
 
 impl OutputTail {
-    fn push(&mut self, line: String) {
+    pub(super) fn push(&mut self, line: String) {
         self.bytes += line.len() + 1;
         self.lines.push_back(line);
         while self.bytes > STDERR_TAIL_BYTES {
@@ -571,7 +571,7 @@ impl OutputTail {
         }
     }
 
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         self.lines
             .iter()
             .map(String::as_str)

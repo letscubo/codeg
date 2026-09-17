@@ -330,6 +330,26 @@ pub struct AcpAdapterRelation {
     pub docs_url: &'static str,
 }
 
+/// Packages installed beside an agent's ACP adapter for codeg's own use. For
+/// DeepSeek that is the official `dsh` launcher: the CLI transport drives
+/// `dsh --profile headless` directly, which `deepseek-acp` (the ACP bridge)
+/// does not ship. `--json` / `--session-id` need ≥ 0.1.6-alpha.2.
+pub fn companion_distributions(agent_type: AgentType) -> &'static [AgentDistribution] {
+    match agent_type {
+        AgentType::DeepSeek => &DSH_CLI,
+        _ => &[],
+    }
+}
+
+static DSH_CLI: [AgentDistribution; 1] = [AgentDistribution::Npx {
+    version: "0.1.6-alpha.2",
+    package: "@deepseek-ai/dsh@0.1.6-alpha.2",
+    cmd: "dsh",
+    args: &[],
+    env: &[],
+    node_required: Some("22.0.0"),
+}];
+
 /// Adapter relation for an agent, or `None` when codeg's entry IS the vendor's
 /// own CLI (every agent except these two).
 ///
@@ -2068,6 +2088,19 @@ mod tests {
             "deepseek-acp@0.8.0",
             Some("22.0.0"),
         );
+        // The CLI transport needs the official launcher beside the bridge.
+        match companion_distributions(AgentType::DeepSeek) {
+            [AgentDistribution::Npx { package, cmd, .. }] => {
+                assert_eq!(*package, "@deepseek-ai/dsh@0.1.6-alpha.2");
+                assert_eq!(*cmd, "dsh");
+            }
+            other => panic!("unexpected companion spec: {other:?}"),
+        }
+        for agent in all_acp_agents() {
+            if agent != AgentType::DeepSeek {
+                assert!(companion_distributions(agent).is_empty(), "{agent}");
+            }
+        }
         assert_npx_version(
             AgentType::Qoder,
             "1.1.45",

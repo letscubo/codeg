@@ -398,7 +398,7 @@ impl ConnectionManager {
         self.chat_channel.get().map(|c| c.clone_ref())
     }
 
-    fn delegation_snapshot(&self) -> Option<crate::acp::connection::DelegationInjection> {
+    pub(crate) fn delegation_snapshot(&self) -> Option<crate::acp::connection::DelegationInjection> {
         self.delegation_injection.get().cloned()
     }
 

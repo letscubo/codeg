@@ -61,6 +61,8 @@ impl Harness {
                     session_id: None,
                     runtime_env,
                     executable,
+                    provider: None,
+                    model: None,
                 },
                 EventEmitter::Noop,
             )
@@ -71,7 +73,7 @@ impl Harness {
             dir,
             manager,
             connection_id: conn.connection_id,
-            session_id: conn.session_id,
+            session_id: conn.session_id.expect("claude connections pre-assign a session id"),
         }
     }
 
@@ -326,6 +328,8 @@ async fn a_live_session_is_reused_in_place_and_locked_elsewhere() {
         session_id: Some(h.session_id.clone()),
         runtime_env: BTreeMap::new(),
         executable: PathBuf::from("/bin/false"),
+        provider: None,
+        model: None,
     };
 
     let reused = h

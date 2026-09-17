@@ -2484,6 +2484,19 @@ pub(crate) fn deepseek_mcp_json_path_for_launch(runtime_env: &BTreeMap<String, S
 /// The parent is created `0700` when it does not exist yet, matching what the
 /// harness itself does with `$DSH_HOME`.
 fn write_deepseek_json_file(path: &Path, value: &Value) -> Result<(), AppCommandError> {
+    let serialized = serde_json::to_string_pretty(value).map_err(|e| {
+        mcp_configuration_invalid(format!(
+            "failed to serialize JSON for {}: {e}",
+            path.display()
+        ))
+    })?;
+    write_private_text_file(path, &format!("{serialized}\n")).map_err(AppCommandError::io)
+}
+
+/// The owner-only file writer behind [`write_deepseek_json_file`], shared with
+/// the CLI transport's per-connection harness patch (`acp::cli::dsh_profile`),
+/// which carries the same kind of secret.
+pub(crate) fn write_private_text_file(path: &Path, body: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             #[cfg(unix)]
@@ -2492,21 +2505,12 @@ fn write_deepseek_json_file(path: &Path, value: &Value) -> Result<(), AppCommand
                 fs::DirBuilder::new()
                     .recursive(true)
                     .mode(0o700)
-                    .create(parent)
-                    .map_err(AppCommandError::io)?;
+                    .create(parent)?;
             }
             #[cfg(not(unix))]
-            fs::create_dir_all(parent).map_err(AppCommandError::io)?;
+            fs::create_dir_all(parent)?;
         }
     }
-
-    let serialized = serde_json::to_string_pretty(value).map_err(|e| {
-        mcp_configuration_invalid(format!(
-            "failed to serialize JSON for {}: {e}",
-            path.display()
-        ))
-    })?;
-    let body = format!("{serialized}\n");
 
     #[cfg(unix)]
     {
@@ -2520,24 +2524,19 @@ fn write_deepseek_json_file(path: &Path, value: &Value) -> Result<(), AppCommand
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(path)
-                .map_err(AppCommandError::io)?;
-            return file.write_all(body.as_bytes()).map_err(AppCommandError::io);
+                .open(path)?;
+            return file.write_all(body.as_bytes());
         }
     }
 
-    fs::write(path, &body).map_err(AppCommandError::io)?;
+    fs::write(path, body)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = fs::metadata(path)
-            .map_err(AppCommandError::io)?
-            .permissions()
-            .mode();
+        let mode = fs::metadata(path)?.permissions().mode();
         if mode & 0o007 != 0 {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o770))
-                .map_err(AppCommandError::io)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o770))?;
         }
     }
 
