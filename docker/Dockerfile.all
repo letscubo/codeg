@@ -1,0 +1,377 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ghcr.io/letscubo/myclaw-all — Myclaw 多 agent 实例 (instance_kind='all') 的
+# **多 agent 镜像**(5 个上架 agent + codeg 预装)。第五条镜像线,与 openclaw / hermes / claudecode 平级。
+#
+# 与其它三条的根本区别:【预装 agent_registry 上架的 agent】(2026-08-22 决策,
+#   推翻首版"零预装"不变量 —— codeg 接入定稿后拍板:开箱即聊 + 安装产物进镜像层
+#   不占用户写层配额)。**当前只烤 5 个 enabled agent**(openclaw / claude_code /
+#   deepseek_harness_acp / hermes / pi,全 npm 系;清单同步下方 label 与 web 侧
+#   seed-agents.ts 的 ALL_IMAGE_PREINSTALLED_AGENTS)。其余 agent 上架后走运行时
+#   安装管线(数据中心网络下 npm 冷装仅 7s 实测),不再全量烤进镜像 —— 曾试过烤 14
+#   个,镜像 5.7GB;砍到 5 个省 ~2GB。版本 = 下方 ARG 的"出厂版";运行时管线
+#   (web 侧 manage-scripts.ts)仍负责升级/重装/卸载与 per-实例配置,安装路径与管线
+#   逐字对齐(npm 前缀 / /opt/acp-agents;hermes 走 npm 社区桥,见其层注),管线眼里
+#   "镜像预装"与"自己装过"无差别。
+#   ⚠️ per-实例的东西(gateway 配置 / 凭证注入 / services.d 注册)不进镜像,仍由
+#   开通流程做(codeg-access 的 seedCodegAgents:播 vm_agents 行 + 写 claude 凭证)。
+#
+# 【零 agent 常驻服务,但有一个通用的进程守护】PID1 是 tini + supervisord,
+#   而 supervisord 的 include 目录 **/etc/myclaw/services.d/ 出厂是空的** ——
+#   镜像本身不跑任何 agent 的任何东西,也不认识任何 agent。
+#
+#   它存在只为解一个问题:有些 agent 需要常驻进程(openclaw 的 gateway 就是,
+#   实测 `openclaw acp` 只是个桥,连不上 127.0.0.1:18789 就 ECONNREFUSED),
+#   而这类进程必须【装完自动起】且【容器重启自动起】。容器里没有 systemd,
+#   cron @reboot 又要先有人拉起 cron —— 只有 PID1 能兜住"重启后自动恢复"。
+#
+#   所以:agent 的安装器往 services.d 丢一段 program 定义 + supervisorctl update,
+#   卸载时删掉。装了什么由用户决定,镜像自始至终不知道。不需要常驻进程的 agent
+#   (12 个里的绝大多数)完全不碰这套东西,交互仍是纯 ACP —— myclaw-agent 的
+#   /ws/acp → docker exec <agent 的 acp 命令> → stdio NDJSON JSON-RPC。
+#
+# 那镜像里剩什么?**装 agent 需要的基础环境**,预装是为了:
+#   - npx 型 agent (12 个里占 9 个) 要 Node + npm;
+#   - binary 型要 curl/tar/unzip + sha256sum;
+#   - script 型 (hermes) 要 git + python3 + 免密 sudo;
+#   - solution 三件套 (libicu / officecli / chromium) 与其它三条镜像线拉齐 ——
+#     不预装的话每个会话首次跑 solution 都要等好几分钟装 chromium,而且装在
+#     写层的东西会被 UPGRADE (重建容器) 冲掉。
+#
+# 【这份文件随 codeg 发布】放在 letscubo/codeg 仓库、跟 codeg 一起打 tag。myclaw-deploy
+#   的打包弹窗选了哪个 codeg 版本,就拉**那个 tag 下的这份文件**原样构建;弹窗里展示的
+#   依赖版本也是解析这份文件的 `ARG V_*` 得来。所以:
+#   · 这里的 `V_*` 就是镜像装的版本,构建时不会被覆盖;
+#   · 由 codeg 固定的那几个(openclaw / claude-code / pi-acp / dsh / hermes-agent)
+#     必须与 src-tauri/src/acp/registry.rs 一致 —— `acp::image_pins_tests` 会校验,
+#     改 registry 的 pin 时同一个提交里一起改这里;
+#   · 不需要任何 COPY,构建上下文可以是空目录。
+#
+# Build args(只有这几个由 dashboard 传入,其余全用本文件的默认值):
+#   AGENT_VERSION   — 本镜像自己的版本 (日期式,如 2026.08.13);镜像 tag 用它。
+#                     沿用管线统一的 build-arg 名,但这条线**没有上游 agent 可
+#                     跟随** —— 镜像内容就是基础环境本身,版本由发布者手工定。
+#   BUILD_TIMESTAMP — 构建时间戳 (由 dashboard 传入,进 LABEL)
+#   CODEG_VERSION / CODEG_SHA256 — 弹窗里选中的 codeg release 与其 linux tarball 的
+#                     sha256(从 release 的 .sha256 资产解析)。tag 里的文件没法预知自己
+#                     那次 release 产物的 sha,所以这两个不写默认值,缺了就构建失败。
+# ─────────────────────────────────────────────────────────────────────────────
+FROM ubuntu:24.04
+
+ARG AGENT_VERSION
+ARG BUILD_TIMESTAMP=unknown
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 基础工具。这一层同时服务三条 agent 安装管线:
+#   curl/wget + ca-certificates → 所有管线的下载;
+#   git + git-lfs              → script 型 (hermes clone 源码);
+#   python3 + venv + pip       → script 型 (hermes 用 uv/venv) 与配置读写脚本;
+#   build-essential            → npm 包里的原生模块编译;
+#   unzip/zip + tar(自带)      → binary 型解包;
+#   jq/ripgrep/less/vim-tiny   → agent 在容器内自助操作的高频工具;
+#   sudo                       → 下面的免密提权;
+#   supervisor                 → 通用进程守护 (PID1,见文件头);
+#   libicu74                   → OfficeCLI(.NET 单二进制)缺它直接 FailFast。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git git-lfs jq ripgrep unzip zip less vim-tiny \
+      python3 python3-pip python3-venv build-essential sudo tini locales tzdata \
+      supervisor libicu74 \
+ && locale-gen en_US.UTF-8 \
+ && rm -rf /var/lib/apt/lists/*
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# GitHub CLI —— 多数编码类 agent 做 PR/issue/CI 操作时调的就是 `gh`
+# (官方 apt 源,ubuntu 自带源里没有)。
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/* \
+ && gh --version | head -1
+
+# Node 24 (当前 LTS)。12 个内置 agent 里 9 个是 npx 分发,其中 kimi_code 要求
+# Node ≥22.19、claude_code 要求 ≥22.0 —— 取 24 一次性满足全部,且留出余量。
+# 用 NodeSource 而非 ubuntu 源 (24.04 自带 18,过不了 nodeRequired 预检)。
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/* \
+ && node -v && npm -v
+
+# npm 全局前缀挪到 ubuntu 自己的 HOME。
+#
+# 为什么不是"让默认前缀 /usr 可写":第一版镜像 (2026.08.13) 就是那么写的 ——
+# `chown -R ubuntu:ubuntu /usr/lib/node_modules /usr/bin`,容器实测两个后果:
+#   1. **chown 会清掉 setuid 位** → sudo / su / passwd 全废
+#      (`find /usr/bin -perm -4000` 一个都不剩),免密 sudo 当场不可用,
+#      而 script 型 agent (hermes) 的 setup、solution 装系统依赖都要它;
+#   2. /usr/bin 下 559 个二进制属主变成 ubuntu → 以 ubuntu 身份跑的 agent
+#      会话(跑的是模型输出)能覆写任意系统二进制。
+# 两条都不能接受。前缀放 HOME 则一个字节都不用动 /usr。
+#
+# 谁写谁读:`npm install -g` 由 web 侧安装器以 **root** 执行(execViaAgent 显式
+# user='root'),ACP 会话与预检以 **ubuntu** 执行(镜像 USER 决定,docker exec
+# 不传 user 时就是它)。root 往 ubuntu 的目录里写没问题,装出来的 755 文件
+# ubuntu 能执行;卸载/升级同样走 root,属主始终一致。
+#
+# lib/node_modules 必须**预先建好并归 ubuntu** —— 预检项 npm_writable 是
+# `[ -w "$(npm prefix -g)/lib/node_modules" ]`,目录不存在时 -w 为假,会在
+# 你还没装任何东西时先红一条。
+ENV NPM_CONFIG_PREFIX=/home/ubuntu/.npm-global
+RUN mkdir -p /home/ubuntu/.npm-global/lib/node_modules /home/ubuntu/.npm-global/bin \
+ && chown -R ubuntu:ubuntu /home/ubuntu/.npm-global \
+ && su ubuntu -c "npm config set fund false && npm config set audit false" || true
+
+# binary 型 agent 的安装根 (web 侧 BINARY_INSTALL_ROOT = /opt/acp-agents)。
+# 预建并归属 ubuntu,免得安装脚本第一步就因为属主失败。
+RUN mkdir -p /opt/acp-agents && chown ubuntu:ubuntu /opt/acp-agents
+
+# 免密 sudo —— agent 在会话里装系统依赖时需要提权 (如 script 型 hermes 的
+# setup 脚本、solution 的 officecli 三件套)。与其它三条镜像线一致。
+RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-ubuntu-nopasswd \
+ && chmod 0440 /etc/sudoers.d/90-ubuntu-nopasswd \
+ && visudo -cf /etc/sudoers.d/90-ubuntu-nopasswd
+
+# ── solution 底座 ────────────────────────────────────────────────────────────
+# 与 openclaw / hermes / claudecode 三条镜像线拉齐,理由见文件头。
+# playwright + headless chromium —— officecli `view screenshot` 的
+# render→look→fix 闭环依赖。浏览器装到 /opt/pw-browsers 供各用户共用;
+# PLAYWRIGHT_BROWSERS_PATH 必须进 /etc/environment,否则 agent 的 shell 找不到
+# 浏览器、screenshot 静默降级 (2026-07-26 生产实测踩过)。
+# ubuntu24 PEP668 需 --break-system-packages。
+RUN pip3 install --break-system-packages -q playwright \
+ && PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers python3 -m playwright install --with-deps chromium \
+ && echo 'PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers' >> /etc/environment \
+ && rm -rf /var/lib/apt/lists/* /root/.cache/pip \
+ && test -d /opt/pw-browsers
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+
+# officecli 本体 (官方安装器,装到 ~/.local/bin)。以 ubuntu 身份装 —— solution
+# prepare 的 probe 就是 `test -x /home/ubuntu/.local/bin/officecli`。
+# 安装器会探测 runtime 决定要不要顺带装 skill;**本层必须排在预装 agent 层
+# 之前**(构建到这里时一个 agent 都还没有,探不到 runtime → 只装 CLI 本体,
+# skill 仍由 solution 的 provision 步骤按需下发)。调层序前先想清这一条。
+RUN mkdir -p /home/ubuntu/.local/bin && chown -R ubuntu:ubuntu /home/ubuntu \
+ && su ubuntu -c "curl -fsSL https://d.officecli.ai/install.sh | bash" \
+ && test -x /home/ubuntu/.local/bin/officecli \
+ && su ubuntu -c "/home/ubuntu/.local/bin/officecli --version" || true
+
+# ── 通用进程守护 ─────────────────────────────────────────────────────────────
+# supervisord 作 PID1(经 tini),include 目录**出厂为空** —— 预装的是二进制,
+# 服务注册(openclaw gateway / codeg)仍由运行时安装器/开通流程按实例做。
+# 需要常驻进程的 agent 由它的安装器往 services.d 丢一段 program 定义,再
+# `supervisorctl update`;卸载时删掉。这是 'all' 实例上「装完自动起 + 容器重启
+# 自动起」的唯一落点(容器里没有 systemd,cron @reboot 也要先有人拉起 cron)。
+#
+# ⚠️ 本镜像 `USER ubuntu`,所以 **PID1 就是 ubuntu**,supervisord 也以 ubuntu 跑:
+#   · 不能写 `user=root` —— supervisord 会试图降权然后报
+#     "Can't drop privilege as nonroot user",容器无限重启(2026-08-14 实测);
+#   · socket/pid 必须放 /tmp,不能放 /run 或 /var/run —— 那两处 root 属主 0755,
+#     ubuntu 绑不上(openclaw 实例 1.1.87 修过同一个坑);
+#   · program 段里也**不写 user=** —— 守护本身已经是 ubuntu,再指定同名用户
+#     等于要求降权,同样会被拒。
+#   · 日志 stdout/stderr 直接重定向到容器日志(nodaemon + 无轮转),
+#     `docker logs` 能看见守护本身的动静,agent 各自的日志由各自 program 段决定。
+RUN mkdir -p /etc/myclaw/services.d /var/log/myclaw \
+ && chown ubuntu:ubuntu /var/log/myclaw \
+ && printf '%s\n' \
+      '[supervisord]' \
+      'nodaemon=true' \
+      'logfile=/dev/stdout' \
+      'logfile_maxbytes=0' \
+      'pidfile=/tmp/myclaw-supervisord.pid' \
+      '' \
+      '[unix_http_server]' \
+      'file=/tmp/myclaw-supervisor.sock' \
+      'chmod=0700' \
+      '' \
+      '[rpcinterface:supervisor]' \
+      'supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface' \
+      '' \
+      '[supervisorctl]' \
+      'serverurl=unix:///tmp/myclaw-supervisor.sock' \
+      '' \
+      '[include]' \
+      'files = /etc/myclaw/services.d/*.conf' \
+      > /etc/myclaw/supervisord.conf \
+ && chmod 644 /etc/myclaw/supervisord.conf
+
+# ── codeg-server(平台多 agent 工作台 runtime,非 agent) ───────────────────────
+# letscubo/codeg fork release 单二进制(Apache 2.0,上游 xintaofei/codeg),烘入
+# 只为省每实例首开时的 43MB 现场下载;fork 自 v0.28.2 起:升级源/验签公钥指向
+# letscubo release(签名私钥 ~/.codeg-signing,发版 SOP 见 fork 仓库记忆)。
+# **不注册任何服务** —— services.d 出厂仍空,零预装 agent 不变量不受影响。
+# 进程由 web 侧 provisioning(lib/codeg/provision.ts)作为"安装器"注册进
+# services.d(与 openclaw 安装器同款姿势),配置(CODEG_TOKEN 等)也由它下发;
+# 镜像里只有二进制,不知道也不关心任何实例的凭证。
+# 升级 = 改 CODEG_VERSION/CODEG_SHA256 重建镜像(不用它的 --supervise 自更新,
+# 写层里的自更新会被 UPGRADE 冲掉,版本一律归镜像管)。
+# ⚠️ codeg.db 的 migration 是单向门:新版首启自动前滚 schema,之后旧二进制启动
+# 即拒 —— 存量实例换镜像前冷备 /home/ubuntu/.codeg/data。0.26.2 → 0.28.x 如此,
+# 0.28.x → 0.30.x 同样:新增 4 个建表迁移(remote_workspace_connection_headers /
+# folder_group / canvas_node / canvas_node_group_grid),全是 additive,但前滚后
+# 一样回不去。
+ARG CODEG_VERSION
+ARG CODEG_SHA256
+RUN test -n "${CODEG_VERSION}" && test -n "${CODEG_SHA256}" \
+ && curl -fsSL -o /tmp/codeg.tar.gz \
+      "https://github.com/letscubo/codeg/releases/download/v${CODEG_VERSION}/codeg-server-linux-x64.tar.gz" \
+ && echo "${CODEG_SHA256}  /tmp/codeg.tar.gz" | sha256sum -c - \
+ && mkdir -p /opt/codeg \
+ && tar -xzf /tmp/codeg.tar.gz -C /opt/codeg --strip-components=1 \
+ && rm /tmp/codeg.tar.gz \
+ && test -x /opt/codeg/codeg-server && test -x /opt/codeg/codeg-mcp \
+ && chown -R ubuntu:ubuntu /opt/codeg
+
+# ── 预装 agent(仅 agent_registry 上架的 5 个;2026-08-22 精简,原烤 14 个)────────
+# 只烤 enabled 的 agent(openclaw / claude_code / deepseek_harness_acp / hermes /
+# pi),全 npm 系。其余 agent 二进制不再进镜像 —— 上架后走运行时安装管线(数据
+# 中心网络下最重的 openclaw npm 冷装也仅 7s,实测),换镜像 -2GB 体积。
+# 以 ubuntu 身份装进真实前缀(~/.npm-global,root 装会产 root 属主文件的事故见
+# manage-scripts.ts)。版本全 pin。hermes 在下方单独层(npm 社区桥)。
+# 版本就是下面的 ARG 默认值,构建时不覆盖(见文件头)。V_OPENCLAW / V_CLAUDE_CODE / V_PI
+# 与 registry.rs 的 pin 一致(image_pins_tests 校验)。
+# claude_code 2026-09-18 起走 codeg 的 CLI 通道(每轮 `claude -p`),**不再装 ACP 外壳**
+# claude-agent-acp,直接装本体。
+# V_PI_RUNTIME 是 pi 本体,registry 只 pin pi-acp 适配器,本体版本由这里定。
+ARG V_OPENCLAW=2026.9.4
+ARG V_CLAUDE_CODE=2.1.276
+ARG V_PI=0.0.33
+ARG V_PI_RUNTIME=0.84.2
+RUN su ubuntu -c "npm install -g \
+      --allow-scripts=@anthropic-ai/claude-code \
+      openclaw@${V_OPENCLAW} \
+      @anthropic-ai/claude-code@${V_CLAUDE_CODE} \
+      pi-acp@${V_PI} \
+      @earendil-works/pi-coding-agent@${V_PI_RUNTIME}" \
+ && su ubuntu -c "npm cache clean --force" \
+ && rm -rf /home/ubuntu/.npm/_logs
+
+# pi 的 MCP:本体没有 MCP、pi-acp 也不转发 mcpServers,由扩展 pi-mcp-adapter 读每个 agent
+# 自己的 `$PI_CODING_AGENT_DIR/mcp.json`(MyClaw 投影写)去连。装进共享 ~/.pi/agent
+# (settings.json 的 packages + npm/),每个 agent 的 overlay 经软链共用。
+# 版本与 MyClaw overlay-agent-sync.ts 的 PI_MCP_ADAPTER_VERSION 同步 —— 存量实例由投影
+# 按那个版本补装。它只声明兼容 pi-ai ^0.84.1 / ^0.85.0,升 V_PI_RUNTIME 时要一起看。
+# registry 不管它(不是 ACP),版本由这里定。
+ARG V_PI_MCP_ADAPTER=2.34.0
+RUN su ubuntu -c "PATH=/home/ubuntu/.npm-global/bin:\$PATH pi install npm:pi-mcp-adapter@${V_PI_MCP_ADAPTER}" \
+ && su ubuntu -c "grep -q '\"version\": \"${V_PI_MCP_ADAPTER}\"' /home/ubuntu/.pi/agent/npm/node_modules/pi-mcp-adapter/package.json" \
+ && su ubuntu -c "npm cache clean --force" \
+ && rm -rf /home/ubuntu/.npm/_logs
+
+# deepseek_harness_acp:官方 DeepSeek Harness 启动器 `@deepseek-ai/dsh`。
+# 2026-09-18 起**不再装 ACP 外壳 deepseek-acp**:codeg 直接驱动 `dsh --profile headless
+# --json`(CLI 通道,一轮一进程),MCP 工具由 codeg 的 tool-search 插件按需加载。
+# `--json` / `--session-id` 要 ≥ 0.1.6-alpha.2(npm 的 latest 标签 0.1.5-rc.2 没有)。
+# 与 registry.rs 的 pin 一致(image_pins_tests 校验)。
+#
+# ⚠️ allow-scripts 必须显式给:npm 11 默认跳过依赖的安装脚本(A3 实测 npm 11.19 会打印
+#    这串放行清单),不放行这 5 个,node-pty / koffi 可能只剩空壳。清单与 codeg 安装时
+#    传的、以及 agent-registry.ts 的 allowScripts 同源。
+ARG V_DSH=0.1.6-alpha.2
+RUN su ubuntu -c "npm install -g \
+      --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
+      @deepseek-ai/dsh@${V_DSH}" \
+ && su ubuntu -c "test -x /home/ubuntu/.npm-global/bin/dsh" \
+ && su ubuntu -c "timeout 60 /home/ubuntu/.npm-global/bin/dsh --profile headless --help </dev/null | grep -q -- --json" \
+ && su ubuntu -c "npm cache clean --force" \
+ && rm -rf /home/ubuntu/.npm/_logs
+
+
+# (binary 系 opencode / cursor 未上架,2026-08-22 精简移除 —— 省 ~400MB。
+#  上架后走运行时 binary 安装管线,布局 /opt/acp-agents/<type>/<version>/ 不变。)
+
+# hermes:codeg 同款 npm 社区桥(2026-08-22 决策,替换 git 源码直装)。
+# 背景:上游已停发 PyPI wheel 且用 HERMES_NIX_BUILD 门禁封杀 git-tag 源码构建
+# (官方只支持 shell installer/Docker/Nix),git clone + setup-hermes.sh 在
+# v2026.8.3 之后走不通。`hermes-agent`(npm)是社区桥(wyrtensi/hermes-agent-npm,
+# 非 Nous 官方) —— codeg 按精确版本 pin 并逐版本审计 diff(0.20.4 已审:桥的
+# postinstall clone 官方仓库 tag v2026.8.18 并校验完整 commit SHA,用
+# checksum-pin 的 uv 建隔离 Python 3.11 venv,uv sync --locked --extra all,
+# 全部落在 npm 包目录内;hermes bin exec venv 里官方 console script,
+# `hermes acp` 与官方安装等价)。**升版本必须重新审计桥的 diff** —— 精确 pin
+# 就是第三方信任面的边界。config/凭证仍在 ~/.hermes(运行时per-实例)。
+# 以 ubuntu 装:postinstall 的 venv/克隆全在 ubuntu 属主目录,零 root 残留。
+# 与 registry.rs 的 pin 一致(image_pins_tests 校验)—— 升这个版本就是在 codeg 里同时
+# 改 registry 和这里,审计桥的 diff 放在那次改动里做。
+ARG V_HERMES_BRIDGE=0.21.3
+RUN su ubuntu -c "npm install -g hermes-agent@${V_HERMES_BRIDGE}" \
+ && su ubuntu -c "timeout 120 /home/ubuntu/.npm-global/bin/hermes --version </dev/null" \
+ && su ubuntu -c "npm cache clean --force"
+
+# git 默认身份 —— 不设的话 agent 一 commit 就撞 "Please tell me who you are"。
+RUN git config --system user.name "MyClaw Agent" \
+ && git config --system user.email "agent@myclaw.ai" \
+ && git config --system init.defaultBranch main \
+ && git config --system --add safe.directory '*'
+
+# 平台侧目录:
+#   ~/.myclaw          — 平台自己的命名空间 (会话目录、delivery.env、
+#                        以及网关凭据 gateway.json —— 没有 openclaw 的实例
+#                        靠它拿平台 key,见 web 侧 native-config 的 platform_key)
+#   ~/.myclaw/skills   — skill 共享库真身 (各 agent 的 skills 目录放符号链接)
+#   ~/workspace        — 默认工作区
+RUN mkdir -p /home/ubuntu/.myclaw/skills /home/ubuntu/workspace \
+ && chown -R ubuntu:ubuntu /home/ubuntu/.myclaw /home/ubuntu/workspace \
+ && chmod 700 /home/ubuntu/.myclaw
+
+# 构建期自校验。四条不变量,任一条不满足就让构建失败 —— 都是踩过之后写下来的:
+#
+#   ① 基础环境齐备(三条安装管线 + solution 底座的依赖)。
+#   ② **零预装 agent** —— 这条镜像线的核心不变量。
+#   ③ **系统提权面完好**。2026.08.13 首版就栽在这儿:为了让 npm 全局目录对
+#      ubuntu 可写而 `chown -R ubuntu /usr/bin`,连带清掉了全部 setuid 位
+#      (sudo 直接不可用),559 个系统二进制归了 ubuntu。构建期挡住,别靠人眼。
+#   ④ npm 全局前缀确实落在 ubuntu 自己的目录且可写(预检项 npm_writable 检它)。
+#
+# ⚠️ 下面这条 RUN 里**不要插 `#` 注释** —— Dockerfile 续行的注释处理有坑,
+#    说明一律写在 RUN 外面。
+RUN set -e \
+ && command -v node && command -v npm && command -v npx \
+ && command -v git && command -v python3 && command -v curl && command -v tar \
+ && command -v unzip && command -v sha256sum && command -v gh && command -v sudo \
+ && ldconfig -p | grep -q libicu \
+ && test -x /home/ubuntu/.local/bin/officecli \
+ && test -d /opt/pw-browsers \
+ && test -x /opt/codeg/codeg-server \
+ && for agent_cmd in openclaw claude pi-acp hermes dsh; do \
+      if ! test -x "/home/ubuntu/.npm-global/bin/$agent_cmd"; then \
+        echo "ERROR: 预装 npm agent 缺失: $agent_cmd (注意不能用 su ubuntu -c command -v 探测 —— su 会按 login.defs 重置 PATH,npm-global 不在其中,overlay 测试构建实测假阴性)"; exit 1; \
+      fi; \
+    done \
+ && if [ ! -u /usr/bin/sudo ]; then echo "ERROR: /usr/bin/sudo 丢了 setuid 位(多半是谁 chown 了 /usr)"; exit 1; fi \
+ && if [ "$(stat -c %U /usr/bin/sudo)" != "root" ]; then echo "ERROR: /usr/bin/sudo 属主不是 root"; exit 1; fi \
+ && if [ "$(stat -c %U /usr/bin/env)" != "root" ]; then echo "ERROR: /usr/bin 下的二进制属主被改过"; exit 1; fi \
+ && su ubuntu -c "sudo -n true" \
+ && test "$(su ubuntu -c 'npm prefix -g')" = "/home/ubuntu/.npm-global" \
+ && su ubuntu -c "test -w /home/ubuntu/.npm-global/lib/node_modules" \
+ && command -v supervisord && command -v supervisorctl \
+ && test -f /etc/myclaw/supervisord.conf \
+ && test -d /etc/myclaw/services.d \
+ && test -z "$(ls -A /etc/myclaw/services.d)" \
+ && su ubuntu -c "test -w /var/log/myclaw" \
+ && echo "OK: 基础环境齐备 / 5 agent + codeg 预装到位 / 提权面完好 / npm 前缀正确 / 守护就位且 services.d 为空"
+
+USER ubuntu
+ENV HOME=/home/ubuntu
+# PATH 两段都必须有,docker exec 继承镜像 ENV:
+#   ~/.npm-global/bin —— 9 个 npx 型 agent 装出来的可执行落这儿(ACP 命令靠它);
+#   ~/.local/bin      —— officecli。
+ENV PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.local/bin:$PATH
+WORKDIR /home/ubuntu
+
+LABEL myclaw.image_version="${AGENT_VERSION}" \
+      myclaw.build_timestamp="${BUILD_TIMESTAMP}" \
+      myclaw.codeg_version="${CODEG_VERSION}" \
+      myclaw.instance_kind="all" \
+      myclaw.preinstalled_agents="openclaw,claude_code,deepseek_harness_acp,hermes,pi" \
+      org.opencontainers.image.source="https://github.com/letscubo/myclaw-deploy" \
+      org.opencontainers.image.description="MyClaw multi-agent image (5 enabled agents + codeg preinstalled, no resident service registered)"
+
+# PID1 = tini + supervisord。tini 仍然负责收割 docker exec 留下的孤儿进程
+# (ACP 会话是 exec 出来的);supervisord 负责把 services.d 里注册过的常驻进程
+# 拉起来并看着 —— **出厂时那个目录是空的**,所以新容器的行为与从前的
+# `sleep infinity` 等价:什么都不跑,只是保活。
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["supervisord", "-n", "-c", "/etc/myclaw/supervisord.conf"]
