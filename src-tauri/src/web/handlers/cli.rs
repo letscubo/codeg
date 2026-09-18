@@ -243,6 +243,7 @@ async fn connect(
                 executable,
                 provider: params.provider.clone(),
                 model: params.model.clone(),
+                owner_window_label: None,
             },
             state.emitter.clone(),
         )
@@ -266,15 +267,16 @@ const CLI_TRANSPORT_AGENTS: &[AgentType] = &[AgentType::ClaudeCode, AgentType::D
 fn validate_cli_session_id(agent_type: AgentType, session_id: &str) -> Result<(), AppCommandError> {
     match agent_type {
         AgentType::DeepSeek => {
-            let ok = session_id
-                .strip_prefix("session-")
-                .is_some_and(|rest| uuid::Uuid::parse_str(rest).is_ok());
-            if ok {
+            // A bare uuid is a conversation from the retired `deepseek-acp`
+            // bridge: the connection continues it in a fresh launcher session.
+            if crate::acp::cli::is_dsh_session_id(session_id)
+                || uuid::Uuid::parse_str(session_id).is_ok()
+            {
                 Ok(())
             } else {
                 Err(coded_invalid(
                     "invalid_params",
-                    "sessionId must be `session-<uuid>` for deepseek",
+                    "sessionId must be `session-<uuid>` (or a bridge uuid) for deepseek",
                 ))
             }
         }
@@ -329,7 +331,10 @@ mod tests {
         assert!(validate_cli_session_id(AgentType::ClaudeCode, uuid).is_ok());
         assert!(validate_cli_session_id(AgentType::ClaudeCode, "session-x").is_err());
         assert!(validate_cli_session_id(AgentType::DeepSeek, &format!("session-{uuid}")).is_ok());
-        assert!(validate_cli_session_id(AgentType::DeepSeek, uuid).is_err());
+        assert!(
+            validate_cli_session_id(AgentType::DeepSeek, uuid).is_ok(),
+            "a bridge id is continued, not rejected"
+        );
         assert!(validate_cli_session_id(AgentType::DeepSeek, "session-nope").is_err());
     }
 

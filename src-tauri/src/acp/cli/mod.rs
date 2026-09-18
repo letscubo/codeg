@@ -41,6 +41,19 @@ use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 /// Owner label shared with `acp_connect`'s web connections.
 const CLI_OWNER_WINDOW: &str = "web";
+/// Agent env keys MyClaw pushes for DeepSeek: the provider route and model the
+/// harness patch pins as `agent-default-model`.
+const DSH_PROVIDER_ENV: &str = "DEEPSEEK_ACP_PROVIDER";
+const DSH_MODEL_ENV: &str = "DEEPSEEK_ACP_MODEL";
+
+/// The official DeepSeek launcher only continues ids it minted, spelled
+/// `session-<uuid>`. A bare uuid is a `deepseek-acp` (ACP bridge) session id,
+/// which the launcher cannot load.
+pub fn is_dsh_session_id(session_id: &str) -> bool {
+    session_id
+        .strip_prefix("session-")
+        .is_some_and(|rest| uuid::Uuid::parse_str(rest).is_ok())
+}
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 
 pub struct CliConnectRequest {
@@ -55,6 +68,11 @@ pub struct CliConnectRequest {
     /// default model. Ignored by the claude driver (`cli_model` covers it).
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Owner label for the connection. `None` = the web label `cli_prompt`
+    /// uses; codeg's own engines (chat channels, work tasks, automations)
+    /// pass theirs so reply routing and `disconnect_by_owner_window` keep
+    /// working when `spawn_agent` hands them a CLI connection.
+    pub owner_window_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,9 +107,26 @@ impl ConnectionManager {
     /// No process is spawned here — that happens per prompt.
     pub async fn create_or_reuse_cli_connection(
         &self,
-        request: CliConnectRequest,
+        mut request: CliConnectRequest,
         emitter: EventEmitter,
     ) -> Result<CliConnection, CliConnectError> {
+        // deepseek: a conversation started on the retired `deepseek-acp` bridge
+        // carries that bridge's bare-uuid session id, which the launcher cannot
+        // load. Start a fresh launcher session that CONTINUES it (transcript
+        // `continues_from`), so the earlier turns stay in the same history
+        // instead of being replaced by the new session's.
+        let continues_from = match (request.agent_type, request.session_id.take()) {
+            (AgentType::DeepSeek, Some(id)) if !is_dsh_session_id(&id) => {
+                tracing::info!(
+                    "[CLI][dsh] {id} is a bridge session id; starting a launcher session that continues it"
+                );
+                Some(id)
+            }
+            (_, session_id) => {
+                request.session_id = session_id;
+                None
+            }
+        };
         let mut connections = self.connections.lock().await;
         if let Some(session_id) = request.session_id.as_deref() {
             for (id, conn) in connections.iter() {
@@ -121,6 +156,29 @@ impl ConnectionManager {
         }
 
         let connection_id = uuid::Uuid::new_v4().to_string();
+        let owner_window_label = request
+            .owner_window_label
+            .clone()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| CLI_OWNER_WINDOW.to_string());
+        // deepseek: callers that go through `spawn_agent` carry no explicit
+        // route/model; MyClaw pushes them as the agent env
+        // (`DEEPSEEK_ACP_PROVIDER` / `DEEPSEEK_ACP_MODEL`), which
+        // `build_session_runtime_env` merges into `runtime_env`.
+        let (provider, model) = if request.agent_type == AgentType::DeepSeek {
+            (
+                request
+                    .provider
+                    .clone()
+                    .or_else(|| request.runtime_env.get(DSH_PROVIDER_ENV).cloned()),
+                request
+                    .model
+                    .clone()
+                    .or_else(|| request.runtime_env.get(DSH_MODEL_ENV).cloned()),
+            )
+        } else {
+            (request.provider.clone(), request.model.clone())
+        };
         // claude accepts any uuid as `--session-id`, so a fresh session can be
         // named up front and the conversation row binds to it on the first
         // prompt. dsh only continues ids it already stored: its first turn
@@ -134,6 +192,9 @@ impl ConnectionManager {
 
         // deepseek: the harness home (plugin file, companion token) must be
         // ready before the first turn; failing here leaves nothing registered.
+        // Task-engine launches (owner "work_task") carry the task_progress /
+        // task_complete tool group, exactly as the ACP injection decides it.
+        let tasks_enabled = owner_window_label == "work_task";
         let dsh_profile = if request.agent_type == AgentType::DeepSeek {
             let delegation = self.delegation_snapshot();
             match dsh_profile::prepare_launch_profile(
@@ -141,6 +202,7 @@ impl ConnectionManager {
                 &request.working_dir,
                 &request.runtime_env,
                 delegation.as_ref(),
+                tasks_enabled,
             )
             .await
             {
@@ -150,16 +212,40 @@ impl ConnectionManager {
         } else {
             None
         };
+        // claude: the same `codeg-mcp` companion, handed over per turn with
+        // `--mcp-config` (the ACP path injects it into `mcpServers`).
+        let (claude_companion, claude_delegation) = if request.agent_type == AgentType::ClaudeCode {
+            let delegation = self.delegation_snapshot();
+            let companion = match delegation.as_ref() {
+                Some(injection) => {
+                    crate::acp::connection::companion_launch_spec(
+                        injection,
+                        &connection_id,
+                        &request.working_dir,
+                        tasks_enabled,
+                        crate::acp::host_tools_policy::HostToolsPolicy::from_env(
+                            &request.runtime_env,
+                        ),
+                        crate::acp::connection::locate_codeg_mcp_binary,
+                    )
+                    .await
+                }
+                None => None,
+            };
+            (companion, delegation)
+        } else {
+            (None, None)
+        };
 
         let mut session = SessionState::new(
             connection_id.clone(),
             request.agent_type,
             Some(request.working_dir.clone()),
-            CLI_OWNER_WINDOW.to_string(),
+            owner_window_label.clone(),
             None,
         );
         session.transport = ConnectionTransport::Cli;
-        session.cli_model = request.model.clone().filter(|m| !m.trim().is_empty());
+        session.cli_model = model.filter(|m| !m.trim().is_empty());
         let state = Arc::new(RwLock::new(session));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let child_pid = Arc::new(AtomicU32::new(0));
@@ -171,7 +257,7 @@ impl ConnectionManager {
                 id: connection_id.clone(),
                 agent_type: request.agent_type,
                 status: ConnectionStatus::Connected,
-                owner_window_label: CLI_OWNER_WINDOW.to_string(),
+                owner_window_label,
                 cmd_tx,
                 state: Arc::clone(&state),
                 emitter: emitter.clone(),
@@ -196,8 +282,9 @@ impl ConnectionManager {
                     child_pid,
                     connections: Arc::clone(&self.connections),
                     profile,
-                    provider: request.provider.filter(|p| !p.trim().is_empty()),
+                    provider: provider.filter(|p| !p.trim().is_empty()),
                     delegation,
+                    continues_from,
                 };
                 tokio::spawn(driver.run(cmd_rx));
             }
@@ -212,6 +299,8 @@ impl ConnectionManager {
                     emitter: emitter.clone(),
                     child_pid,
                     connections: Arc::clone(&self.connections),
+                    companion: claude_companion,
+                    delegation: claude_delegation,
                 };
                 tokio::spawn(driver.run(cmd_rx));
             }
@@ -248,5 +337,69 @@ impl ConnectionManager {
             session_id,
             reused: false,
         })
+    }
+}
+
+impl ConnectionManager {
+    /// `spawn_agent` for the CLI-only agents (DeepSeek, Claude Code): there is
+    /// no ACP process for them any more, so every caller — `acp_connect`, chat
+    /// channels, work tasks, automations, delegation — gets a CLI connection
+    /// (`dsh --profile headless` / `claude -p`). The returned id works with the
+    /// same `send_prompt_linked*` / `cancel` / `disconnect` calls.
+    ///
+    /// A resume id in the old bridge spelling (bare uuid) becomes a fresh
+    /// launcher session that continues it (see `create_or_reuse_cli_connection`).
+    pub(crate) async fn spawn_cli_agent(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: Option<String>,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+    ) -> Result<String, crate::acp::error::AcpError> {
+        use crate::acp::error::AcpError;
+        let working_dir = working_dir
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .ok_or_else(|| AcpError::protocol("a CLI connection needs a working dir"))?;
+        // Claude continues any uuid it wrote; anything else starts fresh.
+        let session_id = match (agent_type, session_id) {
+            (AgentType::ClaudeCode, Some(id)) if uuid::Uuid::parse_str(&id).is_err() => {
+                tracing::warn!("[CLI] {id} is not a Claude session id; starting a fresh session");
+                None
+            }
+            (_, session_id) => session_id,
+        };
+        let executable = match agent_type {
+            AgentType::DeepSeek => dsh_binary::resolve_dsh_executable(&runtime_env).await,
+            _ => binary::resolve_claude_executable(&runtime_env).await,
+        }
+        .map_err(|e| AcpError::protocol(format!("cli_not_installed: {e}")))?;
+        let conn = self
+            .create_or_reuse_cli_connection(
+                CliConnectRequest {
+                    agent_type,
+                    working_dir,
+                    session_id,
+                    runtime_env,
+                    executable,
+                    provider: None,
+                    model: None,
+                    owner_window_label: Some(owner_window_label),
+                },
+                emitter,
+            )
+            .await
+            .map_err(|e| match e {
+                CliConnectError::SessionLocked { connection_id } => AcpError::protocol(format!(
+                    "session_locked: this session is held by connection {connection_id}"
+                )),
+                CliConnectError::ProfileWriteFailed(message) => {
+                    AcpError::protocol(format!("dsh_profile_failed: {message}"))
+                }
+            })?;
+        Ok(conn.connection_id)
     }
 }

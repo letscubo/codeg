@@ -330,26 +330,6 @@ pub struct AcpAdapterRelation {
     pub docs_url: &'static str,
 }
 
-/// Packages installed beside an agent's ACP adapter for codeg's own use. For
-/// DeepSeek that is the official `dsh` launcher: the CLI transport drives
-/// `dsh --profile headless` directly, which `deepseek-acp` (the ACP bridge)
-/// does not ship. `--json` / `--session-id` need ≥ 0.1.6-alpha.2.
-pub fn companion_distributions(agent_type: AgentType) -> &'static [AgentDistribution] {
-    match agent_type {
-        AgentType::DeepSeek => &DSH_CLI,
-        _ => &[],
-    }
-}
-
-static DSH_CLI: [AgentDistribution; 1] = [AgentDistribution::Npx {
-    version: "0.1.6-alpha.2",
-    package: "@deepseek-ai/dsh@0.1.6-alpha.2",
-    cmd: "dsh",
-    args: &[],
-    env: &[],
-    node_required: Some("22.0.0"),
-}];
-
 /// Adapter relation for an agent, or `None` when codeg's entry IS the vendor's
 /// own CLI (every agent except these two).
 ///
@@ -357,15 +337,8 @@ static DSH_CLI: [AgentDistribution; 1] = [AgentDistribution::Npx {
 /// `acp_adapter_relation_covers_only_wrapper_agents` test in sync.
 pub fn acp_adapter_relation(agent_type: AgentType) -> Option<AcpAdapterRelation> {
     match agent_type {
-        AgentType::ClaudeCode => Some(AcpAdapterRelation {
-            native_cmd: "claude",
-            native_label: "Claude Code CLI",
-            shared_config_dir: "~/.claude",
-            // The native installer targets ~/.local/bin; older builds used
-            // ~/.claude/local.
-            extra_dirs: &[".local/bin", ".claude/local"],
-            docs_url: ACP_ADAPTER_DOCS_URL,
-        }),
+        // fork(letscubo): no Claude Code entry — codeg installs and runs the
+        // vendor CLI itself (CLI transport), so there is no adapter split.
         AgentType::Codex => Some(AcpAdapterRelation {
             native_cmd: "codex",
             native_label: "Codex CLI",
@@ -500,7 +473,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             agent_type,
             supports_mcp: true,
             name: "Claude Code",
-            description: "ACP wrapper for Anthropic's Claude",
+            description: "Anthropic's Claude Code CLI (CLI transport)",
             // 0.63.0 (claude-agent-sdk 0.3.220) adds the opt-in
             // `clientCapabilities._meta["subagent-transcript"]` capability
             // (#881): when advertised (see `build_client_capabilities`),
@@ -781,12 +754,20 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // land mid-turn). 0.75.1 additionally drops the automatic
             // `getContextUsage` control requests, and `/usage` output now comes
             // back as Markdown, which the transcript renderer already handles.
+            // fork(letscubo): the notes above describe the ACP adapter codeg
+            // used to install. Claude Code now runs ONLY on the CLI transport
+            // (`acp::cli::driver`, one `claude -p` per turn), so the
+            // distribution is the vendor CLI itself and install / version /
+            // upgrade track the Claude Code build directly instead of the
+            // adapter that bundled one. `ConnectionManager::spawn_agent`
+            // registers a CLI connection for this agent.
             distribution: AgentDistribution::Npx {
-                version: "0.75.1",
-                package: "@agentclientprotocol/claude-agent-acp@0.75.1",
-                cmd: "claude-agent-acp",
+                version: "2.1.276",
+                package: "@anthropic-ai/claude-code@2.1.276",
+                cmd: "claude",
                 args: &[],
                 env: &[],
+                // package.json declares `engines.node: ">=22.0.0"`.
                 node_required: Some("22.0.0"),
             },
         },
@@ -1113,12 +1094,12 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenClaw",
             description: "OpenClaw is a personal AI assistant you run on your own devices.",
             distribution: AgentDistribution::Npx {
-                version: "2026.9.2",
-                package: "openclaw@2026.9.2",
+                version: "2026.9.4",
+                package: "openclaw@2026.9.4",
                 cmd: "openclaw",
                 args: &["acp"],
                 env: &[],
-                node_required: Some("22.22.3"),
+                node_required: Some("24.16.0"),
             },
         },
         AgentType::Cline => AcpAgentMeta {
@@ -1229,8 +1210,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // naturally outranks the npm-managed copy; the npm global install
             // is the managed/one-click channel codeg's Install button drives.
             distribution: AgentDistribution::Npx {
-                version: "0.21.2",
-                package: "hermes-agent@0.21.2",
+                version: "0.21.3",
+                package: "hermes-agent@0.21.3",
                 cmd: "hermes",
                 args: &["acp"],
                 env: &[],
@@ -1469,7 +1450,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             agent_type,
             supports_mcp: true,
             name: "DeepSeek Harness",
-            description: "Editor-facing DeepSeek Harness agent (ACP via deepseek-acp)",
+            description: "DeepSeek Harness (official dsh launcher, CLI transport)",
             // `deepseek-acp` is the community editor bridge for DeepSeek
             // Harness (DSH): the harness's own `@deepseek-ai/dsh-acp` is an
             // automation-only transport (no streaming, no tool presentation,
@@ -1591,10 +1572,19 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // the agents list shows as the upgrade target beside the installed
             // version, so a drift leaves the Upgrade button installing one
             // version while the row keeps calling it stale.
+            // fork(letscubo): the notes above describe the `deepseek-acp`
+            // bridge codeg used to install. DeepSeek now runs ONLY on the CLI
+            // transport (`acp::cli::dsh_driver`, `dsh --profile headless`), so
+            // the distribution is the official launcher itself: install,
+            // version and upgrade all track `@deepseek-ai/dsh`, and
+            // `ConnectionManager::spawn_agent` registers a CLI connection for
+            // this agent instead of an ACP process. `--json` / `--session-id`
+            // exist only from 0.1.6-alpha.2; npm's `latest` tag (0.1.5-rc.2)
+            // lacks them, so the pin must not follow `latest`.
             distribution: AgentDistribution::Npx {
-                version: "0.8.0",
-                package: "deepseek-acp@0.8.0",
-                cmd: "deepseek-acp",
+                version: "0.1.6-alpha.2",
+                package: "@deepseek-ai/dsh@0.1.6-alpha.2",
+                cmd: "dsh",
                 args: &[],
                 env: &[],
                 // package.json declares `engines.node: ">=22"`.
@@ -2033,8 +2023,8 @@ mod tests {
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.75.1",
-            "@agentclientprotocol/claude-agent-acp@0.75.1",
+            "2.1.276",
+            "@anthropic-ai/claude-code@2.1.276",
             Some("22.0.0"),
         );
         assert_npx_version(
@@ -2045,9 +2035,9 @@ mod tests {
         );
         assert_npx_version(
             AgentType::OpenClaw,
-            "2026.9.2",
-            "openclaw@2026.9.2",
-            Some("22.22.3"),
+            "2026.9.4",
+            "openclaw@2026.9.4",
+            Some("24.16.0"),
         );
         assert_npx_version(
             AgentType::Cline,
@@ -2084,23 +2074,10 @@ mod tests {
         );
         assert_npx_version(
             AgentType::DeepSeek,
-            "0.8.0",
-            "deepseek-acp@0.8.0",
+            "0.1.6-alpha.2",
+            "@deepseek-ai/dsh@0.1.6-alpha.2",
             Some("22.0.0"),
         );
-        // The CLI transport needs the official launcher beside the bridge.
-        match companion_distributions(AgentType::DeepSeek) {
-            [AgentDistribution::Npx { package, cmd, .. }] => {
-                assert_eq!(*package, "@deepseek-ai/dsh@0.1.6-alpha.2");
-                assert_eq!(*cmd, "dsh");
-            }
-            other => panic!("unexpected companion spec: {other:?}"),
-        }
-        for agent in all_acp_agents() {
-            if agent != AgentType::DeepSeek {
-                assert!(companion_distributions(agent).is_empty(), "{agent}");
-            }
-        }
         assert_npx_version(
             AgentType::Qoder,
             "1.1.45",
@@ -2114,8 +2091,8 @@ mod tests {
         // audited wrapper code is only what the pinned version ships.
         assert_npx_version(
             AgentType::Hermes,
-            "0.21.2",
-            "hermes-agent@0.21.2",
+            "0.21.3",
+            "hermes-agent@0.21.3",
             Some("20.0.0"),
         );
     }
@@ -2156,15 +2133,15 @@ mod tests {
         assert!(!launch_spec_uses_cursor_acp("cursor-agent", &["stdio"]));
     }
 
-    // Only Claude Code and Codex ship as a third-party ACP adapter wrapping a
-    // vendor CLI of a different name. Every other agent's registry `cmd` IS the
+    // Only Codex ships as a third-party ACP adapter wrapping a vendor CLI of a
+    // different name (Claude Code runs its vendor CLI on the CLI transport). Every other agent's registry `cmd` IS the
     // vendor CLI, so claiming an adapter relation for one would make preflight
     // explain a split that doesn't exist.
     #[test]
     fn acp_adapter_relation_covers_only_wrapper_agents() {
         for agent_type in all_acp_agents() {
             let relation = acp_adapter_relation(agent_type);
-            let expected = matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex);
+            let expected = matches!(agent_type, AgentType::Codex);
             assert_eq!(
                 relation.is_some(),
                 expected,

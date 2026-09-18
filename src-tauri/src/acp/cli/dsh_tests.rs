@@ -35,7 +35,7 @@ const SID: &str = "session-11c2b268-f4fc-4eba-805a-ec1a49c08a8f";
 static TRANSCRIPT_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn transcript_root() -> &'static PathBuf {
+pub(super) fn transcript_root() -> &'static PathBuf {
     TRANSCRIPT_ROOT.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("codeg-dsh-tests-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -53,6 +53,10 @@ struct Harness {
 
 impl Harness {
     async fn new(env: &[(&str, &str)]) -> Self {
+        Self::resuming(env, None).await
+    }
+
+    async fn resuming(env: &[(&str, &str)], session_id: Option<&str>) -> Self {
         let _ = transcript_root();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -74,11 +78,12 @@ impl Harness {
                 CliConnectRequest {
                     agent_type: AgentType::DeepSeek,
                     working_dir: dir.clone(),
-                    session_id: None,
+                    session_id: session_id.map(str::to_string),
                     runtime_env,
                     executable,
                     provider: Some("myclaw".to_string()),
                     model: Some("kimi-k3".to_string()),
+                    owner_window_label: None,
                 },
                 EventEmitter::Noop,
             )
@@ -375,4 +380,124 @@ async fn disconnect_removes_the_patch_file_and_the_connection() {
     })
     .await
     .expect("patch file removed on disconnect");
+}
+
+/// `spawn_agent` is the entry every codeg engine uses (acp_connect, chat
+/// channels, work tasks, automations, delegation). DeepSeek has no ACP process
+/// any more, so it must come back as a CLI connection that keeps the caller's
+/// owner label, takes model + route from the agent env MyClaw pushes, and
+/// treats an old bridge session id (bare uuid) as a fresh session.
+#[tokio::test]
+async fn spawn_agent_gives_deepseek_a_cli_connection() {
+    let _serial = SERIAL.lock().await;
+    let _ = transcript_root();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let executable = dir.join("fake-dsh");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\ncase \" $* \" in *\" --help \"*) echo '--json --session-id'; exit 0;; esac\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut runtime_env = BTreeMap::new();
+    runtime_env.insert(
+        "DSH_EXECUTABLE".to_string(),
+        executable.display().to_string(),
+    );
+    runtime_env.insert(
+        "DSH_HOME".to_string(),
+        dir.join("dsh-home").display().to_string(),
+    );
+    runtime_env.insert("DEEPSEEK_ACP_PROVIDER".to_string(), "myclaw".to_string());
+    runtime_env.insert("DEEPSEEK_ACP_MODEL".to_string(), "kimi-k3".to_string());
+
+    let manager = ConnectionManager::new();
+    let id = manager
+        .spawn_agent(
+            AgentType::DeepSeek,
+            Some(dir.display().to_string()),
+            Some("11c2b268-f4fc-4eba-805a-ec1a49c08a8f".to_string()),
+            runtime_env,
+            "work_task".to_string(),
+            EventEmitter::Noop,
+            Some("plan".to_string()),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("deepseek connects through the CLI transport");
+
+    assert_eq!(
+        manager.connection_transport(&id).await,
+        Some(crate::acp::session_state::ConnectionTransport::Cli)
+    );
+    let state = manager.get_state(&id).await.unwrap();
+    {
+        let state = state.read().await;
+        assert_eq!(state.external_id, None, "a bridge id is not resumed");
+        assert_eq!(state.cli_model.as_deref(), Some("kimi-k3"));
+    }
+    {
+        let conns = manager.connections.lock().await;
+        assert_eq!(conns[&id].owner_window_label, "work_task");
+    }
+    assert!(
+        dir.join("dsh-home/plugins/codeg-tool-search.mjs").is_file(),
+        "the harness home is prepared at connect time"
+    );
+    manager.disconnect(&id).await.unwrap();
+}
+
+/// A conversation started on the retired `deepseek-acp` bridge has a bare-uuid
+/// session id the launcher cannot load. The connection starts a fresh launcher
+/// session whose transcript continues the bridge one, so reading the history
+/// back yields the old turns first and the new ones after — not a replacement.
+#[tokio::test]
+async fn a_bridge_session_is_continued_not_replaced() {
+    let _guard = SERIAL.lock().await;
+    let bridge = "b4cbcfb7-641e-4b03-be6b-f248082166c9";
+    let _ = transcript_root();
+    let root = crate::paths::codeg_acp_transcripts_root();
+    // The bridge conversation's recorded turn (what an ACP connection wrote).
+    crate::acp_transcript::append_line_in(
+        &root,
+        "deepseek-acp",
+        bridge,
+        &serde_json::to_string(&crate::acp_transcript::TranscriptHeader::new(
+            "deepseek", bridge, "/ws", 1,
+        ))
+        .unwrap(),
+    );
+    crate::acp_transcript::append_line_in(
+        &root,
+        "deepseek-acp",
+        bridge,
+        r#"{"t":2,"k":"prompt","p":[{"type":"text","text":"old question"}]}"#,
+    );
+
+    let h = Harness::resuming(&[], Some(bridge)).await;
+    assert_eq!(h.external_id().await, None, "the bridge id is not resumed");
+    // Its own minted id: headers are written once per file, and SID is shared.
+    let minted = "session-5d0f7c1e-2b44-4e8e-9a51-0c6c3f0b7d21";
+    let mut turn = happy_turn("new answer");
+    turn[0] = json!({"type":"session","sessionId":minted,"cwd":"/ws"});
+    h.stdout(&turn);
+    let mut rx = h.subscribe().await;
+    h.prompt("new question").await;
+    collect_until(&mut rx, |e| e["type"] == "turn_complete").await;
+
+    assert!(!h.args().contains(&"--session-id".to_string()));
+    assert_eq!(h.external_id().await.as_deref(), Some(minted));
+    let header = crate::acp_transcript::read_header_in(&root, "deepseek-acp", minted).unwrap();
+    assert_eq!(header.continues_from.as_deref(), Some(bridge));
+    let chain = crate::acp_transcript::read_chain_in(&root, "deepseek-acp", minted);
+    let prompts: Vec<String> = chain
+        .entries
+        .iter()
+        .filter(|e| e.k == crate::acp_transcript::EntryKind::Prompt)
+        .map(|e| e.p.to_string())
+        .collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(prompts[0].contains("old question"));
+    assert!(prompts[1].contains("new question"));
 }

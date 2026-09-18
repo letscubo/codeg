@@ -1,10 +1,10 @@
 //! fork(letscubo)专属: locate the Claude Code native binary for the CLI transport.
 //!
-//! Mirrors `claude-agent-acp`'s `claudeCliPath()` so a CLI turn runs the exact
-//! binary an ACP session of the same install runs: an explicit
-//! `CLAUDE_CODE_EXECUTABLE` wins; otherwise the platform package that
-//! `@anthropic-ai/claude-agent-sdk` ships as an optional dependency, nested
-//! under the adapter or hoisted beside it in an npm global prefix.
+//! Order: an explicit `CLAUDE_CODE_EXECUTABLE` wins; then the vendor CLI
+//! (`@anthropic-ai/claude-code`, the `claude` bin codeg now installs for this
+//! agent); last, for installs that still only have the retired ACP adapter,
+//! the platform package `@anthropic-ai/claude-agent-sdk` ships as an optional
+//! dependency, nested under the adapter or hoisted beside it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,19 @@ pub async fn resolve_claude_executable(
         };
     }
 
+    // The vendor CLI codeg installs for Claude Code (registry distribution).
+    if let Some(path) = crate::commands::acp::resolve_npx_command("claude").await {
+        if is_executable_file(&path) {
+            return Ok(path);
+        }
+    }
+    if let Some(candidate) = crate::process::user_npm_prefix().map(|p| p.join("bin").join("claude"))
+    {
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
     let mut prefixes = Vec::new();
     if let Some(prefix) = crate::commands::acp::cached_npm_global_prefix().await {
         prefixes.push(prefix);
@@ -48,8 +61,8 @@ pub async fn resolve_claude_executable(
     first_executable(&candidates).ok_or_else(|| {
         let looked: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
         format!(
-            "Claude Code native binary not found; install {ADAPTER_PACKAGE} or set \
-             {EXECUTABLE_ENV} (looked in: {})",
+            "Claude Code CLI not found; install @anthropic-ai/claude-code (npm install -g) \
+             or set {EXECUTABLE_ENV} (also looked for the {ADAPTER_PACKAGE} SDK binary in: {})",
             looked.join(", ")
         )
     })

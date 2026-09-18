@@ -712,29 +712,6 @@ mod adapter_tests {
         )
     }
 
-    // The card's whole argument rests on these four fields being concrete: the
-    // package we install, the command we look for, the vendor CLI we did NOT
-    // find under that name, and the config dir both share.
-    #[test]
-    fn claude_adapter_info_names_package_command_and_shared_config() {
-        let info = info_for(
-            AgentType::ClaudeCode,
-            Some("/opt/homebrew/bin/claude"),
-            false,
-        );
-        assert_eq!(
-            info.adapter_package,
-            "@agentclientprotocol/claude-agent-acp@0.75.1"
-        );
-        assert_eq!(info.adapter_cmd, "claude-agent-acp");
-        assert!(!info.adapter_installed);
-        assert_eq!(info.native_cmd, "claude");
-        assert_eq!(info.native_label, "Claude Code CLI");
-        assert_eq!(info.native_path.as_deref(), Some("/opt/homebrew/bin/claude"));
-        assert_eq!(info.shared_config_dir, "~/.claude");
-        assert!(info.docs_url.ends_with("#acp-adapters"));
-    }
-
     #[test]
     fn codex_adapter_info_uses_codex_home() {
         let info = info_for(AgentType::Codex, None, true);
@@ -751,7 +728,10 @@ mod adapter_tests {
     // gets an explainer claiming otherwise.
     #[tokio::test]
     async fn non_adapter_agents_have_no_adapter_info() {
+        // fork(letscubo): Claude Code installs and runs its vendor CLI (CLI
+        // transport), so it has no adapter split to explain any more.
         for agent_type in [
+            AgentType::ClaudeCode,
             AgentType::Gemini,
             AgentType::Cline,
             AgentType::OpenCode,

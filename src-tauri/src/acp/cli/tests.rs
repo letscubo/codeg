@@ -38,6 +38,8 @@ struct Harness {
 
 impl Harness {
     async fn new(env: &[(&str, &str)]) -> Self {
+        // The driver records codeg's transcript: keep it in a temp CODEG_HOME.
+        let _ = super::dsh_tests::transcript_root();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let executable = dir.join("fake-claude");
@@ -63,6 +65,7 @@ impl Harness {
                     executable,
                     provider: None,
                     model: None,
+                    owner_window_label: None,
                 },
                 EventEmitter::Noop,
             )
@@ -73,7 +76,9 @@ impl Harness {
             dir,
             manager,
             connection_id: conn.connection_id,
-            session_id: conn.session_id.expect("claude connections pre-assign a session id"),
+            session_id: conn
+                .session_id
+                .expect("claude connections pre-assign a session id"),
         }
     }
 
@@ -330,6 +335,7 @@ async fn a_live_session_is_reused_in_place_and_locked_elsewhere() {
         executable: PathBuf::from("/bin/false"),
         provider: None,
         model: None,
+        owner_window_label: None,
     };
 
     let reused = h
@@ -350,4 +356,94 @@ async fn a_live_session_is_reused_in_place_and_locked_elsewhere() {
             connection_id: h.connection_id.clone()
         })
     );
+}
+
+/// Claude Code's history is read from codeg's own transcript, so a CLI turn
+/// must record header, prompt, the streamed reply and the turn end — and
+/// report its duration like the ACP path does.
+#[tokio::test]
+async fn a_turn_is_recorded_to_codegs_transcript() {
+    let h = Harness::new(&[]).await;
+    h.stdout(&[
+        init_line(&h.session_id),
+        json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":null}),
+        json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}},"parent_tool_use_id":null}),
+        json!({"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"pong"}]},"parent_tool_use_id":null}),
+        json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"pong",
+            "usage":{"input_tokens":10,"output_tokens":2},"modelUsage":{"claude-opus-5":{"contextWindow":200000}}}),
+    ]);
+    let mut rx = h.subscribe().await;
+    h.prompt("ping").await;
+    let events = collect_until(&mut rx, |e| e["type"] == "turn_complete").await;
+    assert!(events.last().unwrap()["duration_ms"].as_u64().is_some());
+    assert!(
+        !h.args().iter().any(|a| a == "--mcp-config"),
+        "no companion without delegation"
+    );
+
+    let transcript = crate::acp_transcript::read_transcript_in(
+        &crate::paths::codeg_acp_transcripts_root(),
+        crate::acp::registry::registry_id_for(AgentType::ClaudeCode),
+        &h.session_id,
+    );
+    assert!(transcript.header.is_some(), "header recorded");
+    let kinds: Vec<crate::acp_transcript::EntryKind> =
+        transcript.entries.iter().map(|e| e.k).collect();
+    assert_eq!(
+        kinds.first(),
+        Some(&crate::acp_transcript::EntryKind::Prompt)
+    );
+    assert!(kinds.contains(&crate::acp_transcript::EntryKind::Update));
+    assert_eq!(
+        kinds.last(),
+        Some(&crate::acp_transcript::EntryKind::TurnEnd)
+    );
+    assert!(transcript.entries[0].p.to_string().contains("ping"));
+}
+
+/// `spawn_agent` (acp_connect, channels, work tasks, automations) must give
+/// Claude Code a CLI connection that keeps the caller's owner label.
+#[tokio::test]
+async fn spawn_agent_gives_claude_code_a_cli_connection() {
+    let _ = super::dsh_tests::transcript_root();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let executable = dir.join("fake-claude");
+    std::fs::write(&executable, FAKE_CLI).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut runtime_env = BTreeMap::new();
+    runtime_env.insert(
+        "CLAUDE_CODE_EXECUTABLE".to_string(),
+        executable.display().to_string(),
+    );
+    let manager = ConnectionManager::new();
+    let resumed = "0b0f7c1e-2b44-4e8e-9a51-0c6c3f0b7d21";
+    let id = manager
+        .spawn_agent(
+            AgentType::ClaudeCode,
+            Some(dir.display().to_string()),
+            Some(resumed.to_string()),
+            runtime_env,
+            "automation".to_string(),
+            EventEmitter::Noop,
+            None,
+            BTreeMap::new(),
+        )
+        .await
+        .expect("claude connects through the CLI transport");
+    assert_eq!(
+        manager.connection_transport(&id).await,
+        Some(ConnectionTransport::Cli)
+    );
+    let state = manager.get_state(&id).await.unwrap();
+    assert_eq!(
+        state.read().await.external_id.as_deref(),
+        Some(resumed),
+        "an ACP-era Claude session id is the same id the CLI resumes"
+    );
+    {
+        let conns = manager.connections.lock().await;
+        assert_eq!(conns[&id].owner_window_label, "automation");
+    }
+    manager.disconnect(&id).await.unwrap();
 }

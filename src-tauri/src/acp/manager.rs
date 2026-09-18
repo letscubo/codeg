@@ -528,6 +528,23 @@ impl ConnectionManager {
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, AcpError> {
+        // fork(letscubo): DeepSeek and Claude Code have no ACP process — they
+        // run only on the CLI transport (official `dsh --profile headless`,
+        // `claude -p`). Mode / config preferences are ACP-only and have
+        // nothing to apply to.
+        if matches!(agent_type, AgentType::DeepSeek | AgentType::ClaudeCode) {
+            let _ = (preferred_mode_id, preferred_config_values);
+            return self
+                .spawn_cli_agent(
+                    agent_type,
+                    working_dir,
+                    session_id,
+                    runtime_env,
+                    owner_window_label,
+                    emitter,
+                )
+                .await;
+        }
         // Held for the whole establishment. A restore writing back to the
         // agents' own directories takes the write side, so it can never see an
         // empty connection list and then have one appear underneath it. Not

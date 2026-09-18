@@ -36,9 +36,9 @@ use super::dsh_prompt::{build_args, flatten_prompt};
 use super::dsh_stream::DshStreamMapper;
 use super::stream_json::{CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_UNKNOWN};
 use crate::acp::connection::{
-    map_prompt_blocks, record_prompt, record_transcript_header, record_transcript_update,
-    record_turn_end, record_turn_error_raw, AgentConnection, ConnectionCommand,
-    DelegationInjection,
+    map_prompt_blocks, record_prompt, record_transcript_header_continuing,
+    record_transcript_update, record_turn_end, record_turn_error_raw, AgentConnection,
+    ConnectionCommand, DelegationInjection,
 };
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessageBlock};
@@ -58,6 +58,12 @@ pub(crate) struct DshDriver {
     pub profile: DshLaunchProfile,
     pub provider: Option<String>,
     pub delegation: Option<DelegationInjection>,
+    /// The conversation's previous session when it cannot be resumed (an id
+    /// minted by the retired `deepseek-acp` bridge). The session the launcher
+    /// mints on the first turn links back to it, so the recorded history reads
+    /// as one conversation. Only a NEW transcript takes it: the header write is
+    /// a no-op once the file exists.
+    pub continues_from: Option<String>,
 }
 
 enum TurnEnd {
@@ -380,11 +386,15 @@ impl DshDriver {
     }
 
     async fn record_turn_start(&self, session_id: &str, blocks: &[PromptInputBlock]) {
-        record_transcript_header(
+        // Durable before `SessionStarted` is emitted: the session-binding guard
+        // reads the link to tell a continuation from an unrelated session.
+        record_transcript_header_continuing(
             self.agent_type,
             session_id,
             &self.working_dir.display().to_string(),
-        );
+            self.continues_from.as_deref(),
+        )
+        .await;
         record_prompt(
             self.agent_type,
             session_id,

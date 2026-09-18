@@ -2175,6 +2175,25 @@ fn npm_package_requires_scripts(package: &str) -> bool {
     package_name_from_spec(package) == "hermes-agent"
 }
 
+/// fork(letscubo): npm 11 skips dependency install scripts unless they are
+/// named in `--allow-scripts` (it prints the exact list to pass). The official
+/// DeepSeek launcher pulls native helpers (`node-pty`, `koffi`, the local
+/// subprocess sandbox) whose scripts the myclaw-all image allows with this same
+/// list; installing without it leaves the upgrade path different from the
+/// image. Older npm ignores the unknown flag.
+fn npm_package_allow_scripts(package: &str) -> Option<&'static str> {
+    match package_name_from_spec(package).as_str() {
+        "@deepseek-ai/dsh" => Some(
+            "--allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs",
+        ),
+        // Its own `postinstall` (install.cjs) places the native binary. npm
+        // 11.19 still runs a top-level package's script but warns it is "not
+        // yet covered by allowScripts" (measured on A3).
+        "@anthropic-ai/claude-code" => Some("--allow-scripts=@anthropic-ai/claude-code"),
+        _ => None,
+    }
+}
+
 /// Name the proxy when a bootstrap package's install died inside the wrapper's
 /// own downloads. `NODE_ENV_PROXY_VAR` covers Node ≥24; what remains is a
 /// proxied machine on an older Node, where nothing codeg can pass makes that
@@ -2341,6 +2360,9 @@ async fn install_npm_global_package_streaming_inner(
     if run_scripts {
         args.push(NPM_RUN_SCRIPTS_OVERRIDE);
     }
+    if let Some(allow) = npm_package_allow_scripts(package) {
+        args.push(allow);
+    }
     args.push(&registry_arg);
     args.push(package);
     let (success, stderr) = run_npm_streaming(&args, task_id, emitter).await?;
@@ -2376,6 +2398,9 @@ async fn install_npm_global_package_streaming_inner(
             ];
             if run_scripts {
                 retry_args.push(NPM_RUN_SCRIPTS_OVERRIDE);
+            }
+            if let Some(allow) = npm_package_allow_scripts(package) {
+                retry_args.push(allow);
             }
             retry_args.push(&registry_arg);
             retry_args.push(package);
@@ -2459,6 +2484,9 @@ async fn install_npm_to_user_prefix_streaming(
     let mut args = vec!["install", "-g", NPM_INCLUDE_OPTIONAL, NPM_FOREGROUND_SCRIPTS];
     if run_scripts {
         args.push(NPM_RUN_SCRIPTS_OVERRIDE);
+    }
+    if let Some(allow) = npm_package_allow_scripts(package) {
+        args.push(allow);
     }
     args.push(&prefix_arg);
     args.push(registry_arg);
@@ -12187,48 +12215,6 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 }
             }
 
-            // Companion packages (the DeepSeek `dsh` launcher for the CLI
-            // transport) ride along with the adapter: same pin discipline, no
-            // latest-channel fallback, and a failure fails the install because
-            // the CLI transport is the reason the package is listed.
-            for companion in registry::companion_distributions(agent_type) {
-                let registry::AgentDistribution::Npx {
-                    package: companion_package,
-                    cmd: companion_cmd,
-                    ..
-                } = companion
-                else {
-                    continue;
-                };
-                if clean_first {
-                    let name = package_name_from_spec(companion_package);
-                    emit_agent_install_event(
-                        emitter,
-                        &task_id,
-                        AgentInstallEventKind::Log,
-                        format!("$ npm uninstall -g {name} (clean reinstall)"),
-                    );
-                    if let Err(e) = uninstall_npm_global_package(companion_package).await {
-                        emit_agent_install_event(
-                            emitter,
-                            &task_id,
-                            AgentInstallEventKind::Log,
-                            format!("(warning) uninstall step failed, continuing: {e}"),
-                        );
-                    }
-                }
-                let (companion_spec, _) = npm_install_attempts(companion_package, None, false)?;
-                emit_agent_install_event(
-                    emitter,
-                    &task_id,
-                    AgentInstallEventKind::Log,
-                    format!("Installing the {companion_cmd} launcher ({companion_spec})"),
-                );
-                install_npm_global_package_streaming(&companion_spec, &task_id, emitter)
-                    .await
-                    .map_err(|e| annotate_npm_bootstrap_failure(&companion_spec, e))?;
-            }
-
             emit_agent_install_event(
                 emitter,
                 &task_id,
@@ -16116,6 +16102,21 @@ wire_api = "chat"
 
     // The pinned default is byte-identical to what `build_npm_install_spec`
     // produced before the channel existed, with no fallback attempt.
+    #[test]
+    fn official_dsh_installs_allow_its_native_scripts() {
+        let allow = npm_package_allow_scripts("@deepseek-ai/dsh@0.1.6-alpha.2")
+            .expect("the DeepSeek launcher needs its install scripts allowed");
+        for pkg in ["koffi", "node-pty", "@deepseek-ai/dsh-subprocess-local"] {
+            assert!(allow.contains(pkg), "{pkg}");
+        }
+        assert_eq!(
+            npm_package_allow_scripts("@anthropic-ai/claude-code@2.1.276"),
+            Some("--allow-scripts=@anthropic-ai/claude-code")
+        );
+        assert_eq!(npm_package_allow_scripts("hermes-agent@0.21.3"), None);
+        assert_eq!(npm_package_allow_scripts("pi-acp@0.0.33"), None);
+    }
+
     #[test]
     fn npm_install_attempts_defaults_to_the_pinned_spec() {
         assert_eq!(

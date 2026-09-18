@@ -1272,7 +1272,7 @@ pub(crate) fn record_transcript_header(agent_type: AgentType, session_id: &str, 
 /// agent session for the same conversation: the earlier turns stay where they
 /// are and this header links back to them, so the reader still sees one
 /// history. See [`crate::acp_transcript::TranscriptHeader::continues_from`].
-async fn record_transcript_header_continuing(
+pub(crate) async fn record_transcript_header_continuing(
     agent_type: AgentType,
     session_id: &str,
     cwd: &str,

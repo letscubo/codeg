@@ -50,6 +50,7 @@ pub(crate) async fn prepare_launch_profile(
     working_dir: &Path,
     runtime_env: &BTreeMap<String, String>,
     delegation: Option<&DelegationInjection>,
+    tasks_enabled: bool,
 ) -> Result<DshLaunchProfile, String> {
     let dsh_home = crate::parsers::deepseek::resolve_dsh_home_dir_for_launch(runtime_env);
     let plugin_path = materialize_plugin(&dsh_home)?;
@@ -59,7 +60,7 @@ pub(crate) async fn prepare_launch_profile(
                 injection,
                 connection_id,
                 working_dir,
-                false,
+                tasks_enabled,
                 HostToolsPolicy::from_env(runtime_env),
                 crate::acp::connection::locate_codeg_mcp_binary,
             )

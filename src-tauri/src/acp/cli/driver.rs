@@ -25,7 +25,11 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use super::stream_json::{
     CliTurnError, LineOutcome, StreamMapper, TurnFinish, STOP_CANCELLED, STOP_UNKNOWN,
 };
-use crate::acp::connection::{AgentConnection, ConnectionCommand};
+use crate::acp::connection::{
+    map_prompt_blocks, record_prompt, record_transcript_header_continuing,
+    record_transcript_update, record_turn_end, record_turn_error_raw, AgentConnection,
+    CompanionLaunchSpec, ConnectionCommand, DelegationInjection,
+};
 use crate::acp::error::AcpError;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessageBlock};
@@ -65,6 +69,11 @@ pub(crate) struct CliDriver {
     pub emitter: EventEmitter,
     pub child_pid: Arc<AtomicU32>,
     pub connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
+    /// The `codeg-mcp` companion (delegation / feedback / task tools), passed
+    /// per turn through `--mcp-config` — the CLI counterpart of the ACP
+    /// `mcpServers` injection. `None` when no companion feature is enabled.
+    pub companion: Option<CompanionLaunchSpec>,
+    pub delegation: Option<DelegationInjection>,
 }
 
 enum TurnEnd {
@@ -98,6 +107,9 @@ impl CliDriver {
             status: ConnectionStatus::Disconnected,
         })
         .await;
+        if let (Some(inj), Some(companion)) = (&self.delegation, &self.companion) {
+            inj.tokens.revoke(&companion.token).await;
+        }
         self.connections.lock().await.remove(&self.connection_id);
         tracing::info!(connection_id = %self.connection_id, "[CLI] driver stopped");
     }
@@ -120,25 +132,48 @@ impl CliDriver {
                 .await;
         }
 
+        let started = std::time::Instant::now();
         let (session_id, model) = {
             let s = self.state.read().await;
             (s.external_id.clone(), s.cli_model.clone())
         };
-        let session_id = match session_id {
-            Some(id) => id,
-            None => {
-                let id = uuid::Uuid::new_v4().to_string();
-                self.emit(AcpEvent::SessionStarted {
-                    session_id: id.clone(),
-                })
-                .await;
-                id
-            }
+        let (session_id, minted) = match session_id {
+            Some(id) => (id, false),
+            None => (uuid::Uuid::new_v4().to_string(), true),
         };
+        // codeg's own transcript is what the history view reads for Claude
+        // Code (`transcript_dir_for`), so a CLI turn records the same header /
+        // prompt / updates / turn end an ACP turn does. Header and prompt land
+        // before a minted id is announced, so the lifecycle bind never
+        // precedes the recorded prompt. A session carried over from the ACP
+        // adapter keeps its file: the header write is a no-op once it exists.
+        record_transcript_header_continuing(
+            self.agent_type,
+            &session_id,
+            &self.working_dir.display().to_string(),
+            None,
+        )
+        .await;
+        record_prompt(
+            self.agent_type,
+            &session_id,
+            &map_prompt_blocks(blocks.clone()),
+        )
+        .await;
+        if minted {
+            self.emit(AcpEvent::SessionStarted {
+                session_id: session_id.clone(),
+            })
+            .await;
+        }
         // A turn that crashed before claude wrote its transcript leaves nothing
         // to resume, so decide from the file rather than from turn history.
         let resume = transcript_exists(&self.claude_config_dir(), &session_id);
-        let args = build_args(&session_id, resume, model.as_deref());
+        let mut args = build_args(&session_id, resume, model.as_deref());
+        if let Some(config) = self.companion.as_ref().map(mcp_config_json) {
+            args.push("--mcp-config".to_string());
+            args.push(config);
+        }
 
         let (finish, disconnect) = match self.spawn(&args).await {
             Ok(child) => {
@@ -158,7 +193,9 @@ impl CliDriver {
             ),
         };
         self.child_pid.store(0, Ordering::SeqCst);
-        self.finish_turn(finish).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        self.finish_turn(finish, &session_id, duration_ms, model)
+            .await;
         if !disconnect {
             self.emit(AcpEvent::StatusChanged {
                 status: ConnectionStatus::Connected,
@@ -293,12 +330,12 @@ impl CliDriver {
                             LineOutcome::Events(events) => {
                                 unparsable = 0;
                                 for event in events {
-                                    self.emit(event).await;
+                                    self.emit_recorded(event, session_id).await;
                                 }
                             }
                             LineOutcome::Finished { events, finish } => {
                                 for event in events {
-                                    self.emit(event).await;
+                                    self.emit_recorded(event, session_id).await;
                                 }
                                 return TurnEnd::Finished(finish);
                             }
@@ -334,7 +371,13 @@ impl CliDriver {
         }
     }
 
-    async fn finish_turn(&self, finish: TurnFinish) {
+    async fn finish_turn(
+        &self,
+        finish: TurnFinish,
+        session_id: &str,
+        duration_ms: u64,
+        model: Option<String>,
+    ) {
         let agent_type = self.agent_type.to_string();
         if let Some(error) = finish.error {
             tracing::warn!(
@@ -342,6 +385,13 @@ impl CliDriver {
                 code = error.code,
                 "[CLI] turn failed: {}",
                 error.message
+            );
+            record_turn_error_raw(
+                self.agent_type,
+                session_id,
+                error.message.clone(),
+                Some(error.code.to_string()),
+                false,
             );
             self.emit(AcpEvent::Error {
                 message: error.message,
@@ -352,6 +402,14 @@ impl CliDriver {
             })
             .await;
         }
+        record_turn_end(
+            self.agent_type,
+            session_id,
+            &finish.stop_reason,
+            duration_ms,
+            model,
+        )
+        .await;
         let session_id = self
             .state
             .read()
@@ -363,9 +421,17 @@ impl CliDriver {
             session_id,
             stop_reason: finish.stop_reason,
             agent_type,
-            duration_ms: None,
+            duration_ms: Some(duration_ms),
         })
         .await;
+    }
+
+    /// Emit one mapped event and record it to codeg's transcript.
+    async fn emit_recorded(&self, event: AcpEvent, session_id: &str) {
+        if let Some(update) = super::dsh_driver::transcript_update_for(&event) {
+            record_transcript_update(self.agent_type, session_id, &update);
+        }
+        self.emit(event).await;
     }
 
     fn claude_config_dir(&self) -> PathBuf {
@@ -379,6 +445,22 @@ impl CliDriver {
     async fn emit(&self, event: AcpEvent) {
         emit_with_state(&self.state, &self.emitter, event).await;
     }
+}
+
+/// `--mcp-config` payload carrying the `codeg-mcp` companion as a stdio server.
+/// Added on top of the user's own MCP config (no `--strict-mcp-config`), so the
+/// servers MyClaw projects into `CLAUDE_CONFIG_DIR/.claude.json` stay mounted.
+pub(crate) fn mcp_config_json(companion: &CompanionLaunchSpec) -> String {
+    json!({
+        "mcpServers": {
+            "codeg-mcp": {
+                "type": "stdio",
+                "command": companion.command.display().to_string(),
+                "args": companion.args,
+            }
+        }
+    })
+    .to_string()
 }
 
 pub(super) fn reject_unsupported(command: ConnectionCommand) {
@@ -409,9 +491,7 @@ pub(super) fn reject_unsupported(command: ConnectionCommand) {
 }
 
 fn unsupported() -> AcpError {
-    AcpError::Protocol(
-        "unsupported_for_cli: not available on the CLI transport".to_string(),
-    )
+    AcpError::Protocol("unsupported_for_cli: not available on the CLI transport".to_string())
 }
 
 pub(crate) fn build_args(session_id: &str, resume: bool, model: Option<&str>) -> Vec<String> {
