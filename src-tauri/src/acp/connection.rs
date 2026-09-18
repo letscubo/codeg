@@ -9117,7 +9117,13 @@ async fn handle_turn_notification(
         track_terminal_tool_calls(agent_type, &notif.update, tracked_terminal_tool_calls);
     probe.note_update(agent_type, &notif.update);
     // Custom agents have no store of their own to parse later.
-    record_transcript_update(agent_type, &session_id.0, &notif.update);
+    // fork(letscubo): pi's startup banner is dropped from the live view (see
+    // `pi_take_startup_banner`), and the history view reads THIS transcript for
+    // pi, so it must not be recorded either — otherwise every pi session opens
+    // with the banner glued onto the first reply once it is re-read.
+    if !pi_is_pending_startup_banner(agent_type, state, &notif.update).await {
+        record_transcript_update(agent_type, &session_id.0, &notif.update);
+    }
     emit_conversation_update(
         state,
         emitter,
@@ -11566,6 +11572,32 @@ async fn pi_take_startup_banner(
         }
         _ => false,
     }
+}
+
+/// Whether this update is the pending pi startup banner — a PEEK, not a take:
+/// the live path's [`pi_take_startup_banner`] still consumes it right after, so
+/// the transcript skip and the live drop agree on exactly the one chunk.
+async fn pi_is_pending_startup_banner(
+    agent_type: AgentType,
+    state: &Arc<RwLock<SessionState>>,
+    update: &SessionUpdate,
+) -> bool {
+    if agent_type != AgentType::Pi {
+        return false;
+    }
+    let SessionUpdate::AgentMessageChunk(ContentChunk {
+        content: ContentBlock::Text(text),
+        ..
+    }) = update
+    else {
+        return false;
+    };
+    state
+        .read()
+        .await
+        .pi_startup_banner
+        .as_deref()
+        .is_some_and(|banner| banner == text.text.trim())
 }
 
 /// The mode id carried by a Gemini `[MODE_UPDATE] <mode>` chunk, if this chunk
@@ -21772,6 +21804,36 @@ mod tests {
     /// `_meta.piAcp.startupInfo` on the `session/new` response and once as a bare
     /// `agent_message_chunk` — so the chunk is recognized by comparison, never by
     /// shape. Text captured from pi-acp 0.0.33 driven over real stdio ACP.
+    #[tokio::test]
+    async fn pi_startup_banner_is_skipped_by_the_transcript_peek_without_consuming_it() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "c".to_string(),
+            AgentType::Pi,
+            None,
+            "w".to_string(),
+            None,
+        )));
+        state.write().await.pi_startup_banner = Some("pi v0.85.1\n---".to_string());
+        let chunk = |t: &str| {
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                sacp::schema::TextContent::new(t),
+            )))
+        };
+        assert!(
+            pi_is_pending_startup_banner(AgentType::Pi, &state, &chunk("pi v0.85.1\n---\n")).await
+        );
+        assert!(!pi_is_pending_startup_banner(AgentType::Pi, &state, &chunk("ok")).await);
+        assert!(
+            !pi_is_pending_startup_banner(AgentType::Hermes, &state, &chunk("pi v0.85.1\n---"))
+                .await
+        );
+        // A peek: the live drop still gets to take it afterwards.
+        assert!(pi_take_startup_banner(AgentType::Pi, &state, "pi v0.85.1\n---\n").await);
+        assert!(
+            !pi_is_pending_startup_banner(AgentType::Pi, &state, &chunk("pi v0.85.1\n---")).await
+        );
+    }
+
     #[tokio::test]
     async fn pi_startup_banner_is_captured_and_dropped_exactly_once() {
         let banner = "pi v0.84.2\n---\n\n## Context\n- /tmp/scratch/AGENTS.md\n\n## Skills\n- /Users/x/.agents/skills/officecli/SKILL.md\n";
