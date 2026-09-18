@@ -447,3 +447,100 @@ async fn spawn_agent_gives_claude_code_a_cli_connection() {
     }
     manager.disconnect(&id).await.unwrap();
 }
+
+/// Background work keeps `claude -p` alive past the model's turn: it prints a
+/// `result`, waits for the task, feeds the notification back, runs a follow-up
+/// turn and prints a second `result` (claude 2.1.276 on A3). The codeg turn must
+/// span both — one `turn_complete`, after the follow-up's text — instead of
+/// ending at the first `result` and killing the process with its background task.
+#[tokio::test]
+async fn a_background_task_keeps_the_turn_open_until_its_follow_up() {
+    let h = Harness::new(&[]).await;
+    let tool = "toolu_bg";
+    h.stdout(&[
+        init_line(&h.session_id),
+        json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"description":"sleep","prompt":"sleep 25","run_in_background":true}}]},"parent_tool_use_id":null}),
+        json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a01"}]}),
+        json!({"type":"system","subtype":"task_started","task_id":"a01","tool_use_id":tool,"is_backgrounded":true}),
+        json!({"type":"user","message":{"role":"user","content":[{"tool_use_id":tool,"type":"tool_result","content":"Async agent launched successfully."}]},"parent_tool_use_id":null}),
+        json!({"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"started"}]},"parent_tool_use_id":null}),
+        json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"started"}),
+        // The sub-agent talking to itself: live-only, never transcript.
+        json!({"type":"assistant","message":{"id":"s1","content":[{"type":"text","text":"SIDECHAIN"}]},"parent_tool_use_id":tool}),
+        json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+        json!({"type":"system","subtype":"task_notification","task_id":"a01","tool_use_id":tool,"status":"completed","summary":"SUBAGENT_DONE"}),
+        json!({"type":"system","subtype":"init","session_id":h.session_id,"model":"claude-opus-5"}),
+        json!({"type":"assistant","message":{"id":"m3","content":[{"type":"text","text":"done"}]},"parent_tool_use_id":null}),
+        json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"done"}),
+    ]);
+    let mut rx = h.subscribe().await;
+    h.prompt("go").await;
+    let events = collect_until(&mut rx, is_status("connected")).await;
+
+    let completes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "turn_complete")
+        .collect();
+    assert_eq!(completes.len(), 1, "one codeg turn for both claude turns");
+    let texts: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "content_delta")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert!(
+        texts.contains(&"started") && texts.contains(&"done"),
+        "{texts:?}"
+    );
+    let done_at = events.iter().position(|e| e["text"] == "done").unwrap();
+    let complete_at = events
+        .iter()
+        .position(|e| e["type"] == "turn_complete")
+        .unwrap();
+    assert!(done_at < complete_at, "the follow-up lands inside the turn");
+    let card = events
+        .iter()
+        .filter(|e| e["type"] == "tool_call_update" && e["tool_call_id"] == tool)
+        .map(|e| e["status"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(card.last(), Some(&"completed"), "{card:?}");
+    assert!(card.contains(&"in_progress"), "{card:?}");
+
+    let transcript = crate::acp_transcript::read_transcript_in(
+        &crate::paths::codeg_acp_transcripts_root(),
+        crate::acp::registry::registry_id_for(AgentType::ClaudeCode),
+        &h.session_id,
+    );
+    let recorded =
+        serde_json::to_string(&transcript.entries.iter().map(|e| &e.p).collect::<Vec<_>>())
+            .unwrap();
+    assert!(recorded.contains("done"));
+    assert!(
+        !recorded.contains("SIDECHAIN"),
+        "sub-agent prose is live-only"
+    );
+    let turn_ends = transcript
+        .entries
+        .iter()
+        .filter(|e| e.k == crate::acp_transcript::EntryKind::TurnEnd)
+        .count();
+    assert_eq!(turn_ends, 1);
+}
+
+/// If the process exits after a `result` while the mapper still thought work
+/// was pending (e.g. a task it never heard settle), that result ends the turn —
+/// not a spurious `cli_exited`.
+#[tokio::test]
+async fn eof_after_a_deferred_result_finishes_normally() {
+    let h = Harness::new(&[]).await;
+    h.stdout(&[
+        init_line(&h.session_id),
+        json!({"type":"system","subtype":"task_started","task_id":"a01","tool_use_id":"toolu_bg","is_backgrounded":true}),
+        json!({"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"started"}]},"parent_tool_use_id":null}),
+        json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"started"}),
+    ]);
+    let mut rx = h.subscribe().await;
+    h.prompt("go").await;
+    let events = collect_until(&mut rx, |e| e["type"] == "turn_complete").await;
+    assert_eq!(events.last().unwrap()["stop_reason"], "end_turn");
+    assert!(!events.iter().any(|e| e["type"] == "error"));
+}

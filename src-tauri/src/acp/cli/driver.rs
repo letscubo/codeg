@@ -319,6 +319,12 @@ impl CliDriver {
         let mut mapper =
             StreamMapper::new(Some(session_id.to_string()), Some(self.working_dir.clone()));
         let mut unparsable = 0usize;
+        // A `result` printed while a backgrounded task still runs is NOT the
+        // end: claude keeps the process alive, feeds the task's notification
+        // back and runs a follow-up turn (see `stream_json` module docs). Keep
+        // reading; the codeg turn ends on the first `result` with nothing left
+        // in the background, or on EOF after one.
+        let mut deferred_finish: Option<TurnFinish> = None;
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
@@ -334,8 +340,17 @@ impl CliDriver {
                                 }
                             }
                             LineOutcome::Finished { events, finish } => {
+                                unparsable = 0;
                                 for event in events {
                                     self.emit_recorded(event, session_id).await;
+                                }
+                                if mapper.background_pending() {
+                                    tracing::info!(
+                                        connection_id = %self.connection_id,
+                                        "[CLI] result with background work still running; waiting for its follow-up turn"
+                                    );
+                                    deferred_finish = Some(finish);
+                                    continue;
                                 }
                                 return TurnEnd::Finished(finish);
                             }
@@ -352,10 +367,18 @@ impl CliDriver {
                             }
                         }
                     }
-                    Ok(None) => return TurnEnd::Eof,
+                    Ok(None) => {
+                        return match deferred_finish.take() {
+                            Some(finish) => TurnEnd::Finished(finish),
+                            None => TurnEnd::Eof,
+                        };
+                    }
                     Err(e) => {
                         tracing::warn!(connection_id = %self.connection_id, "[CLI] stdout read failed: {e}");
-                        return TurnEnd::Eof;
+                        return match deferred_finish.take() {
+                            Some(finish) => TurnEnd::Finished(finish),
+                            None => TurnEnd::Eof,
+                        };
                     }
                 },
                 command = commands.recv() => match command {
@@ -427,9 +450,25 @@ impl CliDriver {
     }
 
     /// Emit one mapped event and record it to codeg's transcript.
+    ///
+    /// A sub-agent's own prose (`parent_tool_use_id` set) is live-only: the
+    /// transcript has no nesting for it, so recording it would re-read as the
+    /// main agent talking — and MyClaw's live view drops it for that reason.
     async fn emit_recorded(&self, event: AcpEvent, session_id: &str) {
-        if let Some(update) = super::dsh_driver::transcript_update_for(&event) {
-            record_transcript_update(self.agent_type, session_id, &update);
+        let sidechain_prose = matches!(
+            &event,
+            AcpEvent::ContentDelta {
+                parent_tool_use_id: Some(_),
+                ..
+            } | AcpEvent::Thinking {
+                parent_tool_use_id: Some(_),
+                ..
+            }
+        );
+        if !sidechain_prose {
+            if let Some(update) = super::dsh_driver::transcript_update_for(&event) {
+                record_transcript_update(self.agent_type, session_id, &update);
+            }
         }
         self.emit(event).await;
     }

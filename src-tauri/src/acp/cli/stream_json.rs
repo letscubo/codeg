@@ -7,6 +7,14 @@
 //! frame. Deltas are forwarded; the repeat is dropped unless no delta was seen
 //! for that block. `tool_use` blocks are announced from `content_block_start`
 //! (input still empty) and completed from the `assistant` frame.
+//!
+//! Background work (`Agent` / `Bash` with `run_in_background`): `-p` does not
+//! exit when the model ends its turn while such a task runs. It waits, feeds the
+//! task's `<task-notification>` back as a queued user message, lets the model
+//! run a follow-up turn, and prints one `result` per turn (verified against
+//! claude 2.1.276). The mapper tracks the live background set from the
+//! `system` `task_*` / `background_tasks_changed` frames so the driver can tell
+//! "this `result` ends the codeg turn" from "more turns are coming".
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -51,6 +59,14 @@ pub struct StreamMapper {
     /// Per `parent_tool_use_id`: whether the open text/thinking block has
     /// already been streamed as deltas.
     streamed_block: HashMap<Option<String>, bool>,
+    /// Background task ids still running (`background_tasks_changed` is the
+    /// authority; `task_started` / `task_notification` keep it current when a
+    /// build does not send that frame).
+    background: HashSet<String>,
+    /// `tool_use_id`s of backgrounded tool calls: their immediate tool_result
+    /// only says "launched", so the card stays in progress until the task's
+    /// `task_notification` settles it.
+    background_tools: HashSet<String>,
 }
 
 impl StreamMapper {
@@ -60,7 +76,15 @@ impl StreamMapper {
             cwd,
             announced_tools: HashSet::new(),
             streamed_block: HashMap::new(),
+            background: HashSet::new(),
+            background_tools: HashSet::new(),
         }
+    }
+
+    /// Whether a backgrounded task is still running — i.e. a `result` seen now
+    /// is not the last one this process will print.
+    pub fn background_pending(&self) -> bool {
+        !self.background.is_empty()
     }
 
     pub fn map_line(&mut self, line: &str) -> LineOutcome {
@@ -71,7 +95,7 @@ impl StreamMapper {
             Some("system") => self.on_system(&value),
             Some("stream_event") => self.on_stream_event(&value),
             Some("assistant") => self.on_assistant(&value),
-            Some("user") => on_user(&value),
+            Some("user") => self.on_user(&value),
             Some("result") => {
                 return LineOutcome::Finished {
                     events: usage_from_result(&value)
@@ -88,8 +112,51 @@ impl StreamMapper {
     }
 
     fn on_system(&mut self, v: &Value) -> Vec<AcpEvent> {
-        if v["subtype"] != "init" {
-            return Vec::new();
+        match v["subtype"].as_str() {
+            Some("init") => {}
+            Some("background_tasks_changed") => {
+                if let Some(tasks) = v["tasks"].as_array() {
+                    self.background = tasks
+                        .iter()
+                        .filter_map(|t| t["task_id"].as_str().map(str::to_string))
+                        .collect();
+                }
+                return Vec::new();
+            }
+            Some("task_started") => {
+                if v["is_backgrounded"].as_bool() == Some(true) {
+                    if let Some(id) = v["task_id"].as_str() {
+                        self.background.insert(id.to_string());
+                    }
+                    // Only the main thread's own calls own a card here; a
+                    // sub-agent's backgrounded Bash is its own business.
+                    if v["owned_by_subagent"].as_bool() != Some(true) {
+                        if let Some(tool) = v["tool_use_id"].as_str() {
+                            self.background_tools.insert(tool.to_string());
+                        }
+                    }
+                }
+                return Vec::new();
+            }
+            Some("task_updated") => {
+                let status = v["patch"]["status"].as_str().unwrap_or("");
+                if matches!(
+                    status,
+                    "completed" | "failed" | "killed" | "stopped" | "cancelled"
+                ) {
+                    if let Some(id) = v["task_id"].as_str() {
+                        self.background.remove(id);
+                    }
+                }
+                return Vec::new();
+            }
+            Some("task_notification") => {
+                if let Some(id) = v["task_id"].as_str() {
+                    self.background.remove(id);
+                }
+                return self.settle_background_tool(v);
+            }
+            _ => return Vec::new(),
         }
         match v["session_id"].as_str() {
             Some(sid) if self.session_id.as_deref() != Some(sid) => {
@@ -215,32 +282,67 @@ impl StreamMapper {
     }
 }
 
-fn on_user(v: &Value) -> Vec<AcpEvent> {
-    let Some(blocks) = v["message"]["content"].as_array() else {
-        return Vec::new();
-    };
-    blocks
-        .iter()
-        .filter(|b| b["type"] == "tool_result")
-        .filter_map(|b| {
-            let id = b["tool_use_id"].as_str()?;
-            let failed = b["is_error"].as_bool().unwrap_or(false);
-            Some(AcpEvent::ToolCallUpdate {
-                tool_call_id: id.to_string(),
-                title: None,
-                status: Some(if failed { "failed" } else { "completed" }.to_string()),
-                content: None,
-                raw_input: None,
-                // `raw_output` carries serialized JSON; encode the text as a
-                // JSON string so it always renders as text.
-                raw_output: Some(Value::String(tool_result_text(&b["content"])).to_string()),
-                raw_output_append: None,
-                locations: None,
-                meta: None,
-                images: None,
+impl StreamMapper {
+    fn on_user(&self, v: &Value) -> Vec<AcpEvent> {
+        let Some(blocks) = v["message"]["content"].as_array() else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_result")
+            .filter_map(|b| {
+                let id = b["tool_use_id"].as_str()?;
+                let failed = b["is_error"].as_bool().unwrap_or(false);
+                // A backgrounded call's result only acknowledges the launch.
+                let status = if failed {
+                    "failed"
+                } else if self.background_tools.contains(id) {
+                    "in_progress"
+                } else {
+                    "completed"
+                };
+                Some(tool_result_update(id, status, &b["content"]))
             })
-        })
-        .collect()
+            .collect()
+    }
+
+    /// `task_notification` for a backgrounded main-thread call: settle its card
+    /// with the task's outcome and summary.
+    fn settle_background_tool(&mut self, v: &Value) -> Vec<AcpEvent> {
+        let Some(tool) = v["tool_use_id"].as_str() else {
+            return Vec::new();
+        };
+        if !self.background_tools.remove(tool) {
+            return Vec::new();
+        }
+        let status = match v["status"].as_str() {
+            Some("completed") => "completed",
+            _ => "failed",
+        };
+        let summary = v["summary"].as_str().unwrap_or_default();
+        vec![tool_result_update(
+            tool,
+            status,
+            &Value::String(summary.to_string()),
+        )]
+    }
+}
+
+fn tool_result_update(id: &str, status: &str, content: &Value) -> AcpEvent {
+    AcpEvent::ToolCallUpdate {
+        tool_call_id: id.to_string(),
+        title: None,
+        status: Some(status.to_string()),
+        content: None,
+        raw_input: None,
+        // `raw_output` carries serialized JSON; encode the text as a JSON
+        // string so it always renders as text.
+        raw_output: Some(Value::String(tool_result_text(content)).to_string()),
+        raw_output_append: None,
+        locations: None,
+        meta: None,
+        images: None,
+    }
 }
 
 fn text_event(text: &str, thinking: bool, parent_tool_use_id: Option<String>) -> AcpEvent {
@@ -462,7 +564,7 @@ mod tests {
 
     #[test]
     fn failed_tool_result_is_marked_failed() {
-        let evs = on_user(
+        let evs = StreamMapper::new(None, None).on_user(
             &json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"Exit code 137","is_error":true}]}}),
         );
         assert_eq!(serde_json::to_value(&evs[0]).unwrap()["status"], "failed");
@@ -518,6 +620,67 @@ mod tests {
                 error: None
             }
         );
+    }
+
+    /// Shapes captured from claude 2.1.276 `-p` on A3 (2026-09-18).
+    #[test]
+    fn a_backgrounded_agent_stays_in_progress_until_its_notification() {
+        let mut m = StreamMapper::new(Some(SID.to_string()), None);
+        let tool = "toolu_bg";
+        let evs = events(
+            &mut m,
+            &[
+                json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"description":"sleep","prompt":"sleep 25","run_in_background":true}}]},"parent_tool_use_id":null}),
+                json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a01","task_type":"local_agent","description":"sleep"}]}),
+                json!({"type":"system","subtype":"task_started","task_id":"a01","tool_use_id":tool,"is_backgrounded":true,"task_type":"local_agent"}),
+                json!({"type":"user","message":{"role":"user","content":[{"tool_use_id":tool,"type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully."}]}]},"parent_tool_use_id":null}),
+                // A sub-agent's own foreground Bash is not the main thread's background work.
+                json!({"type":"system","subtype":"task_started","task_id":"b01","owned_by_subagent":true,"tool_use_id":"toolu_sub","is_backgrounded":false,"task_type":"local_bash"}),
+            ],
+        );
+        assert_eq!(
+            evs.last().unwrap()["status"],
+            "in_progress",
+            "launch ack is not completion"
+        );
+        assert!(m.background_pending());
+
+        let evs = events(
+            &mut m,
+            &[
+                json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+                json!({"type":"system","subtype":"task_updated","task_id":"a01","patch":{"status":"completed"}}),
+                json!({"type":"system","subtype":"task_notification","task_id":"a01","tool_use_id":tool,"status":"completed","summary":"SUBAGENT_DONE"}),
+            ],
+        );
+        assert!(!m.background_pending());
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["tool_call_id"], tool);
+        assert_eq!(evs[0]["status"], "completed");
+        assert!(evs[0]["raw_output"]
+            .as_str()
+            .unwrap()
+            .contains("SUBAGENT_DONE"));
+    }
+
+    #[test]
+    fn a_failed_background_task_settles_its_card_as_failed() {
+        let mut m = StreamMapper::new(Some(SID.to_string()), None);
+        events(
+            &mut m,
+            &[
+                json!({"type":"system","subtype":"task_started","task_id":"t","tool_use_id":"toolu_x","is_backgrounded":true}),
+            ],
+        );
+        assert!(m.background_pending());
+        let evs = events(
+            &mut m,
+            &[
+                json!({"type":"system","subtype":"task_notification","task_id":"t","tool_use_id":"toolu_x","status":"failed","summary":"boom"}),
+            ],
+        );
+        assert!(!m.background_pending());
+        assert_eq!(evs[0]["status"], "failed");
     }
 
     #[test]
