@@ -37,6 +37,11 @@ pub struct DshStreamMapper {
     last_step_usage: Option<(u64, u64)>,
     /// Set by `turn_end`; consumed by `final` (or by the driver on EOF).
     pending_finish: Option<TurnFinish>,
+    /// Background subagent calls (`started subagent <id>`): their tool_result
+    /// only acknowledges the launch. codeg's runner keeps the process alive
+    /// until they settle and the parent's follow-up turns ran, so they are
+    /// done by `final` — the card is completed there.
+    background_calls: Vec<String>,
 }
 
 impl DshStreamMapper {
@@ -48,6 +53,7 @@ impl DshStreamMapper {
             saw_text: false,
             last_step_usage: None,
             pending_finish: None,
+            background_calls: Vec::new(),
         }
     }
 
@@ -84,7 +90,7 @@ impl DshStreamMapper {
                 None => Vec::new(),
             },
             Some("tool_call") => self.on_tool_call(&value),
-            Some("tool_result") => on_tool_result(&value),
+            Some("tool_result") => self.on_tool_result(&value),
             Some("final") => return self.on_final(&value),
             Some("error") => return on_runner_error(&value),
             _ => Vec::new(),
@@ -146,8 +152,41 @@ impl DshStreamMapper {
         }]
     }
 
+    fn on_tool_result(&mut self, v: &Value) -> Vec<AcpEvent> {
+        let mut events = on_tool_result(v);
+        let launched = v["result"].as_str().is_some_and(|r| {
+            r.starts_with("started subagent ") || r.starts_with("started background subagent")
+        });
+        if launched && v["status"].as_str() != Some("error") {
+            if let Some(id) = v["callId"].as_str().filter(|s| !s.is_empty()) {
+                self.background_calls.push(id.to_string());
+                for event in &mut events {
+                    if let AcpEvent::ToolCallUpdate { status, .. } = event {
+                        *status = Some("in_progress".to_string());
+                    }
+                }
+            }
+        }
+        events
+    }
+
     fn on_final(&mut self, v: &Value) -> LineOutcome {
-        let mut events = Vec::new();
+        let mut events: Vec<AcpEvent> = self
+            .background_calls
+            .drain(..)
+            .map(|id| AcpEvent::ToolCallUpdate {
+                tool_call_id: id,
+                title: None,
+                status: Some("completed".to_string()),
+                content: None,
+                raw_input: None,
+                raw_output: None,
+                raw_output_append: None,
+                locations: None,
+                meta: None,
+                images: None,
+            })
+            .collect();
         if !self.saw_text {
             if let Some(text) = text_of(v) {
                 events.push(AcpEvent::ContentDelta {
@@ -250,7 +289,10 @@ fn on_runner_error(v: &Value) -> LineOutcome {
         .to_string();
     let lower = message.to_ascii_lowercase();
     let code = if lower.contains("session")
-        && (lower.contains("unknown") || lower.contains("not found") || lower.contains("no stored"))
+        && (lower.contains("unknown")
+            || lower.contains("not found")
+            || lower.contains("no stored")
+            || lower.contains("does not exist"))
     {
         "cli_resume_failed"
     } else {
@@ -434,6 +476,52 @@ mod tests {
                 assert_eq!(finish.error.unwrap().code, "cli_execution_error")
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Shapes from codeg's runner on A3 (2026-09-18): the launch ack, two
+    /// follow-up turns, then one `final`.
+    #[test]
+    fn a_background_subagent_card_stays_open_until_final() {
+        let mut m = mapper();
+        m.map_line(&json!({"type":"tool_call","callId":"c1","tool":"subagent","input":{"description":"sleep","prompt":"sleep 20","run_in_background":true}}).to_string());
+        let ack = events(m.map_line(
+            &json!({"type":"tool_result","callId":"c1","status":"completed","result":"started subagent 0aa0d709-73b5-47b2-a8de-768d6148d889"}).to_string(),
+        ));
+        assert_eq!(
+            serde_json::to_value(&ack[0]).unwrap()["status"],
+            "in_progress"
+        );
+        m.map_line(
+            &json!({"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"completed"}})
+                .to_string(),
+        );
+        m.map_line(&json!({"type":"text","text":"BG_OK"}).to_string());
+        m.map_line(
+            &json!({"type":"status","phase":"turn_end","turn":2,"reason":{"kind":"completed"}})
+                .to_string(),
+        );
+        match m.map_line(&json!({"type":"final","text":"BG_OK"}).to_string()) {
+            LineOutcome::Finished { events, finish } => {
+                let first = serde_json::to_value(&events[0]).unwrap();
+                assert_eq!(first["tool_call_id"], "c1");
+                assert_eq!(first["status"], "completed");
+                assert_eq!(finish.stop_reason, STOP_END_TURN);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_runners_missing_session_message_is_a_resume_failure() {
+        let mut m = mapper();
+        match m.map_line(
+            &json!({"type":"error","message":"session \"session-x\" does not exist; omit --session-id to start a new Session"}).to_string(),
+        ) {
+            LineOutcome::Finished { finish, .. } => {
+                assert_eq!(finish.error.unwrap().code, "cli_resume_failed")
+            }
+            other => panic!("expected Finished, got {other:?}"),
         }
     }
 
