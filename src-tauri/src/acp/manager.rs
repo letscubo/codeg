@@ -683,11 +683,14 @@ impl ConnectionManager {
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, AcpError> {
-        // fork(letscubo): DeepSeek and Claude Code have no ACP process — they
-        // run only on the CLI transport (official `dsh --profile headless`,
-        // `claude -p`). Mode / config preferences are ACP-only and have
+        // fork(letscubo): DeepSeek, Claude Code and Codex have no ACP process —
+        // they run only on the CLI transport (official `dsh --profile headless`,
+        // `claude -p`, `codex app-server`). Mode / config preferences are ACP-only and have
         // nothing to apply to.
-        if matches!(agent_type, AgentType::DeepSeek | AgentType::ClaudeCode) {
+        if matches!(
+            agent_type,
+            AgentType::DeepSeek | AgentType::ClaudeCode | AgentType::Codex
+        ) {
             let _ = (preferred_mode_id, preferred_config_values);
             return self
                 .spawn_cli_agent(

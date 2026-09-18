@@ -16,7 +16,9 @@ use std::sync::Arc;
 use axum::{extract::Extension, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::acp::cli::{binary, dsh_binary, CliConnectError, CliConnectRequest, CliConnection};
+use crate::acp::cli::{
+    binary, codex_binary, dsh_binary, CliConnectError, CliConnectRequest, CliConnection,
+};
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::ConnectionTransport;
@@ -189,7 +191,7 @@ async fn connect(
         return Err(coded_invalid(
             "unsupported_agent",
             format!(
-                "{agent_type} is not supported by the CLI transport; supported: claude_code, deepseek"
+                "{agent_type} is not supported by the CLI transport; supported: claude_code, deepseek, codex"
             ),
         ));
     }
@@ -228,6 +230,7 @@ async fn connect(
     }
     let executable = match agent_type {
         AgentType::DeepSeek => dsh_binary::resolve_dsh_executable(&runtime_env).await,
+        AgentType::Codex => codex_binary::resolve_codex_executable(&runtime_env).await,
         _ => binary::resolve_claude_executable(&runtime_env).await,
     }
     .map_err(|e| AppCommandError::dependency_missing(format!("cli_not_installed: {e}")))?;
@@ -260,9 +263,10 @@ async fn connect(
 
 /// Agents the CLI transport can drive. Adding one needs a driver in
 /// `acp::cli` and a binary resolver.
-const CLI_TRANSPORT_AGENTS: &[AgentType] = &[AgentType::ClaudeCode, AgentType::DeepSeek];
+const CLI_TRANSPORT_AGENTS: &[AgentType] =
+    &[AgentType::ClaudeCode, AgentType::DeepSeek, AgentType::Codex];
 
-/// Claude session ids are bare uuids; the official DeepSeek Harness launcher
+/// Claude session ids and Codex thread ids are uuids; the official DeepSeek Harness launcher
 /// mints `session-<uuid>` and only continues an id in that exact spelling.
 fn validate_cli_session_id(agent_type: AgentType, session_id: &str) -> Result<(), AppCommandError> {
     match agent_type {
@@ -336,12 +340,15 @@ mod tests {
             "a bridge id is continued, not rejected"
         );
         assert!(validate_cli_session_id(AgentType::DeepSeek, "session-nope").is_err());
+        // codex thread ids (uuid v7) are uuids
+        assert!(validate_cli_session_id(AgentType::Codex, "01a0b54e-568c-7310-aa4d-f777c3663fb7").is_ok());
+        assert!(validate_cli_session_id(AgentType::Codex, "thread-x").is_err());
     }
 
     #[test]
     fn cli_transport_allow_list() {
         assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::ClaudeCode));
         assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::DeepSeek));
-        assert!(!CLI_TRANSPORT_AGENTS.contains(&AgentType::Codex));
+        assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::Codex));
     }
 }

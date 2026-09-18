@@ -337,15 +337,8 @@ pub struct AcpAdapterRelation {
 /// `acp_adapter_relation_covers_only_wrapper_agents` test in sync.
 pub fn acp_adapter_relation(agent_type: AgentType) -> Option<AcpAdapterRelation> {
     match agent_type {
-        // fork(letscubo): no Claude Code entry — codeg installs and runs the
-        // vendor CLI itself (CLI transport), so there is no adapter split.
-        AgentType::Codex => Some(AcpAdapterRelation {
-            native_cmd: "codex",
-            native_label: "Codex CLI",
-            shared_config_dir: "~/.codex",
-            extra_dirs: &[".local/bin"],
-            docs_url: ACP_ADAPTER_DOCS_URL,
-        }),
+        // fork(letscubo): no Claude Code / Codex entry — codeg installs and runs
+        // each vendor CLI itself (CLI transport), so there is no adapter split.
         _ => None,
     }
 }
@@ -371,6 +364,9 @@ pub fn binary_system_dirs(agent_type: AgentType) -> &'static [&'static str] {
 
 /// Docs anchor explaining the adapter/vendor-CLI split. The zh mirror carries
 /// the same explicit `{#acp-adapters}` anchor.
+// fork(letscubo): no built-in agent is an adapter any more (see
+// `acp_adapter_relation`); kept for when one is added back.
+#[allow(dead_code)]
 const ACP_ADAPTER_DOCS_URL: &str = "https://docs.codeg.app/guide/supported-agents#acp-adapters";
 
 /// Minimum adapter version whose `_session/steering` honors the
@@ -1052,7 +1048,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             agent_type,
             supports_mcp: true,
             name: "Codex CLI",
-            description: "ACP adapter for OpenAI's coding assistant",
+            description: "OpenAI's coding agent",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
             // 1.1.8 depends on `@openai/codex` ^0.145.0 and drives `codex
@@ -1527,13 +1523,23 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // `features.cwd_relative_turn_diffs = false` in the merged config so
             // turn-diff paths are git-root relative — codeg writes no such key
             // (repo grep: zero hits) and reads no turn diff.
+            // fork(letscubo): the notes above describe the ACP adapter codeg
+            // used to install. Codex now runs ONLY on the CLI transport
+            // (`acp::cli::codex_driver`: one `codex app-server` per turn, driven
+            // over its stdio JSON-RPC), so the distribution is the vendor CLI
+            // itself and install / version / upgrade track the Codex build
+            // directly. `ConnectionManager::spawn_agent` registers a CLI
+            // connection for this agent. 0.155.0 is the build the app-server
+            // protocol (thread/start, thread/resume, turn/start, turn/interrupt,
+            // item/agentMessage/delta) was verified against.
             distribution: AgentDistribution::Npx {
-                version: "1.12.0",
-                package: "@agentclientprotocol/codex-acp@1.12.0",
-                cmd: "codex-acp",
+                version: "0.155.0",
+                package: "@openai/codex@0.155.0",
+                cmd: "codex",
                 args: &[],
                 env: &[],
-                node_required: Some("20.0.0"),
+                // package.json declares `engines.node: ">=16"`.
+                node_required: Some("16.0.0"),
             },
         },
         AgentType::Gemini => AcpAgentMeta {
@@ -2684,9 +2690,9 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.12.0",
-            "@agentclientprotocol/codex-acp@1.12.0",
-            Some("20.0.0"),
+            "0.155.0",
+            "@openai/codex@0.155.0",
+            Some("16.0.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
         assert_npx_version(
@@ -2756,30 +2762,18 @@ mod tests {
         assert!(!launch_spec_uses_cursor_acp("cursor-agent", &["stdio"]));
     }
 
-    // Only Codex ships as a third-party ACP adapter wrapping a vendor CLI of a
-    // different name (Claude Code runs its vendor CLI on the CLI transport). Every other agent's registry `cmd` IS the
-    // vendor CLI, so claiming an adapter relation for one would make preflight
-    // explain a split that doesn't exist.
+    // fork(letscubo): Claude Code and Codex — the two agents upstream ships as
+    // third-party ACP adapters wrapping a differently named vendor CLI — both
+    // run their vendor CLI on the CLI transport here. Every remaining agent's
+    // registry `cmd` IS the vendor CLI, so claiming an adapter relation for one
+    // would make preflight explain a split that doesn't exist.
     #[test]
     fn acp_adapter_relation_covers_only_wrapper_agents() {
         for agent_type in all_acp_agents() {
-            let relation = acp_adapter_relation(agent_type);
-            let expected = matches!(agent_type, AgentType::Codex);
-            assert_eq!(
-                relation.is_some(),
-                expected,
+            assert!(
+                acp_adapter_relation(agent_type).is_none(),
                 "unexpected adapter relation for {agent_type:?}"
             );
-            // The whole point is that the vendor CLI's name differs from the
-            // adapter command codeg actually launches.
-            if let Some(relation) = relation {
-                match get_agent_meta(agent_type).distribution {
-                    AgentDistribution::Npx { cmd, .. } => {
-                        assert_ne!(cmd, relation.native_cmd, "{agent_type:?}")
-                    }
-                    other => panic!("expected npx distribution for {agent_type:?}, got {other:?}"),
-                }
-            }
         }
     }
 

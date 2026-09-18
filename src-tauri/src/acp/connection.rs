@@ -1473,7 +1473,7 @@ pub(crate) fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> 
     if agent_type == AgentType::DeepSeek {
         return Some(registry::registry_id_for(agent_type));
     }
-    // claude_code / hermes / pi: the remaining kind=all runtimes. Their native
+    // claude_code / hermes / pi / codex: the remaining kind=all runtimes. Their native
     // stores are trustworthy but lossy for what a MyClaw chat needs — claude.rs
     // caps tool input and output at 500 chars, none of the three keeps the
     // prompt's attachments, and no native store carries a stop reason or the
@@ -1481,9 +1481,13 @@ pub(crate) fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> 
     // reproduces the live view exactly. The read path prefers this transcript
     // and copies per-turn token usage back from the native store, which is the
     // one thing the wire lacks (`merge_native_turn_usage`).
+    //
+    // codex: the CLI driver (`acp::cli::codex_driver`) records here for the
+    // same reason — the rollout under `CODEX_HOME/sessions` is per agent home,
+    // and only the relayed wire carries the stop reason and surfaced errors.
     if matches!(
         agent_type,
-        AgentType::ClaudeCode | AgentType::Hermes | AgentType::Pi
+        AgentType::ClaudeCode | AgentType::Hermes | AgentType::Pi | AgentType::Codex
     ) {
         return Some(registry::registry_id_for(agent_type));
     }
@@ -14913,16 +14917,23 @@ mod tests {
         assert!(transcript_dir_for(AgentType::OpenClaw).is_some());
         // The other kind=all runtimes record too: their history must match the
         // live wire (full tool input/output, attachments, stop reason).
-        for at in [AgentType::ClaudeCode, AgentType::Hermes, AgentType::Pi] {
+        for at in [
+            AgentType::ClaudeCode,
+            AgentType::Hermes,
+            AgentType::Pi,
+            AgentType::Codex,
+        ] {
             assert!(transcript_dir_for(at).is_some(), "{at:?} must be recorded");
         }
         // Built-ins outside kind=all keep their native store as the only
         // history — recording them would double the storage and risk two
         // disagreeing histories.
-        assert!(
-            transcript_dir_for(AgentType::Codex).is_none(),
-            "built-ins with a reliable native store must not be double-recorded",
-        );
+        for at in [AgentType::Gemini, AgentType::Cursor] {
+            assert!(
+                transcript_dir_for(at).is_none(),
+                "built-ins with a reliable native store must not be double-recorded",
+            );
+        }
     }
 
     /// Unwrap a select selector. The Grok synthesizers below only ever build
@@ -16596,11 +16607,12 @@ mod tests {
             Some("session_archived"),
         );
 
-        // Codex reads history back out of its own rollout store, so an archived
+        // A built-in that reads history back out of its own store (Gemini; Codex
+        // did too before it moved to the recorded CLI transport): an archived
         // session must stop with the banner — silently opening a new session
         // would orphan history that one command restores.
         assert!(!recovers_load_failure_locally(
-            AgentType::Codex,
+            AgentType::Gemini,
             Some("session_archived")
         ));
         // A custom agent's history is codeg's own transcript, so it keeps the
@@ -16691,7 +16703,12 @@ mod tests {
 
         // The kind=all runtimes codeg records (see `transcript_dir_for`) can
         // recover the same way: their history lives in codeg's transcript.
-        for recorded in [AgentType::ClaudeCode, AgentType::Hermes, AgentType::Pi] {
+        for recorded in [
+            AgentType::ClaudeCode,
+            AgentType::Hermes,
+            AgentType::Pi,
+            AgentType::Codex,
+        ] {
             assert!(
                 recovers_load_failure_locally(recorded, Some("session_unavailable")),
                 "{recorded:?} is recorded by codeg and must recover locally"
@@ -16700,7 +16717,7 @@ mod tests {
         // Built-ins codeg does not record read history back out of the agent's
         // own store, so a forgotten session really is gone and must still stop
         // with the banner.
-        for builtin in [AgentType::Codex, AgentType::Gemini, AgentType::Cursor] {
+        for builtin in [AgentType::Gemini, AgentType::Cursor] {
             assert!(
                 !recovers_load_failure_locally(builtin, Some("session_unavailable")),
                 "{builtin:?} has no codeg-side transcript to fall back on"

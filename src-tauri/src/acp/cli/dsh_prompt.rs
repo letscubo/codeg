@@ -100,7 +100,7 @@ pub(crate) fn flatten_prompt(
 
 /// An existing `file://` upload is referenced in place; anything else is
 /// decoded and written content-addressed under the workspace.
-fn attachment_path(
+pub(crate) fn attachment_path(
     working_dir: &Path,
     data: &str,
     mime_type: &str,

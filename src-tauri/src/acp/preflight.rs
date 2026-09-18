@@ -767,38 +767,16 @@ async fn check_binary_environment(
 mod adapter_tests {
     use super::*;
 
-    fn info_for(agent_type: AgentType, native_path: Option<&str>, installed: bool) -> AdapterInfo {
-        let meta = registry::get_agent_meta(agent_type);
-        let relation = registry::acp_adapter_relation(agent_type)
-            .expect("agent under test must be an adapter agent");
-        build_adapter_info(
-            &meta,
-            &relation,
-            installed,
-            native_path.map(str::to_string),
-        )
-    }
-
-    #[test]
-    fn codex_adapter_info_uses_codex_home() {
-        let info = info_for(AgentType::Codex, None, true);
-        assert_eq!(info.adapter_package, "@agentclientprotocol/codex-acp@1.12.0");
-        assert_eq!(info.adapter_cmd, "codex-acp");
-        assert!(info.adapter_installed);
-        assert_eq!(info.native_cmd, "codex");
-        assert!(info.native_path.is_none());
-        assert_eq!(info.shared_config_dir, "~/.codex");
-    }
-
     // Non-adapter agents must produce nothing: `probe_adapter` short-circuits
     // on the registry relation, so an agent whose `cmd` IS the vendor CLI never
     // gets an explainer claiming otherwise.
     #[tokio::test]
     async fn non_adapter_agents_have_no_adapter_info() {
-        // fork(letscubo): Claude Code installs and runs its vendor CLI (CLI
-        // transport), so it has no adapter split to explain any more.
+        // fork(letscubo): Claude Code and Codex install and run their vendor
+        // CLI (CLI transport), so neither has an adapter split to explain.
         for agent_type in [
             AgentType::ClaudeCode,
+            AgentType::Codex,
             AgentType::Gemini,
             AgentType::Cline,
             AgentType::OpenCode,

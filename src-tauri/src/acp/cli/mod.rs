@@ -1,15 +1,19 @@
-//! fork(letscubo)专属: CLI transport (Claude Code, DeepSeek Harness).
+//! fork(letscubo)专属: CLI transport (Claude Code, DeepSeek Harness, Codex).
 //!
 //! A `ConnectionTransport::Cli` connection is an ordinary entry in the
 //! [`ConnectionManager`] map — same `connection_id`, `SessionState`, prompt
 //! lock, `turn_in_flight` gate and event pipeline as an ACP connection. The one
 //! difference is who consumes its `cmd_tx`: instead of a long-lived ACP adapter
 //! loop, a per-turn driver runs one CLI process per prompt — [`driver::CliDriver`]
-//! for `claude -p`, [`dsh_driver::DshDriver`] for `dsh --profile headless`. That
+//! for `claude -p`, [`dsh_driver::DshDriver`] for `dsh --profile headless`,
+//! [`codex_driver::CodexDriver`] for `codex app-server` (JSON-RPC over stdio). That
 //! keeps `send_prompt_linked_with_message_id`, `cancel`, the lifecycle worker,
 //! chat-channel webhooks, WS attach and snapshots working unchanged.
 
 pub mod binary;
+pub mod codex_binary;
+pub mod codex_driver;
+pub mod codex_stream;
 pub mod driver;
 pub mod dsh_binary;
 pub mod dsh_driver;
@@ -20,6 +24,8 @@ pub mod dsh_tool_info;
 pub mod stream_json;
 pub mod tool_info;
 
+#[cfg(all(test, unix))]
+mod codex_tests;
 #[cfg(all(test, unix))]
 mod dsh_tests;
 #[cfg(all(test, unix))]
@@ -186,7 +192,8 @@ impl ConnectionManager {
         // arrives.
         let session_id = match (request.agent_type, request.session_id) {
             (_, Some(id)) => Some(id),
-            (AgentType::DeepSeek, None) => None,
+            // codex: `thread/start` mints the thread id on the first turn.
+            (AgentType::DeepSeek | AgentType::Codex, None) => None,
             (_, None) => Some(uuid::Uuid::new_v4().to_string()),
         };
 
@@ -214,7 +221,10 @@ impl ConnectionManager {
         };
         // claude: the same `codeg-mcp` companion, handed over per turn with
         // `--mcp-config` (the ACP path injects it into `mcpServers`).
-        let (claude_companion, claude_delegation) = if request.agent_type == AgentType::ClaudeCode {
+        let (claude_companion, claude_delegation) = if matches!(
+            request.agent_type,
+            AgentType::ClaudeCode | AgentType::Codex
+        ) {
             let delegation = self.delegation_snapshot();
             let companion = match delegation.as_ref() {
                 Some(injection) => {
@@ -288,6 +298,22 @@ impl ConnectionManager {
                 };
                 tokio::spawn(driver.run(cmd_rx));
             }
+            None if request.agent_type == AgentType::Codex => {
+                let driver = codex_driver::CodexDriver {
+                    connection_id: connection_id.clone(),
+                    agent_type: request.agent_type,
+                    executable: request.executable,
+                    working_dir: request.working_dir,
+                    runtime_env: request.runtime_env,
+                    state: Arc::clone(&state),
+                    emitter: emitter.clone(),
+                    child_pid,
+                    connections: Arc::clone(&self.connections),
+                    companion: claude_companion,
+                    delegation: claude_delegation,
+                };
+                tokio::spawn(driver.run(cmd_rx));
+            }
             None => {
                 let driver = driver::CliDriver {
                     connection_id: connection_id.clone(),
@@ -341,10 +367,10 @@ impl ConnectionManager {
 }
 
 impl ConnectionManager {
-    /// `spawn_agent` for the CLI-only agents (DeepSeek, Claude Code): there is
+    /// `spawn_agent` for the CLI-only agents (DeepSeek, Claude Code, Codex): there is
     /// no ACP process for them any more, so every caller — `acp_connect`, chat
     /// channels, work tasks, automations, delegation — gets a CLI connection
-    /// (`dsh --profile headless` / `claude -p`). The returned id works with the
+    /// (`dsh --profile headless` / `claude -p` / `codex app-server`). The returned id works with the
     /// same `send_prompt_linked*` / `cancel` / `disconnect` calls.
     ///
     /// A resume id in the old bridge spelling (bare uuid) becomes a fresh
@@ -366,14 +392,17 @@ impl ConnectionManager {
             .ok_or_else(|| AcpError::protocol("a CLI connection needs a working dir"))?;
         // Claude continues any uuid it wrote; anything else starts fresh.
         let session_id = match (agent_type, session_id) {
-            (AgentType::ClaudeCode, Some(id)) if uuid::Uuid::parse_str(&id).is_err() => {
-                tracing::warn!("[CLI] {id} is not a Claude session id; starting a fresh session");
+            (AgentType::ClaudeCode | AgentType::Codex, Some(id))
+                if uuid::Uuid::parse_str(&id).is_err() =>
+            {
+                tracing::warn!("[CLI] {id} is not a {agent_type} session id; starting a fresh session");
                 None
             }
             (_, session_id) => session_id,
         };
         let executable = match agent_type {
             AgentType::DeepSeek => dsh_binary::resolve_dsh_executable(&runtime_env).await,
+            AgentType::Codex => codex_binary::resolve_codex_executable(&runtime_env).await,
             _ => binary::resolve_claude_executable(&runtime_env).await,
         }
         .map_err(|e| AcpError::protocol(format!("cli_not_installed: {e}")))?;
