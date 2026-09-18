@@ -544,3 +544,34 @@ async fn eof_after_a_deferred_result_finishes_normally() {
     assert_eq!(events.last().unwrap()["stop_reason"], "end_turn");
     assert!(!events.iter().any(|e| e["type"] == "error"));
 }
+
+/// Background work that never settles (a backgrounded dev server) must not pin
+/// the connection forever: past the wait budget the turn ends with a clear
+/// error and the process is stopped.
+#[tokio::test]
+async fn background_work_that_never_settles_is_stopped_after_the_budget() {
+    let h = Harness::new(&[
+        ("CODEG_CLI_BACKGROUND_WAIT_SECS", "1"),
+        ("FAKE_SLEEP", "30"),
+    ])
+    .await;
+    h.stdout(&[
+        init_line(&h.session_id),
+        json!({"type":"system","subtype":"task_started","task_id":"srv","tool_use_id":"toolu_srv","is_backgrounded":true,"task_type":"local_bash"}),
+        json!({"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"server up"}]},"parent_tool_use_id":null}),
+        json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"server up"}),
+    ]);
+    let mut rx = h.subscribe().await;
+    let started = std::time::Instant::now();
+    h.prompt("go").await;
+    let events = collect_until(&mut rx, |e| e["type"] == "turn_complete").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "stopped at the budget, not after FAKE_SLEEP"
+    );
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "error" && e["code"] == "cli_background_timeout"));
+    assert_eq!(events.last().unwrap()["stop_reason"], "end_turn");
+    assert!(!h.turn_in_flight().await);
+}

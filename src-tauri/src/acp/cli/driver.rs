@@ -46,6 +46,12 @@ pub(super) const EXIT_WAIT: Duration = Duration::from_secs(5);
 pub(super) const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 pub(super) const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+/// How long a turn may keep waiting on background work after the model's own
+/// `result` before codeg stops the process. claude itself waits indefinitely —
+/// a backgrounded dev server never finishes — so an unbounded wait would pin
+/// the connection at `turn_in_progress` forever.
+const BACKGROUND_WAIT_ENV: &str = "CODEG_CLI_BACKGROUND_WAIT_SECS";
+const DEFAULT_BACKGROUND_WAIT: Duration = Duration::from_secs(20 * 60);
 
 const BASE_ARGS: &[&str] = &[
     "-p",
@@ -325,8 +331,36 @@ impl CliDriver {
         // reading; the codeg turn ends on the first `result` with nothing left
         // in the background, or on EOF after one.
         let mut deferred_finish: Option<TurnFinish> = None;
+        let mut background_deadline: Option<tokio::time::Instant> = None;
         loop {
+            let deadline = background_deadline;
             tokio::select! {
+                _ = async move {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let waited = self.background_wait();
+                    tracing::warn!(
+                        connection_id = %self.connection_id,
+                        "[CLI] background work still running after {}s; stopping the turn",
+                        waited.as_secs()
+                    );
+                    let mut finish = deferred_finish.take().unwrap_or(TurnFinish {
+                        stop_reason: STOP_UNKNOWN.to_string(),
+                        error: None,
+                    });
+                    finish.error = Some(CliTurnError {
+                        code: "cli_background_timeout",
+                        message: format!(
+                            "Background tasks were still running after {} minutes and were stopped",
+                            waited.as_secs() / 60
+                        ),
+                        details: None,
+                    });
+                    return TurnEnd::Finished(finish);
+                }
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
                         if line.trim().is_empty() {
@@ -350,6 +384,10 @@ impl CliDriver {
                                         "[CLI] result with background work still running; waiting for its follow-up turn"
                                     );
                                     deferred_finish = Some(finish);
+                                    if background_deadline.is_none() {
+                                        background_deadline =
+                                            Some(tokio::time::Instant::now() + self.background_wait());
+                                    }
                                     continue;
                                 }
                                 return TurnEnd::Finished(finish);
@@ -471,6 +509,15 @@ impl CliDriver {
             }
         }
         self.emit(event).await;
+    }
+
+    fn background_wait(&self) -> Duration {
+        self.runtime_env
+            .get(BACKGROUND_WAIT_ENV)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_BACKGROUND_WAIT)
     }
 
     fn claude_config_dir(&self) -> PathBuf {

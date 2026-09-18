@@ -63,6 +63,12 @@ pub struct StreamMapper {
     /// authority; `task_started` / `task_notification` keep it current when a
     /// build does not send that frame).
     background: HashSet<String>,
+    /// Backgrounded tasks a SUB-AGENT started (`owned_by_subagent`). claude
+    /// keeps waiting for them — the sub-agent resumes when they finish — but
+    /// `background_tasks_changed` lists only the main thread's own tasks, so
+    /// they are tracked apart and cleared only by their own settle frames
+    /// (A3, 2026-09-18: a sub-agent's `sleep 25` outlived the list going empty).
+    sub_background: HashSet<String>,
     /// `tool_use_id`s of backgrounded tool calls: their immediate tool_result
     /// only says "launched", so the card stays in progress until the task's
     /// `task_notification` settles it.
@@ -77,6 +83,7 @@ impl StreamMapper {
             announced_tools: HashSet::new(),
             streamed_block: HashMap::new(),
             background: HashSet::new(),
+            sub_background: HashSet::new(),
             background_tools: HashSet::new(),
         }
     }
@@ -84,7 +91,7 @@ impl StreamMapper {
     /// Whether a backgrounded task is still running — i.e. a `result` seen now
     /// is not the last one this process will print.
     pub fn background_pending(&self) -> bool {
-        !self.background.is_empty()
+        !self.background.is_empty() || !self.sub_background.is_empty()
     }
 
     pub fn map_line(&mut self, line: &str) -> LineOutcome {
@@ -125,12 +132,17 @@ impl StreamMapper {
             }
             Some("task_started") => {
                 if v["is_backgrounded"].as_bool() == Some(true) {
+                    let by_subagent = v["owned_by_subagent"].as_bool() == Some(true);
                     if let Some(id) = v["task_id"].as_str() {
-                        self.background.insert(id.to_string());
+                        if by_subagent {
+                            self.sub_background.insert(id.to_string());
+                        } else {
+                            self.background.insert(id.to_string());
+                        }
                     }
                     // Only the main thread's own calls own a card here; a
                     // sub-agent's backgrounded Bash is its own business.
-                    if v["owned_by_subagent"].as_bool() != Some(true) {
+                    if !by_subagent {
                         if let Some(tool) = v["tool_use_id"].as_str() {
                             self.background_tools.insert(tool.to_string());
                         }
@@ -146,6 +158,7 @@ impl StreamMapper {
                 ) {
                     if let Some(id) = v["task_id"].as_str() {
                         self.background.remove(id);
+                        self.sub_background.remove(id);
                     }
                 }
                 return Vec::new();
@@ -153,6 +166,7 @@ impl StreamMapper {
             Some("task_notification") => {
                 if let Some(id) = v["task_id"].as_str() {
                     self.background.remove(id);
+                    self.sub_background.remove(id);
                 }
                 return self.settle_background_tool(v);
             }
@@ -661,6 +675,30 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("SUBAGENT_DONE"));
+    }
+
+    #[test]
+    fn a_sub_agents_background_task_survives_the_main_list_going_empty() {
+        let mut m = StreamMapper::new(Some(SID.to_string()), None);
+        events(
+            &mut m,
+            &[
+                json!({"type":"system","subtype":"task_started","task_id":"b1","owned_by_subagent":true,"tool_use_id":"toolu_sub","is_backgrounded":true,"task_type":"local_bash"}),
+                json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+            ],
+        );
+        assert!(m.background_pending(), "the sub-agent still waits on it");
+        let evs = events(
+            &mut m,
+            &[
+                json!({"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_sub","status":"completed","summary":"BG_OK"}),
+            ],
+        );
+        assert!(!m.background_pending());
+        assert!(
+            evs.is_empty(),
+            "a sub-agent's task owns no main-thread card"
+        );
     }
 
     #[test]
