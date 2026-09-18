@@ -76,10 +76,18 @@ pub struct WorkTaskInfo {
     /// Source snapshot (URL, title, account id …), parsed from the row's JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_meta: Option<serde_json::Value>,
-    /// Latest `agent_progress` milestone (filled by `list` for live tasks only
-    /// — the card's realtime progress line).
+    /// Latest `agent_progress` milestone OF THIS GENERATION (filled by `list`
+    /// for live tasks only — the card's realtime progress line). Scoped by
+    /// `run_seq`: a retry, a follow-up and a merge each start a new one, and
+    /// the previous round's last milestone is not this round's news.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_progress: Option<String>,
+    /// This generation is parked on its pre-prompt context compaction — the
+    /// agent is working, but on shrinking the session rather than on the task.
+    /// Filled by `list` alongside `latest_progress`, and the only thing that
+    /// explains a card sitting in `preparing`/`merging` for minutes.
+    #[serde(default)]
+    pub compacting: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -181,6 +189,18 @@ pub struct WorkTaskConfig {
     /// folder-wide value would hand every task in the folder the same session.
     #[serde(default)]
     pub runtime_env: std::collections::BTreeMap<String, String>,
+    /// The branch this task is FOR: its worktree branches from that branch's
+    /// tip, and the merge lands back onto it. `None` — every task created
+    /// before this existed included — keeps the original behaviour: whatever
+    /// the project folder is checked out on when the task is claimed. A
+    /// pull-request task ignores it; its base comes from the pull request.
+    ///
+    /// Only the request lives here. The branch actually used is recorded on
+    /// `work_task.base_branch` when the worktree is created, and everything
+    /// downstream (merge, delivery, diff baseline) reads that column — so
+    /// editing this afterwards cannot re-base a task that already ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// The one recognized [`WorkTaskConfig::deliverable`] value.

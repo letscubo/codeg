@@ -387,6 +387,10 @@ impl AutomationEngine {
             // creates — the task is this automation's run, so it targets the
             // same sub-agent.
             runtime_env: cfg.runtime_env.clone(),
+            // An automation's own branch never applies to an enqueued task
+            // (the editor blanks it for this mode), so the task branches from
+            // the project folder's checkout like any unspecified one.
+            base_branch: None,
         };
         let draft = crate::models::WorkTaskDraft {
             folder_id,

@@ -28,6 +28,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover"
+import { BranchPicker } from "@/components/shared/branch-picker"
 import { FolderSelect } from "@/components/shared/folder-select"
 import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import {
@@ -124,6 +125,12 @@ function TaskEditorBody({
   const [folderId, setFolderId] = useState<number | null>(
     task?.folder_id ?? defaultFolderId ?? projectFolders[0]?.id ?? null
   )
+  // The branch this task is for. "" = the project folder's current branch when
+  // the task starts, which is what every task did before the choice existed.
+  // The REQUEST, never the recorded base: this is what the next save writes
+  // back, and a task that branched from the checkout by accident must not come
+  // out of the editor asking for that branch by name.
+  const [baseBranch, setBaseBranch] = useState(task?.config?.base_branch ?? "")
   // `agentDirty` = the user explicitly chose agent/mode/config for THIS task.
   // While clean, the controls display the folder's effective task settings and
   // the draft keeps inheriting (agent_type null) — nothing is frozen.
@@ -204,6 +211,14 @@ function TaskEditorBody({
     [folders, folderId]
   )
 
+  // A task that has already minted its worktree: its folder and the branch it
+  // branched from are recorded facts by then, not settings.
+  const pinned = task != null && task.worktree_folder_id != null
+  // A pull-request task has no branch to choose: it starts on the pull request
+  // and is reviewed against that review's base ref, so a pick here would be
+  // quietly ignored.
+  const choosesBranch = task?.source_kind !== "forge_pr"
+
   const agentOptions = useAgentOptions(agentType, folderPath, true)
 
   // The captured composer + agent state as a `WorkTaskConfig` — the shared
@@ -215,6 +230,9 @@ function TaskEditorBody({
     const blocks = composerRef.current?.getPromptBlocks() ?? [
       { type: "text", text: displayText },
     ]
+    // Explicitly null rather than absent when nothing is picked: clearing the
+    // choice has to travel, and the save replaces the stored config wholesale.
+    const base_branch = baseBranch.trim() || null
     if (!agentDirty) {
       return {
         prompt_blocks: blocks,
@@ -225,6 +243,7 @@ function TaskEditorBody({
         // Not editable here; carry it through, or saving from this dialog
         // un-pins the task from its sub-agent and the next launch fails.
         runtime_env: task?.config?.runtime_env ?? {},
+        base_branch,
       }
     }
     const snapshot = await agentOptions.ensure()
@@ -244,6 +263,7 @@ function TaskEditorBody({
         ...snapshotLabels(snapshot, mode_id, config_values),
       },
       runtime_env: task?.config?.runtime_env ?? {},
+      base_branch,
     }
   }
 
@@ -315,11 +335,13 @@ function TaskEditorBody({
     }
     setTemplateBusy(true)
     try {
+      // A template is reusable across tasks and folders: neither the per-task
+      // env overlay (a baked-in sub-agent session key would hand every task
+      // made from this template the same session) nor a branch name from one
+      // repository (it would only fail the launch in another) may ride along.
       const templateConfig = await buildConfig()
-      // A template is reusable across tasks, so the per-task env overlay must
-      // not ride along — a baked-in sub-agent session key would hand every task
-      // made from this template the same session.
       delete templateConfig.runtime_env
+      delete templateConfig.base_branch
       await workTaskTemplateSave({
         name: title.trim(),
         title: title.trim(),
@@ -407,6 +429,7 @@ function TaskEditorBody({
           editorClassName="max-h-[14rem] min-h-[6rem]"
           bottomBarExtra={
             <AgentConfigSection
+              agentType={agentOptions.snapshotAgentType}
               snapshot={agentOptions.snapshot}
               loading={agentOptions.loading}
               error={agentOptions.error}
@@ -431,7 +454,8 @@ function TaskEditorBody({
           }
         />
 
-        {/* Target — which project board the task lives on. */}
+        {/* Target — which project board the task lives on, and which branch of
+            it the task is for. */}
         <div className="flex flex-col gap-2">
           <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
             {t("sectionTarget")}
@@ -441,13 +465,45 @@ function TaskEditorBody({
               variant="field"
               folders={projectFolders}
               value={folderId}
-              onChange={setFolderId}
+              // A branch belongs to a specific repository, so switching folders
+              // drops the previous folder's pick rather than saving it against
+              // the new one. In the handler, not a folderId effect, so the
+              // initial state never wipes an edited task's branch.
+              onChange={(id) => {
+                setFolderId(id)
+                setBaseBranch("")
+              }}
               placeholder={t("folderPlaceholder")}
               // A task that already ran is pinned to its folder (its worktree
               // lives there) — the backend rejects a move too.
-              disabled={task != null && task.worktree_folder_id != null}
+              disabled={pinned}
             />
+            {choosesBranch ? (
+              <BranchPicker
+                folderPath={folderPath}
+                // Read-only, so it can show the branch the task actually
+                // branched from; the moment it is editable again it shows the
+                // request, because that is what a save would write back.
+                value={pinned ? (task?.base_branch ?? baseBranch) : baseBranch}
+                onChange={(b) => setBaseBranch(b)}
+                placeholder={t("baseBranchPlaceholder")}
+                defaultLabel={t("baseBranchDefault")}
+                title={t("baseBranch")}
+                // The base is recorded when the worktree is minted, and every
+                // later decision (merge, delivery, diff) reads THAT — so once
+                // a task has run, its branch is history, not a setting.
+                disabled={folderId == null || pinned}
+                // The merge lands into the project checkout, which can only be
+                // on a local branch.
+                allowRemote={false}
+              />
+            ) : null}
           </div>
+          {choosesBranch ? (
+            <p className="text-xs text-muted-foreground">
+              {t("baseBranchHint")}
+            </p>
+          ) : null}
         </div>
 
         {error ? (
