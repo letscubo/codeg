@@ -181,7 +181,7 @@ impl CliDriver {
             args.push(config);
         }
 
-        let (finish, disconnect) = match self.spawn(&args).await {
+        let (finish, disconnect) = match self.spawn(&args, model.as_deref()).await {
             Ok(child) => {
                 self.drive(child, build_stdin_line(&blocks), &session_id, commands)
                     .await
@@ -211,7 +211,7 @@ impl CliDriver {
         disconnect
     }
 
-    async fn spawn(&self, args: &[String]) -> std::io::Result<Child> {
+    async fn spawn(&self, args: &[String], model: Option<&str>) -> std::io::Result<Child> {
         let mut command = crate::process::tokio_command(&self.executable);
         command
             .args(args)
@@ -221,6 +221,13 @@ impl CliDriver {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // `runtime_env` is frozen when the connection registers, so after a
+        // model switch its ANTHROPIC_MODEL still names the old model. `--model`
+        // already wins for the turn; keep the env in step so nothing the CLI
+        // starts reads the stale value.
+        if let Some(model) = model.filter(|m| !m.is_empty()) {
+            command.env("ANTHROPIC_MODEL", model);
+        }
         // Own process group, so cancel reaches the CLI and every tool process
         // it started in one signal.
         #[cfg(unix)]

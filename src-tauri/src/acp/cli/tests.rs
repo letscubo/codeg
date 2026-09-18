@@ -21,6 +21,7 @@ use crate::web::event_bridge::EventEmitter;
 /// Records argv and stdin, replays `stdout.jsonl`, then exits / sleeps as told.
 const FAKE_CLI: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$FAKE_DIR/args.txt"
+printf '%s' "$ANTHROPIC_MODEL" > "$FAKE_DIR/model_env.txt"
 cat > "$FAKE_DIR/stdin.txt"
 cat "$FAKE_DIR/stdout.jsonl" 2>/dev/null
 if [ -n "$FAKE_STDERR" ]; then echo "$FAKE_STDERR" >&2; fi
@@ -226,6 +227,31 @@ async fn an_existing_transcript_is_resumed_and_the_model_is_passed() {
         .windows(2)
         .any(|w| w == ["--resume", h.session_id.as_str()]));
     assert!(args.windows(2).any(|w| w == ["--model", "claude-sonnet-5"]));
+}
+
+/// The connection's env was captured with the model it started on; a later
+/// switch must not leave the old value in the process env.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switched_model_replaces_the_stale_anthropic_model_env() {
+    let h = Harness::new(&[("ANTHROPIC_MODEL", "claude-sonnet-5")]).await;
+    h.manager
+        .get_state(&h.connection_id)
+        .await
+        .unwrap()
+        .write()
+        .await
+        .cli_model = Some("claude-opus-5".to_string());
+    h.stdout(&[json!({"type":"result","subtype":"success","is_error":false})]);
+    let mut rx = h.subscribe().await;
+    h.prompt("switched").await;
+    collect_until(&mut rx, |v| v["type"] == "turn_complete").await;
+
+    assert!(h
+        .args()
+        .windows(2)
+        .any(|w| w == ["--model", "claude-opus-5"]));
+    let env = std::fs::read_to_string(h.dir.join("model_env.txt")).unwrap();
+    assert_eq!(env, "claude-opus-5");
 }
 
 #[tokio::test(flavor = "multi_thread")]
