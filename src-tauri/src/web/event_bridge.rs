@@ -494,11 +494,16 @@ fn fill_tool_description(payload: AcpEvent) -> AcpEvent {
             meta,
             images,
         } => {
-            // 更新事件多半只带状态;只有这一轮带了 title 才有必要重算
+            /*
+             * 更新事件多半只带状态,但**带了参数就必须重算**:CLI 通道里工具刚出现时
+             * 参数还没到(stream_json.rs 用空参数算标题,于是标题是 "Terminal"),
+             * 参数齐了才发这条更新 —— 只在带 title 时重算会把说明漏掉(2026-09-19)。
+             */
             let description = description.or_else(|| {
-                title
-                    .as_deref()
-                    .and_then(|t| describe(t, None, raw_input.as_ref()))
+                if raw_input.is_none() && title.is_none() {
+                    return None;
+                }
+                describe(title.as_deref().unwrap_or_default(), None, raw_input.as_ref())
             });
             AcpEvent::ToolCallUpdate {
                 tool_call_id,

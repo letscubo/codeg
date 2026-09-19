@@ -508,7 +508,9 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
         }
         AcpEvent::ToolCallUpdate {
             tool_call_id,
+            title,
             status,
+            raw_input,
             raw_output,
             ..
         } => {
@@ -518,6 +520,21 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
             });
             if let Some(status) = status {
                 v["status"] = Value::String(status.clone());
+            }
+            /*
+             * title / rawInput 也要记:CLI 通道里工具刚出现时参数还没到,第一条 tool_call
+             * 记下的是占位标题("Terminal")且没有参数;参数齐了才发这条更新。以前这里用 `..`
+             * 把两者吞掉,于是历史里永远是那份占位 —— 实时看得到命令,刷新后只剩 "Terminal"
+             * 且参数为空(2026-09-19 实测 A3 会话 152)。
+             */
+            if let Some(title) = title {
+                v["title"] = Value::String(title.clone());
+            }
+            if let Some(input) = raw_input
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            {
+                v["rawInput"] = input;
             }
             if let Some(raw) = raw_output
                 .as_deref()
@@ -613,5 +630,52 @@ mod tests {
         assert_eq!(v["toolCallId"], "c9");
         assert_eq!(v["status"], "failed");
         assert_eq!(v["rawOutput"], "boom");
+    }
+
+    /// CLI 通道(claude_code / codex / dsh 共用本函数)里,工具刚出现时参数还没到:
+    /// 第一条 `tool_call` 记的是占位标题与空参数,参数齐了才发更新。更新必须把 title 与
+    /// rawInput 一并记下,否则历史永远停在占位 —— 实时看得到命令,刷新后只剩 "Terminal"。
+    #[test]
+    fn tool_call_update_carries_title_and_raw_input() {
+        let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            description: None,
+            tool_call_id: "c1".into(),
+            title: Some("officecli save a.pptx".into()),
+            status: Some("in_progress".into()),
+            content: None,
+            raw_input: Some("{\"command\":\"officecli save a.pptx\",\"description\":\"保存 PPT\"}".into()),
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        })
+        .unwrap();
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["title"], "officecli save a.pptx");
+        assert_eq!(v["rawInput"]["command"], "officecli save a.pptx");
+        assert_eq!(v["rawInput"]["description"], "保存 PPT");
+    }
+
+    /// 只带状态的更新(最常见)不要凭空写出 title / rawInput 字段。
+    #[test]
+    fn status_only_update_adds_no_title_or_input() {
+        let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            description: None,
+            tool_call_id: "c2".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        })
+        .unwrap();
+        let v = serde_json::to_value(&update).unwrap();
+        assert!(v.get("title").is_none() || v["title"].is_null(), "{v}");
+        assert!(v.get("rawInput").is_none() || v["rawInput"].is_null(), "{v}");
     }
 }
