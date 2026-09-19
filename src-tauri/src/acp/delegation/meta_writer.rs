@@ -144,6 +144,7 @@ impl DelegationMetaWriter for ConnectionManagerMetaWriter {
             &state_arc,
             &emitter,
             AcpEvent::ToolCallUpdate {
+                tool_name: None,
                 description: None,
                 tool_call_id: parent_tool_use_id.to_string(),
                 title: None,
@@ -184,6 +185,7 @@ impl DelegationMetaWriter for ConnectionManagerMetaWriter {
             &state_arc,
             &emitter,
             AcpEvent::ToolCallUpdate {
+                tool_name: None,
                 description: None,
                 tool_call_id: tool_call_id.to_string(),
                 title: Some(title.to_string()),
@@ -473,6 +475,7 @@ mod tests {
 
         // While the parent's `delegate_to_agent` call is live, the write lands.
         state.write().await.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tu-1".into(),
             title: "delegate_to_agent".into(),

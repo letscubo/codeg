@@ -304,6 +304,10 @@ pub enum AcpEvent {
         title: String,
         kind: String,
         status: String,
+        /// 真工具名(`Bash`/`Read`/`Edit`/`mcp__server__tool`…)。`title` 早就被各家驱动
+        /// 换成了人话,界面要按工具类型分形态(命令一种、读写文件另一种)就得有这个。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         /// 一句话说明(`crate::tool_description`):模型自己写的 description,或由命令解析出的
         /// 「Read foo.txt」这类短句。界面优先显示它,没有才显示 `title`。
         /// 由 `emit_with_state_gated` 统一补上,构造方不用管。
@@ -325,6 +329,9 @@ pub enum AcpEvent {
     ToolCallUpdate {
         tool_call_id: String,
         title: Option<String>,
+        /// 见 [`AcpEvent::ToolCall::tool_name`];首帧没带时由更新事件补上。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         /// 见 [`AcpEvent::ToolCall::description`];更新事件带上 title 时一并重算。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,

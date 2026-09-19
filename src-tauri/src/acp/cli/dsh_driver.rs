@@ -469,6 +469,15 @@ impl DshDriver {
 
 /// The `session/update` shape the history projection reads back for one live
 /// event; `None` for events the projection never records.
+/// 真工具名记进 ACP 报文的 `_meta` 扩展位 —— ACP 本身没有工具名通道(`title` 是给人看的),
+/// 而读回时无从重算,所以必须落盘。键名带 `codeg.` 前缀,避免和别家的 meta 撞。
+fn set_tool_name_meta(v: &mut Value, tool_name: Option<&str>) {
+    let Some(name) = tool_name.filter(|n| !n.is_empty()) else {
+        return;
+    };
+    v["_meta"]["codeg.toolName"] = Value::String(name.to_string());
+}
+
 pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::SessionUpdate> {
     let value = match event {
         AcpEvent::ContentDelta { text, .. } => json!({
@@ -484,6 +493,7 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
             title,
             kind,
             status,
+            tool_name,
             raw_input,
             locations,
             ..
@@ -504,12 +514,14 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
             if let Some(locations) = locations {
                 v["locations"] = locations.clone();
             }
+            set_tool_name_meta(&mut v, tool_name.as_deref());
             v
         }
         AcpEvent::ToolCallUpdate {
             tool_call_id,
             title,
             status,
+            tool_name,
             raw_input,
             raw_output,
             ..
@@ -542,6 +554,7 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
             {
                 v["rawOutput"] = raw;
             }
+            set_tool_name_meta(&mut v, tool_name.as_deref());
             v
         }
         AcpEvent::UsageUpdate { used, size } => json!({
@@ -570,6 +583,7 @@ mod tests {
                 parent_tool_use_id: None,
             },
             AcpEvent::ToolCall {
+                tool_name: None,
                 description: None,
                 tool_call_id: "c1".into(),
                 title: "app-notion: notion-fetch".into(),
@@ -583,6 +597,7 @@ mod tests {
                 images: None,
             },
             AcpEvent::ToolCallUpdate {
+                tool_name: None,
                 description: None,
                 tool_call_id: "c1".into(),
                 title: None,
@@ -613,6 +628,7 @@ mod tests {
     #[test]
     fn tool_call_update_carries_status_and_raw_output() {
         let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "c9".into(),
             title: None,
@@ -638,6 +654,7 @@ mod tests {
     #[test]
     fn tool_call_update_carries_title_and_raw_input() {
         let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "c1".into(),
             title: Some("officecli save a.pptx".into()),
@@ -657,10 +674,74 @@ mod tests {
         assert_eq!(v["rawInput"]["description"], "保存 PPT");
     }
 
+    /// 真工具名要随转写落盘:ACP 没有工具名通道(`title` 早被各家换成人话),读回时无从重算。
+    /// 界面按工具类型分形态(命令一种、读写文件另一种)全靠它。
+    #[test]
+    fn tool_name_is_recorded_in_meta() {
+        let update = transcript_update_for(&AcpEvent::ToolCall {
+            tool_name: Some("Edit".into()),
+            description: None,
+            tool_call_id: "c3".into(),
+            title: "Edit a.rs".into(),
+            kind: "edit".into(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: Some("{\"file_path\":\"/a.rs\"}".into()),
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        })
+        .unwrap();
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["_meta"]["codeg.toolName"], "Edit");
+        // 更新事件同样带得上(首帧没带时由它补)
+        let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            tool_name: Some("Bash".into()),
+            description: None,
+            tool_call_id: "c4".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        })
+        .unwrap();
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["_meta"]["codeg.toolName"], "Bash");
+    }
+
+    /// 没有工具名(ACP 通道拿不到)就不要凭空写出 `_meta`。
+    #[test]
+    fn missing_tool_name_writes_no_meta() {
+        let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
+            description: None,
+            tool_call_id: "c5".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        })
+        .unwrap();
+        let v = serde_json::to_value(&update).unwrap();
+        assert!(v.get("_meta").is_none_or(|m| m.get("codeg.toolName").is_none()), "{v}");
+    }
+
     /// 只带状态的更新(最常见)不要凭空写出 title / rawInput 字段。
     #[test]
     fn status_only_update_adds_no_title_or_input() {
         let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "c2".into(),
             title: None,

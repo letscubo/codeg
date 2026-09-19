@@ -457,6 +457,7 @@ fn fill_tool_description(payload: AcpEvent) -> AcpEvent {
             title,
             kind,
             status,
+            tool_name,
             description,
             content,
             raw_input,
@@ -472,6 +473,7 @@ fn fill_tool_description(payload: AcpEvent) -> AcpEvent {
                 title,
                 kind,
                 status,
+                tool_name,
                 description,
                 content,
                 raw_input,
@@ -484,6 +486,7 @@ fn fill_tool_description(payload: AcpEvent) -> AcpEvent {
         AcpEvent::ToolCallUpdate {
             tool_call_id,
             title,
+            tool_name,
             description,
             status,
             content,
@@ -508,6 +511,7 @@ fn fill_tool_description(payload: AcpEvent) -> AcpEvent {
             AcpEvent::ToolCallUpdate {
                 tool_call_id,
                 title,
+                tool_name,
                 description,
                 status,
                 content,

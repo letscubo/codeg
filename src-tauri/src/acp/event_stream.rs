@@ -368,6 +368,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
         } => json_str_len(session_id) + json_value_size(message),
         AcpEvent::ToolCall {
             description: None,
+            tool_name,
             tool_call_id,
             title,
             kind,
@@ -379,7 +380,8 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             meta,
             images,
         } => {
-            json_str_len(tool_call_id)
+            opt_str_size(tool_name)
+                + json_str_len(tool_call_id)
                 + json_str_len(title)
                 + json_str_len(kind)
                 + json_str_len(status)
@@ -392,6 +394,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
         }
         AcpEvent::ToolCallUpdate {
             description: None,
+            tool_name,
             tool_call_id,
             title,
             status,
@@ -405,7 +408,8 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             // estimator to be revisited rather than silently under-counted.
             raw_output_append: _,
         } => {
-            json_str_len(tool_call_id)
+            opt_str_size(tool_name)
+                + json_str_len(tool_call_id)
                 + opt_str_size(title)
                 + opt_str_size(status)
                 + opt_str_size(content)
@@ -577,6 +581,7 @@ mod tests {
             seq,
             connection_id: "c".into(),
             payload: AcpEvent::ToolCallUpdate {
+                tool_name: None,
                 description: None,
                 tool_call_id: "t1".into(),
                 title: None,
@@ -896,6 +901,7 @@ mod tests {
                 seq: 5,
                 connection_id: "cc".into(),
                 payload: AcpEvent::ToolCall {
+                    tool_name: None,
                     description: None,
                     tool_call_id: "call_1".into(),
                     title: "Ti\"tle".into(),
@@ -917,6 +923,7 @@ mod tests {
                 seq: 6,
                 connection_id: "c".into(),
                 payload: AcpEvent::ToolCallUpdate {
+                    tool_name: None,
                     description: None,
                     tool_call_id: "t".into(),
                     title: None,
@@ -1089,6 +1096,7 @@ mod tests {
             seq: 1,
             connection_id: "c".into(),
             payload: AcpEvent::ToolCallUpdate {
+                tool_name: None,
                 description: None,
                 tool_call_id: "t".into(),
                 title: None,

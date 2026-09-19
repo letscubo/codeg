@@ -200,6 +200,7 @@ impl StreamMapper {
                         let name = block["name"].as_str().unwrap_or("");
                         let info = tool_info(name, &Value::Object(Map::new()), self.cwd.as_deref());
                         vec![AcpEvent::ToolCall {
+                            tool_name: Some(name.to_string()),
                             description: None,
                             tool_call_id: id.to_string(),
                             title: info.title,
@@ -264,6 +265,7 @@ impl StreamMapper {
                     let raw_input = Some(input.to_string());
                     if self.announced_tools.insert(id.to_string()) {
                         events.push(AcpEvent::ToolCall {
+                            tool_name: Some(name.to_string()),
                             description: None,
                             tool_call_id: id.to_string(),
                             title: info.title,
@@ -278,6 +280,7 @@ impl StreamMapper {
                         });
                     } else {
                         events.push(AcpEvent::ToolCallUpdate {
+                            tool_name: Some(name.to_string()),
                             description: None,
                             tool_call_id: id.to_string(),
                             title: Some(info.title),
@@ -347,6 +350,8 @@ impl StreamMapper {
 
 fn tool_result_update(id: &str, status: &str, content: &Value) -> AcpEvent {
     AcpEvent::ToolCallUpdate {
+        // 回填结果的更新,工具名首帧已经带过,这里不重复
+        tool_name: None,
         description: None,
         tool_call_id: id.to_string(),
         title: None,

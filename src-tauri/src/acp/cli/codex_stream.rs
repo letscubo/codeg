@@ -143,6 +143,7 @@ impl CodexStreamMapper {
         self.last_block = Block::Other;
         let info = codex_tool_info(item, self.cwd.as_deref());
         vec![AcpEvent::ToolCall {
+            tool_name: codex_tool_name(item),
             description: None,
             tool_call_id: id.to_string(),
             title: info.title,
@@ -192,6 +193,7 @@ impl CodexStreamMapper {
                 self.open_tools.remove(id);
                 self.last_block = Block::Other;
                 events.push(AcpEvent::ToolCallUpdate {
+                    tool_name: codex_tool_name(item),
                     description: None,
                     tool_call_id: id.to_string(),
                     title: None,
@@ -234,6 +236,8 @@ impl CodexStreamMapper {
             .open_tools
             .drain()
             .map(|id| AcpEvent::ToolCallUpdate {
+                // 轮次收尾把没关的调用标失败,工具名首帧已带
+                tool_name: None,
                 description: None,
                 tool_call_id: id,
                 title: None,
@@ -366,6 +370,26 @@ fn tool_output(item: &Value) -> Value {
 }
 
 /// Title / kind / locations for a Codex tool item.
+/// codex 的 item type → 规范工具名。界面按工具类型分形态要用它,而 `title` 早被换成人话了。
+/// 命名对齐 claude_code 的内置工具(Bash/Edit/WebSearch),MCP 调用拼成 `mcp__<server>__<tool>`。
+pub fn codex_tool_name(item: &Value) -> Option<String> {
+    let s = |key: &str| item[key].as_str().filter(|v| !v.is_empty());
+    Some(match item["type"].as_str().unwrap_or("") {
+        "commandExecution" => "Bash".to_string(),
+        "fileChange" => "Edit".to_string(),
+        "webSearch" => "WebSearch".to_string(),
+        "imageGeneration" => "ImageGeneration".to_string(),
+        "mcpToolCall" => format!(
+            "mcp__{}__{}",
+            s("server").unwrap_or("mcp"),
+            s("tool").unwrap_or("tool")
+        ),
+        "dynamicToolCall" | "collabAgentToolCall" => s("tool")?.to_string(),
+        "" => return None,
+        other => other.to_string(),
+    })
+}
+
 pub fn codex_tool_info(item: &Value, cwd: Option<&Path>) -> ToolInfo {
     let s = |key: &str| item[key].as_str().filter(|v| !v.is_empty());
     match item["type"].as_str().unwrap_or("") {

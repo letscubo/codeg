@@ -905,8 +905,10 @@ impl SessionState {
                 }
             }
             AcpEvent::ToolCall {
-                // description 只用于展示,状态机不关心(界面从事件里取)
+                // description / tool_name 只用于展示,状态机不关心(界面从事件里取,
+                // 历史走 acp_transcript 自录线路)
                 description: _,
+                tool_name: _,
                 tool_call_id,
                 title,
                 kind,
@@ -2603,6 +2605,7 @@ mod tests {
 
         s.apply_event(&failure("i4", "connection", "warning"));
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "Read".into(),
@@ -2877,6 +2880,7 @@ mod tests {
             parent_tool_use_id: None,
         });
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "ls".into(),
@@ -2913,6 +2917,7 @@ mod tests {
         // A tool call with no trailing text / thinking → `running tool:` prefix.
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-9".into(),
             title: "grep files".into(),
@@ -3012,6 +3017,7 @@ mod tests {
             parent_tool_use_id: None,
         });
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "ls".into(),
@@ -3412,6 +3418,7 @@ mod tests {
     fn tool_call_inserts_pending_entry() {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "ls".into(),
@@ -3437,6 +3444,7 @@ mod tests {
         let mut s = fresh_state();
         for id in ["tc-z", "tc-a", "tc-m"] {
             s.apply_event(&AcpEvent::ToolCall {
+                tool_name: None,
                 description: None,
                 tool_call_id: id.into(),
                 title: id.into(),
@@ -3463,6 +3471,7 @@ mod tests {
     fn tool_call_content_field_is_preserved_on_state() {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "ls".into(),
@@ -3479,6 +3488,7 @@ mod tests {
         assert_eq!(entry.content.as_deref(), Some("line one\nline two"));
 
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: None,
@@ -3500,6 +3510,7 @@ mod tests {
     fn tool_call_update_merges_status_and_output() {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "cat foo.txt".into(),
@@ -3514,6 +3525,7 @@ mod tests {
         });
         // raw_output text "\"file contents\"" — i.e. JSON-encoded string.
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: None,
@@ -3541,6 +3553,7 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ContentDelta { text: "hi".into(), parent_tool_use_id: None });
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "x".into(),
@@ -3637,6 +3650,7 @@ mod tests {
         // recover it.
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "pt-1".into(),
             title: "delegate_to_agent".into(),
@@ -4163,6 +4177,7 @@ mod tests {
         // Two raw_input fragments; the second is a complete JSON object
         // and should overwrite `entry.input` with the parsed value.
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "edit".into(),
@@ -4176,6 +4191,7 @@ mod tests {
             images: None,
         });
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: None,
@@ -4231,6 +4247,7 @@ mod tests {
                 parent_tool_use_id: None,
             },
             AcpEvent::ToolCall {
+                tool_name: None,
                 description: None,
                 tool_call_id: "tc-1".into(),
                 title: "ls".into(),
@@ -4244,6 +4261,7 @@ mod tests {
                 images: None,
             },
             AcpEvent::ToolCallUpdate {
+                tool_name: None,
                 description: None,
                 tool_call_id: "tc-1".into(),
                 title: None,
@@ -4368,6 +4386,7 @@ mod tests {
 
     fn tool_call_event(id: &str, title: &str) -> AcpEvent {
         AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: id.into(),
             title: title.into(),
@@ -4430,6 +4449,7 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&tool_call_event("tc-1", "ls"));
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: None,
@@ -4460,6 +4480,7 @@ mod tests {
         let locs = serde_json::json!([{ "path": "/tmp/foo.rs", "line": 12 }]);
         let meta = serde_json::json!({ "parent_tool_use_id": "abc", "session": "ext-1" });
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "edit".into(),
@@ -4493,6 +4514,7 @@ mod tests {
         let locs = serde_json::json!([{ "path": "/tmp/foo.rs" }]);
         let meta = serde_json::json!({ "k": "v" });
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: "edit".into(),
@@ -4507,6 +4529,7 @@ mod tests {
         });
         // Subsequent partial update without locations/meta — must not clobber.
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "tc-1".into(),
             title: None,
@@ -4549,6 +4572,7 @@ mod tests {
 
         // Initial ToolCall carries one image — should be persisted.
         s.apply_event(&AcpEvent::ToolCall {
+            tool_name: None,
             description: None,
             tool_call_id: "ig-1".into(),
             title: "Image generation".into(),
@@ -4567,6 +4591,7 @@ mod tests {
 
         // Update without images field — must preserve prior images.
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "ig-1".into(),
             title: None,
@@ -4589,6 +4614,7 @@ mod tests {
 
         // Update with Some(new_vec) — must replace.
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "ig-1".into(),
             title: None,
@@ -4620,6 +4646,7 @@ mod tests {
         // Update with Some(empty) — must clear images (allows the agent to
         // explicitly drop a prior image if needed).
         s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
             description: None,
             tool_call_id: "ig-1".into(),
             title: None,
