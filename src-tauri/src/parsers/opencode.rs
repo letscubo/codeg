@@ -497,6 +497,7 @@ impl OpenCodeParser {
                         marker.insert("overflow".to_string(), serde_json::Value::from(overflow));
                     }
                     blocks.push(ContentBlock::ToolUse {
+                        description: None,
                         tool_use_id: Some(part_id.clone()),
                         tool_name: "context_compaction".to_string(),
                         input_preview: None,
@@ -608,6 +609,7 @@ impl OpenCodeParser {
                         }
 
                         blocks.push(ContentBlock::ToolUse {
+                            description: None,
                             tool_use_id: call_id.clone(),
                             tool_name: "Agent".to_string(),
                             input_preview: Some(agent_input.to_string()),
@@ -676,6 +678,7 @@ impl OpenCodeParser {
                         let normalized = normalize_tool_call(raw_tool_name, state);
 
                         blocks.push(ContentBlock::ToolUse {
+                            description: None,
                             tool_use_id: call_id.clone(),
                             tool_name: normalized.tool_name,
                             input_preview: normalized.input_preview,
@@ -1736,12 +1739,12 @@ async fn batch_load_subagent_tool_calls(
             .and_then(|s| s.as_str())
             .unwrap_or("");
 
-        result.entry(sid).or_default().push(AgentToolCall {
-            tool_name: normalized.tool_name,
-            input_preview: normalized.input_preview.map(|s| truncate_str(&s, 500)),
-            output_preview: normalized.output_preview.map(|s| truncate_str(&s, 500)),
-            is_error: is_error_status(status) || normalized.is_error,
-        });
+        result.entry(sid).or_default().push(AgentToolCall::new(
+            normalized.tool_name,
+            normalized.input_preview.map(|s| truncate_str(&s, 500)),
+            normalized.output_preview.map(|s| truncate_str(&s, 500)),
+            is_error_status(status) || normalized.is_error,
+        ));
     }
 
     result
@@ -2288,6 +2291,7 @@ mod tests {
     #[test]
     fn only_a_bare_compaction_message_gets_refiled_as_assistant() {
         let compaction = || ContentBlock::ToolUse {
+            description: None,
             tool_use_id: Some("prt_1".into()),
             tool_name: "context_compaction".into(),
             input_preview: None,
@@ -2311,6 +2315,7 @@ mod tests {
         // A different tool's pair is not a compaction, and neither is nothing.
         assert!(!super::is_compaction_only(&[
             ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some("prt_2".into()),
                 tool_name: "read".into(),
                 input_preview: None,

@@ -367,6 +367,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             message,
         } => json_str_len(session_id) + json_value_size(message),
         AcpEvent::ToolCall {
+            description: None,
             tool_call_id,
             title,
             kind,
@@ -390,6 +391,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                 + images_size(images)
         }
         AcpEvent::ToolCallUpdate {
+            description: None,
             tool_call_id,
             title,
             status,
@@ -505,6 +507,7 @@ fn content_block_size(block: &crate::models::message::ContentBlock) -> usize {
                 })
         }
         CB::ToolUse {
+            description,
             tool_use_id,
             tool_name,
             input_preview,
@@ -514,6 +517,7 @@ fn content_block_size(block: &crate::models::message::ContentBlock) -> usize {
             96 + opt_str_size(tool_use_id)
                 + json_str_len(tool_name)
                 + opt_str_size(input_preview)
+                + opt_str_size(description)
                 + opt_str_size(status)
                 + opt_json_size(meta)
         }
@@ -573,6 +577,7 @@ mod tests {
             seq,
             connection_id: "c".into(),
             payload: AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: "t1".into(),
                 title: None,
                 status: None,
@@ -891,6 +896,7 @@ mod tests {
                 seq: 5,
                 connection_id: "cc".into(),
                 payload: AcpEvent::ToolCall {
+                    description: None,
                     tool_call_id: "call_1".into(),
                     title: "Ti\"tle".into(),
                     kind: "edit".into(),
@@ -911,6 +917,7 @@ mod tests {
                 seq: 6,
                 connection_id: "c".into(),
                 payload: AcpEvent::ToolCallUpdate {
+                    description: None,
                     tool_call_id: "t".into(),
                     title: None,
                     status: None,
@@ -980,6 +987,7 @@ mod tests {
                     image: Some(image.clone()),
                 },
                 ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: Some("toolu_01ABC".into()),
                     tool_name: "Bash".into(),
                     input_preview: Some("{\"command\":\"pnpm build\"}".into()),
@@ -1003,12 +1011,12 @@ mod tests {
                         lines_added: Some(u32::MAX),
                         lines_removed: Some(u32::MAX),
                         other_tool_count: Some(u32::MAX),
-                        tool_calls: vec![AgentToolCall {
-                            tool_name: "Read".into(),
-                            input_preview: Some("{\"file_path\":\"/a/b\"}".into()),
-                            output_preview: Some("line\n".repeat(40)),
-                            is_error: false,
-                        }],
+                        tool_calls: vec![AgentToolCall::new(
+                            "Read".into(),
+                            Some("{\"file_path\":\"/a/b\"}".into()),
+                            Some("line\n".repeat(40)),
+                            false,
+                        )],
                         child_session_id: Some("019fe6bf-0bcb-70c2-a02d-e5c006dfc32a".into()),
                     }),
                     images: vec![image],
@@ -1081,6 +1089,7 @@ mod tests {
             seq: 1,
             connection_id: "c".into(),
             payload: AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: "t".into(),
                 title: None,
                 status: None,

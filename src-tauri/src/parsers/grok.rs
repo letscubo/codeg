@@ -822,6 +822,7 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                 };
                 let turn = ensure_assistant(&mut assistant, now);
                 turn.blocks.push(ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: Some(id.clone()),
                     tool_name,
                     input_preview,
@@ -898,6 +899,7 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                     .unwrap_or_else(|| format!("grok-compaction-{}", out.content_events));
                 let turn = ensure_assistant(&mut assistant, now);
                 turn.blocks.push(ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: Some(id.clone()),
                     tool_name: "context_compaction".to_string(),
                     input_preview: None,
@@ -1873,14 +1875,14 @@ fn subagent_tool_calls(child_updates: &Path) -> Vec<AgentToolCall> {
                     if tool_use_id.as_deref().unwrap_or_default() != pending_id {
                         continue;
                     }
-                    out.push(AgentToolCall {
+                    out.push(AgentToolCall::new(
                         tool_name,
                         input_preview,
-                        output_preview: output_preview
+                        output_preview
                             .as_deref()
                             .map(|s| truncate_str(s, GROK_SUBAGENT_PREVIEW_CAP)),
-                        is_error: *is_error,
-                    });
+                        *is_error,
+                    ));
                 }
                 _ => {}
             }

@@ -139,6 +139,7 @@ impl DshStreamMapper {
             .unwrap_or(Value::Object(Default::default()));
         let info = dsh_tool_info(name, &input, self.cwd.as_deref());
         vec![AcpEvent::ToolCall {
+            description: None,
             tool_call_id: id.to_string(),
             title: info.title,
             kind: info.kind.to_string(),
@@ -175,6 +176,7 @@ impl DshStreamMapper {
             .background_calls
             .drain(..)
             .map(|id| AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: id,
                 title: None,
                 status: Some("completed".to_string()),
@@ -230,6 +232,7 @@ fn on_tool_result(v: &Value) -> Vec<AcpEvent> {
     let failed = v["status"].as_str() == Some("error");
     let result = v["result"].as_str().unwrap_or("").to_string();
     vec![AcpEvent::ToolCallUpdate {
+        description: None,
         tool_call_id: id.to_string(),
         title: None,
         status: Some(if failed { "failed" } else { "completed" }.to_string()),

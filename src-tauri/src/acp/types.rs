@@ -304,6 +304,11 @@ pub enum AcpEvent {
         title: String,
         kind: String,
         status: String,
+        /// 一句话说明(`crate::tool_description`):模型自己写的 description,或由命令解析出的
+        /// 「Read foo.txt」这类短句。界面优先显示它,没有才显示 `title`。
+        /// 由 `emit_with_state_gated` 统一补上,构造方不用管。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         content: Option<String>,
         raw_input: Option<String>,
         raw_output: Option<String>,
@@ -320,6 +325,9 @@ pub enum AcpEvent {
     ToolCallUpdate {
         tool_call_id: String,
         title: Option<String>,
+        /// 见 [`AcpEvent::ToolCall::description`];更新事件带上 title 时一并重算。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         status: Option<String>,
         content: Option<String>,
         raw_input: Option<String>,

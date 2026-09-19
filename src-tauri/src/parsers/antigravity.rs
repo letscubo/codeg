@@ -1101,6 +1101,7 @@ fn tool_use_block(call: &ChatToolCall) -> ContentBlock {
         ),
     };
     ContentBlock::ToolUse {
+        description: None,
         tool_use_id: (!call.id.is_empty()).then(|| call.id.clone()),
         tool_name: if name.is_empty() {
             String::from("tool")

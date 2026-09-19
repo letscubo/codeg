@@ -1,0 +1,12 @@
+# 搬自 openai/codex 的 codex-rs/shell-command(Apache-2.0),只留命令归类用得到的部分。
+# 单独成 crate 是因为上游代码用了 Rust 2024 的 let chains,而 codeg 主 crate 是 2021。
+[package]
+name = "codex-shell-command"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+shlex = "1"
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"

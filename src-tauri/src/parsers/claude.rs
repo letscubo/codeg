@@ -500,6 +500,7 @@ fn push_goal_marker(messages: &mut Vec<UnifiedMessage>, goal: &PendingGoal) -> O
         role: MessageRole::Assistant,
         content: vec![
             ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(id.clone()),
                 tool_name: marker.tool_name.to_string(),
                 input_preview: Some(marker.input_json),
@@ -761,6 +762,7 @@ fn compaction_blocks(value: &serde_json::Value, tool_use_id: String) -> Vec<Cont
 
     vec![
         ContentBlock::ToolUse {
+            description: None,
             tool_use_id: Some(tool_use_id.clone()),
             tool_name: "context_compaction".to_string(),
             input_preview: None,
@@ -1952,6 +1954,7 @@ impl ClaudeRecordAccumulator {
                     .find(|m| matches!(m.role, MessageRole::Assistant))
                 {
                     last.content.push(ContentBlock::ToolUse {
+                        description: None,
                         tool_use_id: Some(synthetic_id),
                         tool_name,
                         input_preview,
@@ -1963,6 +1966,7 @@ impl ClaudeRecordAccumulator {
                         id: format!("synth-assistant-{}", messages.len()),
                         role: MessageRole::Assistant,
                         content: vec![ContentBlock::ToolUse {
+                            description: None,
                             tool_use_id: Some(synthetic_id),
                             tool_name,
                             input_preview,
@@ -2470,6 +2474,7 @@ pub(crate) fn extract_assistant_content(value: &serde_json::Value) -> Vec<Conten
                         .to_string();
                     let input_preview = item.get("input").map(|i| i.to_string());
                     blocks.push(ContentBlock::ToolUse {
+                        description: None,
                         tool_use_id,
                         tool_name,
                         input_preview,
@@ -2783,12 +2788,7 @@ fn parse_subagent_tool_calls(
         .into_iter()
         .map(|(id, name, input)| {
             let (output, is_error) = results.remove(&id).unwrap_or((None, false));
-            AgentToolCall {
-                tool_name: name,
-                input_preview: input,
-                output_preview: output,
-                is_error,
-            }
+            AgentToolCall::new(name, input, output, is_error)
         })
         .collect();
     (calls, usage, started_at)

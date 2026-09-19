@@ -1036,6 +1036,7 @@ fn extract_assistant_content(value: &serde_json::Value) -> Vec<ContentBlock> {
                         truncate_str(&s, max_len)
                     });
                     blocks.push(ContentBlock::ToolUse {
+                        description: None,
                         tool_use_id,
                         tool_name,
                         input_preview,

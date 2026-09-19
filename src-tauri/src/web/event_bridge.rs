@@ -443,6 +443,81 @@ pub fn emit_event(emitter: &EventEmitter, event: &str, payload: impl Serialize) 
 /// InternalEventBus（进程内订阅者），要么走 Tauri `app.emit`（桌面 webview）。
 /// 删除该全局广播是 Phase 5 架构清理的核心：它消除了 WS 客户端 receiver-side
 /// 去重 (`attachManagedConnectionIdsRef`) 的必要性。
+
+/// 给工具调用事件补上 `description`(见 [`crate::tool_description`])。
+/// 其它事件原样返回。`raw_input` 是 JSON 文本,解析失败就当没有参数。
+fn fill_tool_description(payload: AcpEvent) -> AcpEvent {
+    fn describe(title: &str, kind: Option<&str>, raw_input: Option<&String>) -> Option<String> {
+        let parsed = raw_input.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+        crate::tool_description::describe_tool_call(title, kind, parsed.as_ref())
+    }
+    match payload {
+        AcpEvent::ToolCall {
+            tool_call_id,
+            title,
+            kind,
+            status,
+            description,
+            content,
+            raw_input,
+            raw_output,
+            locations,
+            meta,
+            images,
+        } => {
+            let description =
+                description.or_else(|| describe(&title, Some(kind.as_str()), raw_input.as_ref()));
+            AcpEvent::ToolCall {
+                tool_call_id,
+                title,
+                kind,
+                status,
+                description,
+                content,
+                raw_input,
+                raw_output,
+                locations,
+                meta,
+                images,
+            }
+        }
+        AcpEvent::ToolCallUpdate {
+            tool_call_id,
+            title,
+            description,
+            status,
+            content,
+            raw_input,
+            raw_output,
+            raw_output_append,
+            locations,
+            meta,
+            images,
+        } => {
+            // 更新事件多半只带状态;只有这一轮带了 title 才有必要重算
+            let description = description.or_else(|| {
+                title
+                    .as_deref()
+                    .and_then(|t| describe(t, None, raw_input.as_ref()))
+            });
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title,
+                description,
+                status,
+                content,
+                raw_input,
+                raw_output,
+                raw_output_append,
+                locations,
+                meta,
+                images,
+            }
+        }
+        other => other,
+    }
+}
+
 pub async fn emit_with_state(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -470,6 +545,9 @@ pub async fn emit_with_state_gated<F>(
 where
     F: FnOnce(&SessionState) -> bool,
 {
+    // 工具调用的一句话说明在这里统一补(构造点有五处,逐处写容易漏);实时流与历史
+    // 用的是同一个 `tool_description::describe_tool_call`,两边看到的一样。
+    let payload = fill_tool_description(payload);
     let (envelope_arc, stream, evicted) = {
         let mut s = state.write().await;
         if !gate(&s) {

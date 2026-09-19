@@ -763,6 +763,7 @@ fn parse_compaction(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>, idx
         MessageRole::Assistant,
         vec![
             ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(tool_use_id.clone()),
                 tool_name: "context_compaction".to_string(),
                 input_preview: None,
@@ -884,6 +885,7 @@ fn parse_bash_execution(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>,
         format!("pi-bashcall-{idx}"),
         MessageRole::Assistant,
         vec![ContentBlock::ToolUse {
+            description: None,
             tool_use_id: tool_use_id.clone(),
             tool_name: "bash".to_string(),
             input_preview: (!command.is_empty()).then_some(command),
@@ -1031,6 +1033,7 @@ fn assistant_content_blocks(content: Option<&Value>) -> Vec<ContentBlock> {
                     .unwrap_or("unknown")
                     .to_string();
                 blocks.push(ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id,
                     tool_name,
                     input_preview: tool_arguments_preview(item.get("arguments")),

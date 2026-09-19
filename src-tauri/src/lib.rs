@@ -42,6 +42,8 @@ pub mod preferences;
 pub mod process;
 pub mod supervise;
 mod terminal;
+/// 工具调用的一句话说明(实时事件与历史共用),见 tool_description/mod.rs
+pub mod tool_description;
 pub mod turn_timings;
 pub mod update;
 pub mod web;

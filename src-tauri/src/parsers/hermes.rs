@@ -297,6 +297,7 @@ impl HermesParser {
                             parse_hermes_tool_calls(raw)
                         {
                             blocks.push(ContentBlock::ToolUse {
+                                description: None,
                                 tool_use_id,
                                 tool_name,
                                 input_preview,

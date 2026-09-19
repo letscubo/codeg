@@ -553,6 +553,7 @@ mod tests {
                 parent_tool_use_id: None,
             },
             AcpEvent::ToolCall {
+                description: None,
                 tool_call_id: "c1".into(),
                 title: "app-notion: notion-fetch".into(),
                 kind: "other".into(),
@@ -565,6 +566,7 @@ mod tests {
                 images: None,
             },
             AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: "c1".into(),
                 title: None,
                 status: Some("completed".into()),
@@ -594,6 +596,7 @@ mod tests {
     #[test]
     fn tool_call_update_carries_status_and_raw_output() {
         let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            description: None,
             tool_call_id: "c9".into(),
             title: None,
             status: Some("failed".into()),

@@ -19,6 +19,34 @@ pub struct AgentToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_preview: Option<String>,
     pub is_error: bool,
+    /// 一句话说明,与实时事件同一个来源(`crate::tool_description`)。
+    /// 旧历史没有这个字段,反序列化为 None —— 界面回落显示 `tool_name`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl AgentToolCall {
+    /// 解析器统一走这里建记录:说明由 `tool_description` 现算,**与实时事件同一个函数**,
+    /// 同一次调用在实时流里和刷新后看到的是同一句(用户 2026-09-19 定)。
+    pub fn new(
+        tool_name: String,
+        input_preview: Option<String>,
+        output_preview: Option<String>,
+        is_error: bool,
+    ) -> Self {
+        let parsed = input_preview
+            .as_deref()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+        let description =
+            crate::tool_description::describe_tool_call(&tool_name, None, parsed.as_ref());
+        Self {
+            tool_name,
+            input_preview,
+            output_preview,
+            is_error,
+            description,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +139,11 @@ pub enum ContentBlock {
         tool_use_id: Option<String>,
         tool_name: String,
         input_preview: Option<String>,
+        /// 一句话说明(`crate::tool_description`),与实时事件同一个来源。
+        /// 由 `get_folder_conversation_turns_core` 下发前统一补上(构造点 127 处,逐处写必漏),
+        /// 所以这里 `#[serde(default)]`:旧历史与内部构造都可以不带。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         /// The agent's own tool-call status (`pending` / `in_progress` /
         /// `completed` / `failed`) when the transcript records one.
         ///

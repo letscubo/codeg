@@ -440,6 +440,7 @@ fn parse_wire(path: &Path, agents_dir: Option<&Path>) -> WireParse {
                             format!("kc-toolcall-{idx}"),
                             MessageRole::Assistant,
                             ContentBlock::ToolUse {
+                                description: None,
                                 tool_use_id: tool_call_id,
                                 tool_name: event
                                     .get("name")
@@ -702,12 +703,7 @@ fn parse_kimi_subagent_tool_calls(path: &Path) -> Vec<AgentToolCall> {
         .map(|(id, tool_name, input_preview)| {
             let (output_preview, is_error) =
                 id.and_then(|i| results.remove(&i)).unwrap_or((None, false));
-            AgentToolCall {
-                tool_name,
-                input_preview,
-                output_preview,
-                is_error,
-            }
+            AgentToolCall::new(tool_name, input_preview, output_preview, is_error)
         })
         .collect()
 }

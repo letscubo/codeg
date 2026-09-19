@@ -1053,6 +1053,7 @@ fn build_turns(
                 role: TurnRole::Assistant,
                 blocks: vec![
                     ContentBlock::ToolUse {
+                        description: None,
                         tool_use_id: Some(tool_id.clone()),
                         tool_name: "shell".to_string(),
                         input_preview: bounded_json_preview(
@@ -1419,6 +1420,7 @@ fn decode_tool_call(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("cursor-tool-{}", blocks.len()));
     blocks.push(ContentBlock::ToolUse {
+        description: None,
         tool_use_id: Some(id.clone()),
         tool_name: tool.name,
         input_preview: tool.input.as_ref().and_then(bounded_json_preview_ref),

@@ -767,6 +767,7 @@ fn upsert_tool_call(
         None => {
             pending.tool_use_index.insert(id.to_string(), pending.blocks.len());
             pending.blocks.push(ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(id.to_string()),
                 // ACP has no tool *name* channel — `title` is what the agent
                 // chose to display, and it is what the frontend classifier
@@ -846,6 +847,7 @@ fn upsert_plan(pending: &mut PendingTurn, plan: &sacp::schema::Plan) {
                 .tool_use_index
                 .insert(PLAN_ID.to_string(), pending.blocks.len());
             pending.blocks.push(ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(PLAN_ID.to_string()),
                 tool_name: "TodoWrite".to_string(),
                 input_preview: Some(input),

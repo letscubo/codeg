@@ -200,6 +200,7 @@ impl StreamMapper {
                         let name = block["name"].as_str().unwrap_or("");
                         let info = tool_info(name, &Value::Object(Map::new()), self.cwd.as_deref());
                         vec![AcpEvent::ToolCall {
+                            description: None,
                             tool_call_id: id.to_string(),
                             title: info.title,
                             kind: info.kind.to_string(),
@@ -263,6 +264,7 @@ impl StreamMapper {
                     let raw_input = Some(input.to_string());
                     if self.announced_tools.insert(id.to_string()) {
                         events.push(AcpEvent::ToolCall {
+                            description: None,
                             tool_call_id: id.to_string(),
                             title: info.title,
                             kind: info.kind.to_string(),
@@ -276,6 +278,7 @@ impl StreamMapper {
                         });
                     } else {
                         events.push(AcpEvent::ToolCallUpdate {
+                            description: None,
                             tool_call_id: id.to_string(),
                             title: Some(info.title),
                             status: Some("in_progress".to_string()),
@@ -344,6 +347,7 @@ impl StreamMapper {
 
 fn tool_result_update(id: &str, status: &str, content: &Value) -> AcpEvent {
     AcpEvent::ToolCallUpdate {
+        description: None,
         tool_call_id: id.to_string(),
         title: None,
         status: Some(status.to_string()),

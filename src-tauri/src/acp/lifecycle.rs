@@ -1031,6 +1031,7 @@ mod delegation_registration_tests {
             seq: 1,
             connection_id: "parent-conn".into(),
             payload: AcpEvent::ToolCall {
+                description: None,
                 tool_call_id: tool_call_id.into(),
                 title: title.into(),
                 kind: "other".into(),
@@ -1054,6 +1055,7 @@ mod delegation_registration_tests {
             seq: 2,
             connection_id: "parent-conn".into(),
             payload: AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: tool_call_id.into(),
                 title: title.map(|s| s.to_string()),
                 status: None,
@@ -1087,6 +1089,7 @@ mod delegation_registration_tests {
             seq: 2,
             connection_id: "parent-conn".into(),
             payload: AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: tool_call_id.into(),
                 title: None,
                 status: status.map(|s| s.to_string()),
@@ -1114,6 +1117,7 @@ mod delegation_registration_tests {
             seq: 1,
             connection_id: "parent-conn".into(),
             payload: AcpEvent::ToolCall {
+                description: None,
                 tool_call_id: tool_call_id.into(),
                 title: title.into(),
                 kind: "other".into(),
@@ -2533,6 +2537,7 @@ mod tests {
         // needs to enter a worker mailbox. Keeping them out is what relieves
         // the bus-lag pressure that dropped a parallel delegation's tool_call.
         assert!(!is_lifecycle_relevant(&AcpEvent::ToolCall {
+            description: None,
             tool_call_id: "tc-1".into(),
             title: "delegate_to_agent".into(),
             kind: "other".into(),
@@ -2545,6 +2550,7 @@ mod tests {
             images: None,
         }));
         assert!(!is_lifecycle_relevant(&AcpEvent::ToolCallUpdate {
+            description: None,
             tool_call_id: "tc-1".into(),
             title: Some("delegate_to_agent".into()),
             status: None,

@@ -1548,6 +1548,7 @@ mod async_relay_dedup_tests {
             seq: 1,
             connection_id: "conn".into(),
             payload: AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: "tc-1".into(),
                 title: Some("delegate_to_agent".into()),
                 status: Some("completed".into()),

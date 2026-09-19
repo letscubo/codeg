@@ -93,6 +93,9 @@ zstd = "0.13"
 tar = "0.4"
 zip = "2"
 regex = "1"
+# 工具调用说明:命令解析搬自 codex(见 vendor/codex-shell-command)
+codex-shell-command = { path = "vendor/codex-shell-command" }
+shlex = "1"
 portable-pty = "0.8"
 urlencoding = "2"
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", version = "0.0.0", optional = true }

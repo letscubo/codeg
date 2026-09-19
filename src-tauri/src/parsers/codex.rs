@@ -1318,6 +1318,7 @@ fn unwrap_code_mode_script(
         let call = &calls[0];
         let joined = chunks.join("\n");
         let uses = vec![ContentBlock::ToolUse {
+            description: None,
             tool_use_id: Some(call_id.to_string()),
             tool_name: call.tool_name.clone(),
             input_preview: Some(shell_session_input_preview(
@@ -1354,6 +1355,7 @@ fn unwrap_code_mode_script(
             };
             let group = &chunks[index * stride..(index + 1) * stride];
             uses.push(ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(id.clone()),
                 tool_name: call.tool_name.clone(),
                 input_preview: Some(shell_session_input_preview(
@@ -1400,6 +1402,7 @@ fn unwrap_code_mode_script(
                 .map(call_display_name)
                 .collect();
             uses.push(ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(id.clone()),
                 tool_name: call.tool_name.clone(),
                 input_preview: Some(shell_session_input_preview(
@@ -1651,6 +1654,7 @@ fn unwrap_completed_mcp_calls(
     let mut results = Vec::with_capacity(completed.len());
     for (index, item) in completed.into_iter().enumerate() {
         uses.push(ContentBlock::ToolUse {
+            description: None,
             tool_use_id: Some(item.id.clone()),
             tool_name: script.tool_names[index].clone(),
             input_preview: item.input_preview,
@@ -2791,22 +2795,24 @@ fn parse_codex_subagent_stats(
                     match script.calls {
                         Some(calls) if !calls.is_empty() => calls
                             .into_iter()
-                            .map(|call| AgentToolCall {
-                                tool_name: call.tool_name,
-                                input_preview: Some(truncate_str(&call.input_preview, 500)),
-                                output_preview: None,
-                                is_error: false,
+                            .map(|call| {
+                                AgentToolCall::new(
+                                    call.tool_name,
+                                    Some(truncate_str(&call.input_preview, 500)),
+                                    None,
+                                    false,
+                                )
                             })
                             .collect(),
-                        _ => vec![AgentToolCall {
-                            tool_name: CODEX_SCRIPT_TOOL_NAME.to_string(),
-                            input_preview: script
+                        _ => vec![AgentToolCall::new(
+                            CODEX_SCRIPT_TOOL_NAME.to_string(),
+                            script
                                 .summary
                                 .or_else(|| Some(source.to_string()))
                                 .map(|s| truncate_str(&s, 500)),
-                            output_preview: None,
-                            is_error: false,
-                        }],
+                            None,
+                            false,
+                        )],
                     }
                 } else {
                     let input_preview = if tool_name == "exec_command" {
@@ -2823,12 +2829,12 @@ fn parse_codex_subagent_stats(
                         value_to_preview(payload.get("arguments").or_else(|| payload.get("input")))
                     };
 
-                    vec![AgentToolCall {
+                    vec![AgentToolCall::new(
                         tool_name,
-                        input_preview: input_preview.map(|s| truncate_str(&s, 500)),
-                        output_preview: None,
-                        is_error: false,
-                    }]
+                        input_preview.map(|s| truncate_str(&s, 500)),
+                        None,
+                        false,
+                    )]
                 };
 
                 if let Some(id) = call_id {
@@ -3494,6 +3500,7 @@ impl CodexParser {
                                         role: MessageRole::Assistant,
                                         content: vec![
                                             ContentBlock::ToolUse {
+                                                description: None,
                                                 tool_use_id: Some(id.clone()),
                                                 tool_name: marker.tool_name.to_string(),
                                                 input_preview: Some(marker.input_json),
@@ -4011,6 +4018,7 @@ impl CodexParser {
                                             id: format!("tool-{}", messages.len()),
                                             role: MessageRole::Assistant,
                                             content: vec![ContentBlock::ToolUse {
+                                                description: None,
                                                 tool_use_id,
                                                 tool_name: "Agent".to_string(),
                                                 input_preview: Some(agent_input.to_string()),
@@ -4075,6 +4083,7 @@ impl CodexParser {
                                             id: format!("tool-{}", messages.len()),
                                             role: MessageRole::Assistant,
                                             content: vec![ContentBlock::ToolUse {
+                                                description: None,
                                                 tool_use_id,
                                                 tool_name: CODEX_SCRIPT_TOOL_NAME.to_string(),
                                                 input_preview: Some(script_card_input(
@@ -4153,6 +4162,7 @@ impl CodexParser {
                                             id: format!("tool-{}", messages.len()),
                                             role: MessageRole::Assistant,
                                             content: vec![ContentBlock::ToolUse {
+                                                description: None,
                                                 tool_use_id,
                                                 tool_name: raw_tool_name.to_string(),
                                                 input_preview,
@@ -4374,6 +4384,7 @@ impl CodexParser {
                                             id: format!("tool-{}", messages.len()),
                                             role: MessageRole::Assistant,
                                             content: vec![ContentBlock::ToolUse {
+                                                description: None,
                                                 tool_use_id: tool_use_id.clone(),
                                                 tool_name: "collab_agent".to_string(),
                                                 input_preview: Some(collab_input),
@@ -5487,6 +5498,7 @@ fn push_plan_review_marker(messages: &mut Vec<UnifiedMessage>, timestamp: DateTi
         role: MessageRole::Assistant,
         content: vec![
             ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some(tool_use_id.clone()),
                 // Resolved verbatim by the historical adapter, which passes
                 // `block.tool_name` straight through to the renderer's

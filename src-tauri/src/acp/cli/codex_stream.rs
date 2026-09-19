@@ -143,6 +143,7 @@ impl CodexStreamMapper {
         self.last_block = Block::Other;
         let info = codex_tool_info(item, self.cwd.as_deref());
         vec![AcpEvent::ToolCall {
+            description: None,
             tool_call_id: id.to_string(),
             title: info.title,
             kind: info.kind.to_string(),
@@ -191,6 +192,7 @@ impl CodexStreamMapper {
                 self.open_tools.remove(id);
                 self.last_block = Block::Other;
                 events.push(AcpEvent::ToolCallUpdate {
+                    description: None,
                     tool_call_id: id.to_string(),
                     title: None,
                     status: Some(if tool_failed(item) { "failed" } else { "completed" }.to_string()),
@@ -232,6 +234,7 @@ impl CodexStreamMapper {
             .open_tools
             .drain()
             .map(|id| AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: id,
                 title: None,
                 status: Some("failed".to_string()),

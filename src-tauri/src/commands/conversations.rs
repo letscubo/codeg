@@ -1875,6 +1875,34 @@ pub async fn get_folder_conversation_with_live_core(
 /// variant of the detail fetch: full parse + delegation-meta injection (both
 /// happen inside `get_folder_conversation_core`), then a pure slice — no
 /// auto-title refresh, no live correlation, no sidebar events.
+/// 给一页历史里的工具块补 `description`(见 [`crate::tool_description`])。
+/// 已经带了的不动(解析器将来若自己算好,以它为准)。
+fn fill_tool_descriptions(turns: &mut [MessageTurn]) {
+    for turn in turns.iter_mut() {
+        for block in turn.blocks.iter_mut() {
+            if let crate::models::message::ContentBlock::ToolUse {
+                tool_name,
+                input_preview,
+                description,
+                ..
+            } = block
+            {
+                if description.is_some() {
+                    continue;
+                }
+                let parsed = input_preview
+                    .as_deref()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+                *description = crate::tool_description::describe_tool_call(
+                    tool_name.as_str(),
+                    None,
+                    parsed.as_ref(),
+                );
+            }
+        }
+    }
+}
+
 pub async fn get_folder_conversation_turns_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
@@ -1887,8 +1915,12 @@ pub async fn get_folder_conversation_turns_core(
     let (start, end) = turn_window::resolve_page_bounds(&turns, before_index, limit);
     let meta = turn_window::window_meta(&turns, start);
     let seam = turn_window::window_meta(&turns, before_index.min(turns.len()));
+    // 下发前补一句话说明:各解析器的构造点有上百处,逐处写必漏;这里是历史出库的唯一出口。
+    // 实时流在 web::event_bridge 用同一个 `tool_description::describe_tool_call`,两边一致。
+    let mut page_turns = turns[start..end].to_vec();
+    fill_tool_descriptions(&mut page_turns);
     Ok(ConversationTurnsPage {
-        turns: turns[start..end].to_vec(),
+        turns: page_turns,
         turns_offset: meta.offset,
         turns_total: meta.total,
         assistant_turns_before_offset: meta.assistant_before,
@@ -2804,6 +2836,7 @@ mod tests {
             id: "t1".into(),
             role: TurnRole::Assistant,
             blocks: vec![ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: tool_use_id.map(String::from),
                 tool_name: tool_name.into(),
                 input_preview: input_preview.map(String::from),
@@ -3385,6 +3418,7 @@ mod tests {
             id: "t1".into(),
             role: TurnRole::Assistant,
             blocks: vec![ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: Some("tu-1".into()),
                 tool_name: "delegate_to_agent".into(),
                 input_preview: None,

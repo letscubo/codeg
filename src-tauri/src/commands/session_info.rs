@@ -459,6 +459,7 @@ mod tests {
             vec![
                 ContentBlock::Text { text: "hello".into() },
                 ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: None,
                     tool_name: "Read".into(),
                     input_preview: None,
@@ -466,6 +467,7 @@ mod tests {
                     meta: None,
                 },
                 ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: None,
                     tool_name: "Read".into(),
                     input_preview: None,
@@ -507,6 +509,7 @@ mod tests {
         // most MAX_TOOLS_PER_TURN names, each ≤ MAX_TOOL_NAME_CHARS.
         let blocks: Vec<ContentBlock> = (0..5000)
             .map(|i| ContentBlock::ToolUse {
+                description: None,
                 tool_use_id: None,
                 tool_name: format!("{}_{i}", "x".repeat(500)),
                 input_preview: None,
@@ -529,6 +532,7 @@ mod tests {
         let one_turn = || {
             let blocks: Vec<ContentBlock> = (0..MAX_TOOLS_PER_TURN)
                 .map(|i| ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: None,
                     tool_name: format!("{}_{i}", "t".repeat(MAX_TOOL_NAME_CHARS)),
                     input_preview: None,

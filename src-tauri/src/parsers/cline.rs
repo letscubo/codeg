@@ -995,6 +995,7 @@ fn parse_content_blocks(
                             truncate_str(&s, 2000)
                         });
                         blocks.push(ContentBlock::ToolUse {
+                            description: None,
                             tool_use_id,
                             tool_name,
                             input_preview,

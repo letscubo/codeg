@@ -291,6 +291,7 @@ impl CodeBuddyParser {
                         id: format!("cb-toolcall-{idx}"),
                         role: MessageRole::Assistant,
                         content: vec![ContentBlock::ToolUse {
+                            description: None,
                             tool_use_id: tool_call_id,
                             tool_name,
                             input_preview: tool_input_preview(&value),
@@ -1022,12 +1023,7 @@ fn parse_codebuddy_subagent_tool_calls(path: &Path) -> Vec<AgentToolCall> {
         .map(|(id, tool_name, input_preview)| {
             let (output_preview, is_error) =
                 id.and_then(|i| results.remove(&i)).unwrap_or((None, false));
-            AgentToolCall {
-                tool_name,
-                input_preview,
-                output_preview,
-                is_error,
-            }
+            AgentToolCall::new(tool_name, input_preview, output_preview, is_error)
         })
         .collect()
 }

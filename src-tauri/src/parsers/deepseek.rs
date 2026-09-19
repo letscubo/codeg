@@ -1056,6 +1056,7 @@ fn parse_session_events(text: &str, attachments: Option<&Path>) -> SessionParse 
                             }
                         }
                         "tool-call" => ContentBlock::ToolUse {
+                            description: None,
                             tool_use_id: block.get("id").and_then(Value::as_str).map(String::from),
                             tool_name: block
                                 .get("name")
@@ -1239,6 +1240,7 @@ fn parse_session_events(text: &str, attachments: Option<&Path>) -> SessionParse 
                 // tool_use_id. The pair is self-contained — a ToolUse with no
                 // ToolResult would read as a call still running.
                 turn.blocks.push(ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: Some(id.clone()),
                     tool_name: "context_compaction".to_string(),
                     input_preview: None,

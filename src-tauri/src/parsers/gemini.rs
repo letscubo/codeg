@@ -719,6 +719,7 @@ impl GeminiParser {
                     });
 
                 blocks.push(ContentBlock::ToolUse {
+                    description: None,
                     tool_use_id: tool_use_id.clone(),
                     tool_name,
                     input_preview,

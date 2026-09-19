@@ -6771,6 +6771,7 @@ async fn handle_grok_ask_user_question(
                         &state,
                         &emitter,
                         AcpEvent::ToolCall {
+                            description: None,
                             tool_call_id,
                             title: "ask_user_question".to_string(),
                             kind: "other".to_string(),
@@ -6921,6 +6922,7 @@ async fn try_bridge_pi_select_ask(
                     &state,
                     &emitter,
                     AcpEvent::ToolCall {
+                        description: None,
                         // pi's own id for the dialog, so the one card is keyed
                         // to the request it answers.
                         tool_call_id,
@@ -7241,6 +7243,7 @@ async fn handle_elicitation_request(
                                 &card_state,
                                 &card_emitter,
                                 AcpEvent::ToolCall {
+                                    description: None,
                                     tool_call_id,
                                     title: "request_user_input".to_string(),
                                     kind: "other".to_string(),
@@ -7298,6 +7301,7 @@ async fn handle_permission_request(
             state,
             emitter,
             AcpEvent::ToolCall {
+                description: None,
                 tool_call_id: req.tool_call.tool_call_id.to_string(),
                 title: req.tool_call.fields.title.clone().unwrap_or_default(),
                 kind: "switch_mode".to_string(),
@@ -8385,6 +8389,7 @@ async fn emit_terminal_output_update(
         state,
         emitter,
         AcpEvent::ToolCallUpdate {
+            description: None,
             tool_call_id: tool_call_id.to_string(),
             title: None,
             status: None,
@@ -12319,6 +12324,7 @@ async fn settle_codex_subagent_launch(
         state,
         emitter,
         AcpEvent::ToolCallUpdate {
+            description: None,
             tool_call_id: launch_id.clone(),
             title: None,
             status: None,
@@ -13316,6 +13322,7 @@ fn map_grok_ext_notification(
                 meta.insert("tokensAfter".to_string(), after.into());
             }
             Some(AcpEvent::ToolCall {
+                description: None,
                 tool_call_id: grok_ext_event_id(params),
                 title: "Context compaction".to_string(),
                 kind: "other".to_string(),
@@ -13530,6 +13537,7 @@ fn map_grok_subagent_notification_inner(
             // later snapshot.
             if turn_active && cb_state.grok_progress_eligible.contains(&call_id) {
                 events.push(AcpEvent::ToolCallUpdate {
+                    description: None,
                     tool_call_id: call_id.clone(),
                     title: None,
                     status: None,
@@ -13593,6 +13601,7 @@ fn map_grok_subagent_notification_inner(
             // "open the child's session" affordance mid-run.
             let child_session_id = cb_state.grok_call_child_session.get(&call_id).cloned();
             Some(vec![AcpEvent::ToolCallUpdate {
+                description: None,
                 tool_call_id: call_id,
                 title: None,
                 status: None,
@@ -14342,6 +14351,7 @@ async fn emit_conversation_update(
                 state,
                 emitter,
                 AcpEvent::ToolCall {
+                    description: None,
                     tool_call_id,
                     title,
                     kind: format!("{:?}", tc.kind).to_lowercase(),
@@ -14659,6 +14669,7 @@ async fn emit_conversation_update(
                 state,
                 emitter,
                 AcpEvent::ToolCallUpdate {
+                    description: None,
                     tool_call_id,
                     title,
                     status,
@@ -14802,6 +14813,7 @@ async fn emit_conversation_update(
                         state,
                         emitter,
                         AcpEvent::ToolCall {
+                            description: None,
                             tool_call_id,
                             title: marker.title,
                             kind: "other".to_string(),
