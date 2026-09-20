@@ -1,15 +1,9 @@
-# Stage 1: Build Next.js static export
-FROM node:24-alpine AS frontend
-RUN corepack enable
-WORKDIR /app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
-COPY src/ ./src/
-COPY public/ ./public/
-COPY next.config.ts tsconfig.json postcss.config.mjs components.json ./
-RUN pnpm build
+# This fork ships no frontend: the Next.js app was removed, the platform has its
+# own interface and only ever calls codeg's HTTP API. So there is no static
+# export to build, nothing to copy to /app/web, and CODEG_STATIC_DIR stays
+# unset — the server simply serves /api and /ws and answers 404 elsewhere.
 
-# Stage 2: Build Rust server binary + codeg-mcp companion
+# Stage 1: Build Rust server binary + codeg-mcp companion
 FROM rust:slim-bookworm AS backend
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/src-tauri
@@ -20,7 +14,7 @@ COPY src-tauri/ ./
 RUN cargo build --release --bin codeg-server --no-default-features \
  && cargo build --release --bin codeg-mcp --no-default-features
 
-# Stage 3: Runtime
+# Stage 2: Runtime
 FROM node:24-bookworm-slim
 RUN apt-get update && apt-get install -y \
     libsqlite3-0 \
@@ -42,9 +36,6 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=backend /app/src-tauri/target/release/codeg-server /usr/local/bin/codeg-server
 COPY --from=backend /app/src-tauri/target/release/codeg-mcp /usr/local/bin/codeg-mcp
-COPY --from=frontend /app/out /app/web
-
-ENV CODEG_STATIC_DIR=/app/web
 ENV CODEG_DATA_DIR=/data
 ENV CODEG_PORT=3080
 ENV CODEG_HOST=0.0.0.0

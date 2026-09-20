@@ -1,5 +1,5 @@
 node_modules/
-.next/
+# `out/` holds only the tauri frontendDist placeholder; nothing builds from it.
 out/
 target/
 src-tauri/target/

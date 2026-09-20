@@ -16,38 +16,10 @@ concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
 
+# There is no frontend job: this fork removed the Next.js app (the platform
+# has its own UI and only ever calls codeg's HTTP API), so nothing here lints
+# or builds TypeScript.
 jobs:
-  frontend:
-    name: Frontend (lint + vitest + build)
-    # Frontend tests are OS-independent (jsdom + pure TS), keep on Linux
-    # to save CI minutes.
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: "pnpm"
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Lint
-        run: pnpm eslint .
-
-      - name: Unit tests (vitest)
-        run: pnpm test
-
-      - name: Static export build
-        run: pnpm build
-
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -104,16 +76,6 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev
-
-      - name: Prepare Tauri frontendDist placeholder
-        # Tauri's build script validates `frontendDist` and bundled resource
-        # paths during Rust compilation. The frontend job owns the real static
-        # export; Rust desktop cells only need the path to exist for tests.
-        if: matrix.mode == 'desktop'
-        shell: bash
-        run: |
-          mkdir -p out
-          printf '<!doctype html><html><body></body></html>\n' > out/index.html
 
       - name: cargo test
         # Windows desktop test binaries link the Tauri runtime and can fail at

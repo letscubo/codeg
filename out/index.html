@@ -1,0 +1,16 @@
+<!doctype html>
+<!--
+  Placeholder, not a UI. This fork removed the Next.js frontend; the platform
+  has its own interface and only ever calls codeg's HTTP API. Tauri's build
+  script validates `frontendDist` (../out) and the bundled `../out` resource
+  while the desktop shell is compiled, so the path has to exist. Nothing serves
+  this file: the container sets no CODEG_STATIC_DIR, and a release bundle
+  carries no web/ directory.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>codeg</title>
+  </head>
+  <body></body>
+</html>

@@ -202,10 +202,11 @@ jobs:
           node-version: 24
           cache: "pnpm"
 
-      - name: Build frontend
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
+      - name: Install Node tooling
+        # Not a frontend build — this fork has none. The only Node dependency
+        # left is @tauri-apps/cli, which the signing step below invokes as
+        # `pnpm tauri signer sign`.
+        run: pnpm install --frozen-lockfile
 
       - name: Build server + codeg-mcp companion
         working-directory: src-tauri
@@ -225,7 +226,6 @@ jobs:
           cp src-tauri/target/${{ matrix.target }}/release/codeg-server dist/${{ matrix.artifact }}/
           cp src-tauri/target/${{ matrix.target }}/release/codeg-mcp dist/${{ matrix.artifact }}/
           chmod +x dist/${{ matrix.artifact }}/codeg-server dist/${{ matrix.artifact }}/codeg-mcp
-          cp -r out dist/${{ matrix.artifact }}/web
           cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
       - name: Package (Windows)
@@ -235,7 +235,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-server.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
-          Copy-Item -Recurse out dist/${{ matrix.artifact }}/web
           Compress-Archive -Path dist/${{ matrix.artifact }} -DestinationPath dist/${{ matrix.artifact }}.zip
 
       - name: Smoke test packaged artifact (Unix)

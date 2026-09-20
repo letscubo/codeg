@@ -8,27 +8,26 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 
 ## 技术栈
 
-- **桌面运行时**: Tauri 2（Rust 后端 + webview 前端）
-- **服务器运行时**: 独立 Rust 二进制（Axum HTTP + WebSocket）
-- **前端**: Next.js 16（静态导出模式）+ React 19 + TypeScript（strict）
-- **样式**: Tailwind CSS v4 + shadcn/ui（radix-maia 风格）
-- **国际化**: next-intl
+- **服务器运行时**: 独立 Rust 二进制（Axum HTTP + WebSocket）—— 本 fork 的唯一交付物
+- **桌面运行时**: Tauri 2 外壳仍能编译，但没有界面可加载（见下）
 - **数据库**: SeaORM + SQLite
-- **包管理器**: pnpm
+- **包管理器**: pnpm（只剩 `@tauri-apps/cli` 一个依赖，用于发版签名）
+
+### ⚠️ 本 fork 没有前端
+
+上游的 Next.js 应用（`src/`、`public/` 及全部前端配置）**已从本 fork 删除**：平台
+（MyClaw）有自己的界面，只调用 codeg 的 HTTP API（`/api/*` 与 `/ws`），从不打开
+codeg 自带的工作台。因此：
+
+- 不要新增 / 恢复任何 `.ts` / `.tsx` 界面代码，也不要给后端改动"配套改前端"
+- release 包里不含 `web/` 目录，容器不设 `CODEG_STATIC_DIR`，服务端对非 API 路径一律 404
+- `out/index.html` 是**占位文件**，只为让 tauri-build 校验 `frontendDist` 通过；它不是界面
+- 合上游时 `src/` / `public/` 下的冲突一律按"删除"解决：
+  `git diff --name-only --diff-filter=U | grep -E '^(src|public)/' | xargs -r git rm -q`
 
 ## 代码检查与测试（任务完成后进行必要的检查）
 
-### 前端
-
-```bash
-pnpm lint .                    # lint
-pnpm test                      # vitest 全跑（CI 用同一条命令）
-pnpm test:watch                # 开发时增量重跑
-pnpm test:coverage             # 覆盖率报告（输出到 coverage/index.html）
-pnpm build                     # 静态导出构建
-```
-
-### 后端 Rust（在 `src-tauri/` 目录下执行）
+### Rust（在 `src-tauri/` 目录下执行）
 
 ```bash
 # 桌面模式（默认 feature）
@@ -79,26 +78,11 @@ INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 - **`acp/`** — Agent Client Protocol 连接管理
 - **`db/`** — SeaORM + SQLite
 
-### 前端（`src/`）
-
-#### 核心库（`lib/`）
-
-- **`transport/`** — Transport 抽象层（自动检测 Tauri/Web 环境切换 `invoke()`/`fetch()`）
-- **`adapters/`** — AI 响应到组件渲染的适配器
-- **`types.ts`** — Rust 模型的 TypeScript 镜像
-- **`api.ts`** — 主 API 客户端
-- **`tauri.ts`** — Tauri API 封装
-
-#### 国际化（`i18n/`）
-
-- 支持 10 种语言：英语、简体中文、繁体中文、日语、韩语、西班牙语、德语、法语、葡萄牙语、阿拉伯语
-- 使用 next-intl 框架，消息文件存放在 `i18n/messages/`
-
 ### 数据流
 
-桌面模式：前端 `invoke()` → Tauri 命令 → 业务逻辑 → 返回数据
-服务器模式：前端 `fetch()` → Axum HTTP API → 同一业务逻辑 → 返回 JSON
-实时通信：后端事件 → EventEmitter（Tauri 事件 / WebSocket 广播）→ 前端
+平台调用：MyClaw `fetch()` → Axum HTTP API → 业务逻辑 → 返回 JSON
+实时通信：后端事件 → EventEmitter（WebSocket 广播）→ 平台
+桌面模式（本 fork 不交付）：`invoke()` → Tauri 命令 → 同一套业务逻辑
 
 ### 条件编译约定
 
@@ -108,14 +92,10 @@ INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 
 ## 关键约束
 
-- **仅支持静态导出**：`next.config.ts` 设置 `output: "export"`，不支持动态路由（`[param]`），必须使用查询参数替代
-- **路径别名**：`@/*` 映射到 `./src/*`，导入写法为 `@/lib/utils`、`@/components/ui/button`
-- **服务器部署**：通过环境变量配置（`CODEG_PORT`、`CODEG_HOST`、`CODEG_TOKEN`、`CODEG_DATA_DIR`、`CODEG_STATIC_DIR`）
-- **Docker 支持**：多阶段构建（Node.js + Rust），支持 `docker-compose` 一键部署
+- **服务器部署**：通过环境变量配置（`CODEG_PORT`、`CODEG_HOST`、`CODEG_TOKEN`、`CODEG_DATA_DIR`）。`CODEG_STATIC_DIR` 仍被读取，但本 fork 没有可指的静态目录，正常部署不设它
+- **Docker 支持**：单阶段 Rust 构建，支持 `docker-compose` 一键部署
 
 ## 代码风格
 
-- Prettier：无分号、尾逗号（es5）、2 空格缩进、80 字符宽度
-- ESLint：next/core-web-vitals + typescript + prettier
-- TypeScript：strict 模式，启用 `noUnusedLocals` 和 `noUnusedParameters`
 - Rust：2021 edition，使用 `thiserror` 定义错误类型
+- 仓库里剩余的少量 `.mjs`（sidecar 脚本、dsh 插件）沿用 Prettier 默认：无分号、尾逗号（es5）、2 空格缩进

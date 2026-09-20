@@ -13,13 +13,14 @@ dist-ssr
 *.local
 tsconfig.tsbuildinfo
 
-# Next.js
-.next/
-out/
-next-env.d.ts
-
-# Monaco editor local files (copied from node_modules)
-public/vs
+# Tauri's frontendDist placeholder. This fork ships no frontend, but the
+# desktop shell still compiles (972 `feature = "tauri-runtime"` sites across 56
+# files — removing it is a different, much larger job), and tauri-build
+# validates `frontendDist` / the bundled `../out` resource during compilation.
+# So `out/index.html` is tracked as an empty placeholder and nothing else in
+# `out/` is.
+/out/*
+!/out/index.html
 
 # Editor directories and files
 .vscode/*

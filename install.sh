@@ -10,7 +10,9 @@ set -euo pipefail
 
 REPO="letscubo/codeg"
 INSTALL_DIR="${CODEG_INSTALL_DIR:-/usr/local/bin}"
-WEB_DIR="${CODEG_WEB_DIR:-/usr/local/share/codeg/web}"
+# No web assets: this fork ships no frontend, so a release tarball is the two
+# binaries and there is nothing to place under /usr/local/share. CODEG_WEB_DIR
+# and CODEG_STATIC_DIR are accordingly gone from this installer.
 VERSION=""
 # Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
 # default so the user's `codeg-server` command always runs the freshly
@@ -143,8 +145,8 @@ if command -v sudo >/dev/null 2>&1; then
 fi
 
 # Walk up from $1 to the first ancestor that already exists, so writability can
-# be tested for a not-yet-created path (e.g. /usr/local/share/codeg/web, whose
-# parent /usr/local/share/codeg also doesn't exist on a fresh install).
+# be tested for a not-yet-created path (e.g. $HOME/.local/bin on a machine that
+# has never had one).
 nearest_existing_ancestor() {
   local p="$1"
   while [ -n "$p" ] && [ "$p" != "/" ] && [ ! -e "$p" ]; do
@@ -249,15 +251,11 @@ fi
 TARGET_VER="${VERSION#v}"
 
 # Only short-circuit when the active binary is up to date AND the destination
-# has it AND no other PATH entries shadow it AND the web assets are present.
-# The web-asset check makes the installer self-healing: a prior run that placed
-# the binary but failed before copying web/ (the classic root-without-sudo
-# case) is repaired on re-run instead of exiting "nothing to do" forever.
+# has it AND no other PATH entries shadow it.
 if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$TARGET_VER" ] \
    && [ "${#PATH_CONFLICTS[@]}" -eq 0 ] \
-   && [ -x "$DEST_BIN" ] \
-   && [ -f "${WEB_DIR}/index.html" ]; then
-  echo "codeg-server is already at version ${TARGET_VER} with web assets in place, nothing to do."
+   && [ -x "$DEST_BIN" ]; then
+  echo "codeg-server is already at version ${TARGET_VER}, nothing to do."
   exit 0
 fi
 
@@ -375,8 +373,8 @@ done
 # instead of crashing mid-install under `set -e`.
 if ! resolve_priv "$INSTALL_DIR"; then
   echo "Error: need elevated privileges to install to ${INSTALL_DIR}, but 'sudo' is not installed."
-  echo "       Re-run as root, install sudo, or set CODEG_INSTALL_DIR/CODEG_WEB_DIR to writable"
-  echo "       paths (e.g. \$HOME/.local/bin and \$HOME/.local/share/codeg/web)."
+  echo "       Re-run as root, install sudo, or set CODEG_INSTALL_DIR to a writable"
+  echo "       path (e.g. \$HOME/.local/bin)."
   exit 1
 fi
 if [ -n "$PRIV" ]; then
@@ -399,21 +397,6 @@ done
 # leave the final non-existent component unresolved (notably macOS readlink -f),
 # which would mis-compare against the post-install `command -v` result.
 DEST_BIN_REAL="$(canon_path "$DEST_BIN")"
-
-# ── Install web assets ──
-
-WEB_SRC="${TMP_DIR}/${ARTIFACT}/web"
-
-if [ -d "$WEB_SRC" ]; then
-  echo "Installing web assets to ${WEB_DIR}..."
-  if ! resolve_priv "$WEB_DIR"; then
-    echo "Error: need elevated privileges to write ${WEB_DIR}, but 'sudo' is not installed."
-    echo "       Re-run as root, install sudo, or set CODEG_WEB_DIR to a writable path."
-    exit 1
-  fi
-  priv_run mkdir -p "$WEB_DIR"
-  priv_run cp -r "$WEB_SRC"/* "$WEB_DIR"/
-fi
 
 # ── Remove shadowing binaries from earlier PATH entries ──
 
@@ -445,7 +428,7 @@ if [ -n "$RESTARTED_PIDS" ]; then
   echo ""
   echo "Note: codeg-server was stopped for the upgrade."
   echo "Please restart it manually to ensure your environment variables (CODEG_PORT, CODEG_TOKEN, etc.) are preserved:"
-  echo "  CODEG_STATIC_DIR=${WEB_DIR} codeg-server"
+  echo "  codeg-server"
 fi
 
 # ── Done ──
@@ -495,10 +478,10 @@ fi
 
 echo ""
 echo "Quick start:"
-echo "  CODEG_STATIC_DIR=${WEB_DIR} codeg-server"
+echo "  codeg-server"
 echo ""
 echo "Or with custom settings:"
-echo "  CODEG_PORT=3080 CODEG_TOKEN=your-secret CODEG_STATIC_DIR=${WEB_DIR} codeg-server"
+echo "  CODEG_PORT=3080 CODEG_TOKEN=your-secret codeg-server"
 echo ""
 echo "The auth token is printed to stderr on startup if not set via CODEG_TOKEN."
 

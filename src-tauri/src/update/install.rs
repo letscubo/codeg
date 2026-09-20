@@ -84,7 +84,10 @@ fn mcp_bin_filename() -> &'static str {
 struct Targets {
     server_bin: PathBuf,
     mcp_bin: PathBuf,
-    web_dir: PathBuf,
+    /// `None` on this fork's normal deployment: it ships no frontend, so there
+    /// is no static bundle to swap. Only an install that explicitly names one
+    /// through `CODEG_STATIC_DIR` has a `web/` update target.
+    web_dir: Option<PathBuf>,
 }
 
 fn resolve_targets() -> Result<Targets, AppCommandError> {
@@ -95,25 +98,23 @@ fn resolve_targets() -> Result<Targets, AppCommandError> {
         .to_path_buf();
     let mcp_bin = bindir.join(mcp_bin_filename());
 
-    // Resolve the `web/` *update target* deterministically — this is distinct
-    // from "where to serve static files from right now". When CODEG_STATIC_DIR
-    // is set (the Docker image sets it to /app/web), the bundle lives there by
-    // definition, so target it even if it is momentarily absent (e.g. a prior
-    // web swap was interrupted mid-rename). Routing this through the serving
-    // fallback would silently retarget a *different* directory when index.html
-    // is missing, so a retry could update the wrong path and never repair the
-    // real one.
-    let web_dir = match std::env::var("CODEG_STATIC_DIR")
+    // Resolve the `web/` *update target* — distinct from "where to serve static
+    // files from right now". This fork ships no frontend, so a release carries
+    // no `web/` and there is normally nothing to swap: the target is `None`.
+    // An install that does serve a static bundle names it with CODEG_STATIC_DIR
+    // (the Docker image sets /app/web); target that path even if it is
+    // momentarily absent (e.g. a prior web swap was interrupted mid-rename).
+    // Deliberately NOT routed through the serving fallback: that would silently
+    // retarget a *different* directory when index.html is missing, so a retry
+    // could update the wrong path and never repair the real one.
+    let web_dir = std::env::var("CODEG_STATIC_DIR")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-    {
-        Some(dir) => PathBuf::from(dir),
-        None => crate::web::find_static_dir_standalone(None),
-    };
-    // Absolutize so the rename-based swap is filesystem-stable regardless of
-    // the process CWD (which the supervisor/respawn may not preserve).
-    let web_dir = std::fs::canonicalize(&web_dir).unwrap_or(web_dir);
+        .map(PathBuf::from)
+        // Absolutize so the rename-based swap is filesystem-stable regardless
+        // of the process CWD (which the supervisor/respawn may not preserve).
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
 
     Ok(Targets {
         server_bin,
@@ -217,7 +218,7 @@ fn preflight_writable(targets: &Targets) -> Result<(), AppCommandError> {
         .parent()
         .ok_or_else(|| AppCommandError::io_error("Cannot resolve server binary directory"))?;
     check_writable(bindir)?;
-    if let Some(web_parent) = targets.web_dir.parent() {
+    if let Some(web_parent) = targets.web_dir.as_deref().and_then(Path::parent) {
         check_writable(web_parent)?;
     }
     Ok(())
@@ -313,32 +314,35 @@ pub async fn perform_update(
     let bundle_root = find_bundle_root(&staging, asset)?;
     let new_server = bundle_root.join(server_bin_filename());
     let new_mcp = bundle_root.join(mcp_bin_filename());
+    // A release of this fork is the two binaries — the frontend was removed, so
+    // no `web/` is packaged and its absence is not a defect. Both binaries are
+    // still required before touching any live file: a signed but mis-packaged
+    // release that dropped one must not install a half-new mixture.
     let new_web = bundle_root.join("web");
-    // Require the full bundle before touching any live file. A signed but
-    // mis-packaged release that dropped, say, `web/` must not be allowed to
-    // install a half-new mixture (new server, stale frontend).
-    if !new_server.is_file() || !new_mcp.is_file() || !new_web.is_dir() {
+    if !new_server.is_file() || !new_mcp.is_file() {
         return Err(AppCommandError::new(
             crate::app_error::AppErrorCode::TaskExecutionFailed,
-            "Downloaded update is incomplete (expected codeg-server, codeg-mcp and a web/ directory)",
+            "Downloaded update is incomplete (expected codeg-server and codeg-mcp)",
         ));
     }
 
     // 4. Swap, web → mcp → server (server last: it is the one the restart
     //    relaunches). Roll back already-swapped artifacts on any failure.
     on_progress(UpdatePhase::Swapping, 0, None);
-    if new_web.is_dir() {
-        replace_dir(&targets.web_dir, &new_web)?;
+    // Both sides must exist: an install that serves a static bundle, and a
+    // release that carries a replacement for it.
+    if let (Some(web_dir), true) = (targets.web_dir.as_deref(), new_web.is_dir()) {
+        replace_dir(web_dir, &new_web)?;
     }
     if new_mcp.exists() {
         if let Err(e) = replace_file(&targets.mcp_bin, &new_mcp) {
-            let _ = restore_dir_from_bak(&targets.web_dir);
+            let _ = restore_web_from_bak(&targets);
             return Err(e);
         }
     }
     if let Err(e) = replace_file(&targets.server_bin, &new_server) {
         let _ = restore_from_bak(&targets.mcp_bin);
-        let _ = restore_dir_from_bak(&targets.web_dir);
+        let _ = restore_web_from_bak(&targets);
         return Err(e);
     }
 
@@ -354,7 +358,7 @@ pub async fn perform_update(
         let _ = take_upgrade_staged();
         let _ = restore_from_bak(&targets.server_bin);
         let _ = restore_from_bak(&targets.mcp_bin);
-        let _ = restore_dir_from_bak(&targets.web_dir);
+        let _ = restore_web_from_bak(&targets);
         return Err(e);
     }
 
@@ -370,7 +374,7 @@ pub fn rollback() -> Result<(), AppCommandError> {
     let mut restored = false;
     restored |= restore_from_bak(&targets.server_bin)?;
     restored |= restore_from_bak(&targets.mcp_bin)?;
-    restored |= restore_dir_from_bak(&targets.web_dir)?;
+    restored |= restore_web_from_bak(&targets);
     if !restored {
         return Err(AppCommandError::not_found(
             "No previous version is available to roll back to",
@@ -888,6 +892,16 @@ fn restore_from_bak(target: &Path) -> Result<bool, AppCommandError> {
     let _ = std::fs::remove_file(target);
     std::fs::rename(&bak, target).map_err(AppCommandError::io)?;
     Ok(true)
+}
+
+/// Undo the `web/` swap on installs that have such a target; a no-op on the
+/// ones that do not (this fork's default). Best-effort, like its file sibling.
+fn restore_web_from_bak(targets: &Targets) -> bool {
+    targets
+        .web_dir
+        .as_deref()
+        .and_then(|dir| restore_dir_from_bak(dir).ok())
+        .unwrap_or(false)
 }
 
 fn restore_dir_from_bak(target: &Path) -> Result<bool, AppCommandError> {

@@ -255,14 +255,7 @@ foreach ($name in $ManagedBins) {
 # against the post-install Get-Command result.
 $DestBinReal = Get-CanonicalPath $DestBin
 
-# Install web assets
-$WebSrc = Join-Path $TmpDir $Artifact "web"
-$WebDir = Join-Path $InstallDir "web"
-if (Test-Path $WebSrc) {
-    Write-Host "Installing web assets to $WebDir..."
-    if (Test-Path $WebDir) { Remove-Item $WebDir -Recurse -Force }
-    Copy-Item $WebSrc -Destination $WebDir -Recurse
-}
+# No web assets: this fork ships no frontend, so the tarball is the two binaries.
 
 # ── Add to PATH ──
 
@@ -307,7 +300,7 @@ if ($WasRunning) {
     Write-Host ""
     Write-Host "Note: codeg-server was stopped for the upgrade."
     Write-Host "Please restart it manually to ensure your environment variables (CODEG_PORT, CODEG_TOKEN, etc.) are preserved:"
-    Write-Host "  `$env:CODEG_STATIC_DIR=`"$WebDir`"; codeg-server"
+    Write-Host "  codeg-server"
 }
 
 # ── Done ──
@@ -359,9 +352,9 @@ if (-not $ActiveBinAfter) {
 
 Write-Host ""
 Write-Host "Quick start:"
-Write-Host "  `$env:CODEG_STATIC_DIR=`"$WebDir`"; codeg-server"
+Write-Host "  codeg-server"
 Write-Host ""
 Write-Host "Or with custom settings:"
-Write-Host "  `$env:CODEG_PORT=`"3080`"; `$env:CODEG_TOKEN=`"your-secret`"; `$env:CODEG_STATIC_DIR=`"$WebDir`"; codeg-server"
+Write-Host "  `$env:CODEG_PORT=`"3080`"; `$env:CODEG_TOKEN=`"your-secret`"; codeg-server"
 
 exit $ExitStatus

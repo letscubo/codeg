@@ -27,9 +27,7 @@ COPY dist/${TARGETARCH}/codeg-server /usr/local/bin/codeg-server
 # (see acp/delegation/companion.rs). It must ship next to codeg-server so
 # `locate_codeg_mcp_binary()` finds it via the exe-sibling lookup.
 COPY dist/${TARGETARCH}/codeg-mcp /usr/local/bin/codeg-mcp
-COPY dist/web /app/web
 
-ENV CODEG_STATIC_DIR=/app/web
 ENV CODEG_DATA_DIR=/data
 ENV CODEG_PORT=3080
 ENV CODEG_HOST=0.0.0.0
