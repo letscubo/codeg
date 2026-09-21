@@ -10,9 +10,9 @@ set -euo pipefail
 
 REPO="letscubo/codeg"
 INSTALL_DIR="${CODEG_INSTALL_DIR:-/usr/local/bin}"
-# No web assets: this fork ships no frontend, so a release tarball is the two
-# binaries and there is nothing to place under /usr/local/share. CODEG_WEB_DIR
-# and CODEG_STATIC_DIR are accordingly gone from this installer.
+# No web assets: this fork ships no frontend. The tarball's web/ is only a blank
+# placeholder kept for older self-updaters, so this installer leaves it alone;
+# CODEG_WEB_DIR and CODEG_STATIC_DIR are accordingly gone from it.
 VERSION=""
 # Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
 # default so the user's `codeg-server` command always runs the freshly

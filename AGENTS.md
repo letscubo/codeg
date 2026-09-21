@@ -20,7 +20,8 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 codeg 自带的工作台。因此：
 
 - 不要新增 / 恢复任何 `.ts` / `.tsx` 界面代码，也不要给后端改动"配套改前端"
-- release 包里不含 `web/` 目录，容器不设 `CODEG_STATIC_DIR`，服务端对非 API 路径一律 404
+- release 包里的 `web/` 只有占位页：旧版（< v0.30.10-10）自更新器硬性要求包里有 `web/`，
+  删掉它存量实例就升不上来。容器不设 `CODEG_STATIC_DIR`，服务端对非 API 路径一律 404
 - `out/index.html` 是**占位文件**，只为让 tauri-build 校验 `frontendDist` 通过；它不是界面
 - 合上游时 `src/` / `public/` 下的冲突一律按"删除"解决：
   `git diff --name-only --diff-filter=U | grep -E '^(src|public)/' | xargs -r git rm -q`

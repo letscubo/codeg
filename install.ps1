@@ -255,7 +255,7 @@ foreach ($name in $ManagedBins) {
 # against the post-install Get-Command result.
 $DestBinReal = Get-CanonicalPath $DestBin
 
-# No web assets: this fork ships no frontend, so the tarball is the two binaries.
+# No web assets: this fork ships no frontend; the zip's web/ is only a placeholder for older self-updaters.
 
 # ── Add to PATH ──
 

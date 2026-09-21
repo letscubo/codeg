@@ -226,6 +226,13 @@ jobs:
           cp src-tauri/target/${{ matrix.target }}/release/codeg-server dist/${{ matrix.artifact }}/
           cp src-tauri/target/${{ matrix.target }}/release/codeg-mcp dist/${{ matrix.artifact }}/
           chmod +x dist/${{ matrix.artifact }}/codeg-server dist/${{ matrix.artifact }}/codeg-mcp
+          # Compatibility shim, not a frontend. Updaters older than v0.30.10-10
+          # refuse any bundle without a `web/` directory ("Downloaded update is
+          # incomplete"), and every running instance is on one of those until it
+          # installs this release — so the bundle keeps a `web/`, holding only the
+          # blank placeholder from `out/`. Newer updaters swap it in solely when
+          # CODEG_STATIC_DIR names a target, and ignore it otherwise.
+          cp -r out dist/${{ matrix.artifact }}/web
           cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
       - name: Package (Windows)
@@ -235,6 +242,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-server.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
+          # Compatibility shim, not a frontend. Updaters older than v0.30.10-10
+          # refuse any bundle without a `web/` directory ("Downloaded update is
+          # incomplete"), and every running instance is on one of those until it
+          # installs this release — so the bundle keeps a `web/`, holding only the
+          # blank placeholder from `out/`. Newer updaters swap it in solely when
+          # CODEG_STATIC_DIR names a target, and ignore it otherwise.
+          Copy-Item -Recurse out dist/${{ matrix.artifact }}/web
           Compress-Archive -Path dist/${{ matrix.artifact }} -DestinationPath dist/${{ matrix.artifact }}.zip
 
       - name: Smoke test packaged artifact (Unix)

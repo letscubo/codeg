@@ -4,8 +4,9 @@
   has its own interface and only ever calls codeg's HTTP API. Tauri's build
   script validates `frontendDist` (../out) and the bundled `../out` resource
   while the desktop shell is compiled, so the path has to exist. Nothing serves
-  this file: the container sets no CODEG_STATIC_DIR, and a release bundle
-  carries no web/ directory.
+  this file: the container sets no CODEG_STATIC_DIR. It is also packaged as a
+  release's web/ directory, only because updaters older than v0.30.10-10
+  refuse a bundle without one.
 -->
 <html lang="en">
   <head>

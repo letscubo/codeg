@@ -99,8 +99,9 @@ fn resolve_targets() -> Result<Targets, AppCommandError> {
     let mcp_bin = bindir.join(mcp_bin_filename());
 
     // Resolve the `web/` *update target* — distinct from "where to serve static
-    // files from right now". This fork ships no frontend, so a release carries
-    // no `web/` and there is normally nothing to swap: the target is `None`.
+    // files from right now". This fork ships no frontend: a release's `web/` is
+    // only a blank placeholder kept for older updaters (see release.yml), so there
+    // is normally nothing worth swapping and the target is `None`.
     // An install that does serve a static bundle names it with CODEG_STATIC_DIR
     // (the Docker image sets /app/web); target that path even if it is
     // momentarily absent (e.g. a prior web swap was interrupted mid-rename).
@@ -314,10 +315,11 @@ pub async fn perform_update(
     let bundle_root = find_bundle_root(&staging, asset)?;
     let new_server = bundle_root.join(server_bin_filename());
     let new_mcp = bundle_root.join(mcp_bin_filename());
-    // A release of this fork is the two binaries — the frontend was removed, so
-    // no `web/` is packaged and its absence is not a defect. Both binaries are
-    // still required before touching any live file: a signed but mis-packaged
-    // release that dropped one must not install a half-new mixture.
+    // The two binaries are the release; `web/` is optional — this fork has no
+    // frontend and ships only a placeholder there for older updaters, so its
+    // absence is not a defect. Both binaries are still required before touching
+    // any live file: a signed but mis-packaged release that dropped one must not
+    // install a half-new mixture.
     let new_web = bundle_root.join("web");
     if !new_server.is_file() || !new_mcp.is_file() {
         return Err(AppCommandError::new(

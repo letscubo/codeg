@@ -3,7 +3,8 @@
 > **letscubo fork — 无前端。** 本仓库是 [xintaofei/codeg](https://github.com/xintaofei/codeg)
 > 的 fork，供 MyClaw 平台作为容器内的多 agent runtime 使用。上游的 Next.js 界面
 > （`src/`、`public/`）**已删除**：平台有自己的界面，只调用 `/api/*` 与 `/ws`。
-> release 只包含 `codeg-server` 与 `codeg-mcp` 两个二进制，不含 `web/`。
+> release 的实质内容是 `codeg-server` 与 `codeg-mcp` 两个二进制；包里的 `web/` 只是空白占位，
+> 为了让旧版自更新器能通过校验。
 > 下面的截图与桌面端说明来自上游，对本 fork 不适用。
 
 [![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
