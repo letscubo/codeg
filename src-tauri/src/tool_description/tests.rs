@@ -85,3 +85,71 @@ fn unknown_command_falls_back_to_cleaned_text() {
         Some("officecli save a.pptx".to_string())
     );
 }
+
+// ── openclaw ─────────────────────────────────────────────────────────────
+// 输入取自 A5 实录(acp-transcripts/openclaw-acp):ACP 标题是「工具名: 参数: 值, …」平铺。
+
+#[test]
+fn openclaw_exec_uses_the_title_the_model_wrote() {
+    let input = json!({ "command": "sleep 20 && echo 1", "title": "等待 20 秒后打印 1", "background": true });
+    let acp_title = "exec: command: sleep 20 && echo 1, title: 等待 20 秒后打印 1, background: true";
+    assert_eq!(
+        describe_tool_call(acp_title, Some("execute"), Some(&input)),
+        Some("等待 20 秒后打印 1".to_string())
+    );
+    // 历史记录路径:kind 为 None,结果一致
+    assert_eq!(
+        describe_tool_call("exec", None, Some(&input)),
+        Some("等待 20 秒后打印 1".to_string())
+    );
+}
+
+#[test]
+fn a_title_without_a_command_is_not_a_description() {
+    // 建页面 / 建 issue 这类工具的 `title` 是内容,不是调用说明
+    let input = json!({ "title": "Q3 roadmap", "parent": "abc" });
+    assert_eq!(describe_tool_call("mcp__app-notion__create_page", None, Some(&input)), None);
+}
+
+#[test]
+fn openclaw_process_actions_are_translated() {
+    let list = json!({ "action": "list" });
+    assert_eq!(
+        describe_tool_call("process: action: list", None, Some(&list)),
+        Some("List background processes".to_string())
+    );
+    let log = json!({ "action": "log", "sessionId": "gentle-zephyr" });
+    assert_eq!(
+        describe_tool_call("process: action: log, sessionId: gentle-zephyr", None, Some(&log)),
+        Some("Read output of gentle-zephyr".to_string())
+    );
+    // 历史里工具名可能只剩 `process`
+    assert_eq!(
+        describe_tool_call("process", None, Some(&log)),
+        Some("Read output of gentle-zephyr".to_string())
+    );
+    let kill = json!({ "action": "kill", "sessionId": "gentle-zephyr" });
+    assert_eq!(
+        describe_tool_call("process", None, Some(&kill)),
+        Some("Stop gentle-zephyr".to_string())
+    );
+    // 缺 sessionId 也有一句能读的
+    assert_eq!(
+        describe_tool_call("process", None, Some(&json!({ "action": "poll" }))),
+        Some("Check a background process".to_string())
+    );
+}
+
+#[test]
+fn openclaw_process_does_not_guess() {
+    // 不认识的 action → 不猜,调用方照旧显示原文
+    assert_eq!(
+        describe_tool_call("process: action: rewind", None, Some(&json!({ "action": "rewind" }))),
+        None
+    );
+    // 别的工具碰巧有 `action` 参数,不当成 process
+    assert_eq!(
+        describe_tool_call("browser: action: list", None, Some(&json!({ "action": "list" }))),
+        None
+    );
+}

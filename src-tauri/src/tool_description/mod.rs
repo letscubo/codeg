@@ -6,7 +6,10 @@
 //!
 //! ## 取值顺序
 //! 1. 工具参数里自带的 `description` —— DeepSeek dsh、Claude Code、opencode 的 bash 工具都要求
-//!    模型填一句「主动语态、5–10 个词」的说明,直接用它,这是最贴合意图的;
+//!    模型填一句「主动语态、5–10 个词」的说明,直接用它,这是最贴合意图的;openclaw 的 exec
+//!    把同一句话放在 `title` 里(见 [`command_title`]);
+//! 1'. openclaw 的 `process`(管后台进程)没有说明也没有命令,按 `action` 翻成短句(见
+//!    [`describe_openclaw_process`]);
 //! 2. 没有就解析命令:`parse_command`(vendor/codex-shell-command,搬自 codex)归类成 读文件 / 列目录 / 搜索,
 //!    生成 `Read foo.txt`、`Search "todo" in src`、`List src` 这类短句;
 //! 3. 归不了类 → 返回 None,调用方照旧显示命令原文(与 codex 的兜底一致,不猜)。
@@ -37,6 +40,50 @@ fn model_written(raw_input: Option<&serde_json::Value>) -> Option<String> {
         }
     }
     None
+}
+
+/// openclaw exec 的说明:它把模型写的那句话放在 `title` 里,而不是 `description`。
+///
+/// 只在参数里**同时有 `command`** 时才认 —— `title` 是个常见参数名(建页面、建 issue 的
+/// MCP 工具都有),历史记录里 kind 一律是 None,不加这道闸会把「页面标题」当成调用说明。
+fn command_title(raw_input: Option<&serde_json::Value>) -> Option<String> {
+    let obj = raw_input?.as_object()?;
+    obj.get("command")?.as_str()?;
+    let text = obj.get("title")?.as_str()?;
+    (!text.trim().is_empty()).then(|| clip(text))
+}
+
+/// openclaw 的 `process` 工具(后台进程的 list / poll / log / kill …)。
+///
+/// 它的 ACP 标题是把工具名和参数平铺成一行(`process: action: log, sessionId: gentle-zephyr`),
+/// 参数里没有说明也没有命令,不译就只能原样显示。工具名取标题冒号前那段:实时是整行标题,
+/// 历史里可能只剩 `process`,两种都认。action 不认识就返回 None,照旧显示原文,不猜。
+fn describe_openclaw_process(title: &str, raw_input: Option<&serde_json::Value>) -> Option<String> {
+    if title.split(':').next()?.trim() != "process" {
+        return None;
+    }
+    let obj = raw_input?.as_object()?;
+    let action = obj.get("action")?.as_str()?.trim();
+    let session = obj
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let on = |verb: &str, fallback: &str| match session {
+        Some(id) => format!("{verb} {id}"),
+        None => fallback.to_string(),
+    };
+    let text = match action {
+        "list" => "List background processes".to_string(),
+        "poll" => on("Check", "Check a background process"),
+        "log" => on("Read output of", "Read process output"),
+        "write" | "submit" | "paste" | "send-keys" => on("Send input to", "Send input to a process"),
+        "kill" => on("Stop", "Stop a background process"),
+        "clear" => on("Clear output of", "Clear process output"),
+        "remove" => on("Remove", "Remove a background process"),
+        _ => return None,
+    };
+    Some(clip(&text))
 }
 
 /// 参数里的 `cwd` / `workdir`(不同实现叫法不同)。
@@ -188,7 +235,10 @@ pub fn describe_tool_call(
     kind: Option<&str>,
     raw_input: Option<&serde_json::Value>,
 ) -> Option<String> {
-    if let Some(text) = model_written(raw_input) {
+    if let Some(text) = model_written(raw_input).or_else(|| command_title(raw_input)) {
+        return Some(text);
+    }
+    if let Some(text) = describe_openclaw_process(title, raw_input) {
         return Some(text);
     }
     // 只对命令类做解析;读写文件、MCP 调用等由各自的 title 表达,已经够清楚
