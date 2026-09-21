@@ -1,7 +1,7 @@
 {
   "name": "codeg",
   "private": true,
-  "version": "0.30.10-13",
+  "version": "0.30.10-14",
   "packageManager": "pnpm@11.9.0",
   "comment": "This fork ships no frontend — the Next.js app under src/ was removed (the platform has its own UI and only ever calls codeg's HTTP API). Node is kept for exactly two jobs: the Tauri CLI, which release.yml uses to minisign the server bundle, and the sidecar staging script.",
   "scripts": {
