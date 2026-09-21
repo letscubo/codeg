@@ -19,7 +19,10 @@
 //! ## 节奏(2026-09-21 实测,A1-HM 托管 bot)
 //! - 草稿每秒 1 次连续 90 秒不限流;每秒 1.5 次会 429 → 两次草稿至少间隔 1 秒。
 //!   来字就推、推送在路上时新字攒着(本 worker 串行发请求,天然单飞),不设固定计时器
-//! - 草稿约 30 秒自动消失;没有新字时每 20 秒重发一次续上
+//! - 草稿没有更新约 **10 秒**就消失(文档说 30 秒;2026-09-22 在 Telegram Web 里挂 DOM 监听实测,
+//!   两次都是最后一次更新后 ~10 秒消失)。消失后再发同 id 的草稿,客户端当新草稿重建并把整段
+//!   文字重新「打字」一遍 —— 正文写完、这一轮迟迟不结束时就会反复「消失 → 重打 → 消失」。
+//!   所以没有新字时每 5 秒重发一次续上,赶在过期前
 //!
 //! ## 和平台的分工
 //! - 平台照旧靠 `turn_complete` webhook 同步历史。本模块在该 webhook 里写上
@@ -52,8 +55,8 @@ use super::tg_html;
 
 /// 两次草稿最小间隔(实测 1/s 稳定,1.5/s 触发 429)。
 const MIN_DRAFT_INTERVAL: Duration = Duration::from_secs(1);
-/// 没有新字时续草稿的间隔(草稿约 30 秒消失)。
-const DRAFT_HEARTBEAT: Duration = Duration::from_secs(20);
+/// 没有新字时续草稿的间隔。草稿不更新约 10 秒就消失(见文件头),取一半留余量。
+const DRAFT_HEARTBEAT: Duration = Duration::from_secs(5);
 /// 一轮最长跟多久;超过按失败收尾,防止连接异常没有结束事件时 worker 常驻。
 const MAX_TURN: Duration = Duration::from_secs(3 * 60 * 60);
 /// 认领记录保留多久(给 event_subscriber 取;正常在 turn_complete 时就取走了)。
@@ -1125,8 +1128,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(drafts(&api), vec![RelayTexts::default().thinking, "abcd".to_string()]);
-        // 没有新字:20 秒后续一次同样的草稿
-        tokio::time::sleep(Duration::from_secs(21)).await;
+        // 没有新字:5 秒后续一次同样的草稿(草稿 ~10 秒过期)
+        tokio::time::sleep(Duration::from_secs(6)).await;
         assert_eq!(drafts(&api).last().unwrap(), "abcd");
         assert_eq!(drafts(&api).len(), 3);
         tx.send(complete("end_turn")).unwrap();
