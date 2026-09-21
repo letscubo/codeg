@@ -60,7 +60,10 @@ impl Harness {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut runtime_env = BTreeMap::new();
         runtime_env.insert("FAKE_DIR".to_string(), dir.display().to_string());
-        runtime_env.insert("CODEX_HOME".to_string(), dir.join("codex-home").display().to_string());
+        runtime_env.insert(
+            "CODEX_HOME".to_string(),
+            dir.join("codex-home").display().to_string(),
+        );
         let manager = ConnectionManager::new();
         let conn = manager
             .create_or_reuse_cli_connection(
@@ -79,7 +82,10 @@ impl Harness {
             .await
             .unwrap();
         if session_id.is_none() {
-            assert_eq!(conn.session_id, None, "codex mints the thread id on the first turn");
+            assert_eq!(
+                conn.session_id, None,
+                "codex mints the thread id on the first turn"
+            );
         }
         Self {
             _tmp: tmp,
@@ -144,13 +150,28 @@ fn happy_turn(text: &str) -> Vec<Value> {
     let t = |method: &str, params: Value| json!({ "method": method, "params": params });
     let mut lines = vec![
         json!({"id":3,"result":{"turn":{"id":"T1","status":"inProgress"}}}),
-        t("turn/started", json!({"threadId":THREAD_ID,"turn":{"id":"T1"}})),
-        t("item/started", json!({"turnId":"T1","item":{"type":"commandExecution","id":"c1","command":"/bin/bash -lc 'ls'","commandActions":[{"command":"ls"}],"cwd":"/ws","status":"inProgress"}})),
-        t("item/completed", json!({"turnId":"T1","item":{"type":"commandExecution","id":"c1","command":"/bin/bash -lc 'ls'","commandActions":[{"command":"ls"}],"cwd":"/ws","status":"completed","aggregatedOutput":"a\n","exitCode":0}})),
-        t("item/started", json!({"turnId":"T1","item":{"type":"agentMessage","id":"m1","text":""}})),
+        t(
+            "turn/started",
+            json!({"threadId":THREAD_ID,"turn":{"id":"T1"}}),
+        ),
+        t(
+            "item/started",
+            json!({"turnId":"T1","item":{"type":"commandExecution","id":"c1","command":"/bin/bash -lc 'ls'","commandActions":[{"command":"ls"}],"cwd":"/ws","status":"inProgress"}}),
+        ),
+        t(
+            "item/completed",
+            json!({"turnId":"T1","item":{"type":"commandExecution","id":"c1","command":"/bin/bash -lc 'ls'","commandActions":[{"command":"ls"}],"cwd":"/ws","status":"completed","aggregatedOutput":"a\n","exitCode":0}}),
+        ),
+        t(
+            "item/started",
+            json!({"turnId":"T1","item":{"type":"agentMessage","id":"m1","text":""}}),
+        ),
     ];
     for chunk in text.chars().collect::<Vec<_>>().chunks(2) {
-        lines.push(t("item/agentMessage/delta", json!({"turnId":"T1","itemId":"m1","delta":chunk.iter().collect::<String>()})));
+        lines.push(t(
+            "item/agentMessage/delta",
+            json!({"turnId":"T1","itemId":"m1","delta":chunk.iter().collect::<String>()}),
+        ));
     }
     lines.extend([
         t("item/completed", json!({"turnId":"T1","item":{"type":"agentMessage","id":"m1","text":text}})),
@@ -200,15 +221,24 @@ async fn first_turn_starts_a_thread_streams_and_binds_the_thread_id() {
 
     // Protocol order and parameters.
     let requests = h.requests();
-    let methods: Vec<&str> = requests.iter().filter_map(|r| r["method"].as_str()).collect();
-    assert_eq!(methods, vec!["initialize", "initialized", "thread/start", "turn/start"]);
+    let methods: Vec<&str> = requests
+        .iter()
+        .filter_map(|r| r["method"].as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        vec!["initialize", "initialized", "thread/start", "turn/start"]
+    );
     let start = &requests[2]["params"];
     assert_eq!(start["approvalPolicy"], "never");
     assert_eq!(start["sandbox"], "danger-full-access");
     assert_eq!(start["model"], "gpt-5.4-mini");
     let turn = &requests[3]["params"];
     assert_eq!(turn["threadId"], THREAD_ID);
-    assert_eq!(turn["input"][0], json!({"type":"text","text":"hello","text_elements":[]}));
+    assert_eq!(
+        turn["input"][0],
+        json!({"type":"text","text":"hello","text_elements":[]})
+    );
     assert_eq!(h.args(), vec!["app-server".to_string()]);
 
     let kinds = types(&events);
@@ -234,7 +264,10 @@ async fn first_turn_starts_a_thread_streams_and_binds_the_thread_id() {
     assert_eq!(kinds[0], EntryKind::Prompt);
     assert!(kinds.contains(&EntryKind::Update));
     assert_eq!(*kinds.last().unwrap(), EntryKind::TurnEnd);
-    assert_eq!(transcript.entries.last().unwrap().p["model"], "gpt-5.4-mini");
+    assert_eq!(
+        transcript.entries.last().unwrap().p["model"],
+        "gpt-5.4-mini"
+    );
 }
 
 #[tokio::test]
@@ -260,12 +293,17 @@ async fn continued_session_resumes_the_thread() {
 async fn resume_failure_is_surfaced_before_turn_complete() {
     let _guard = SERIAL.lock().await;
     let h = Harness::new(Some(THREAD_ID)).await;
-    h.thread(json!({"id":2,"error":{"code":-32600,"message":"thread not found: no rollout for id"}}));
+    h.thread(
+        json!({"id":2,"error":{"code":-32600,"message":"thread not found: no rollout for id"}}),
+    );
     h.turn(&[]);
     let mut rx = h.subscribe().await;
     h.prompt("hi").await;
     let events = collect_until(&mut rx, |e| e["type"] == "turn_complete").await;
-    let error = events.iter().find(|e| e["type"] == "error").expect("error event");
+    let error = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("error event");
     assert_eq!(error["code"], "cli_resume_failed");
     assert_eq!(events.last().unwrap()["stop_reason"], "unknown");
 }
@@ -283,9 +321,15 @@ async fn failed_turn_reports_the_upstream_message() {
     let mut rx = h.subscribe().await;
     h.prompt("hi").await;
     let events = collect_until(&mut rx, |e| e["type"] == "turn_complete").await;
-    let error = events.iter().find(|e| e["type"] == "error").expect("error event");
+    let error = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("error event");
     assert_eq!(error["code"], "cli_api_error");
-    assert_eq!(error["message"], "The encrypted content could not be verified.");
+    assert_eq!(
+        error["message"],
+        "The encrypted content could not be verified."
+    );
 }
 
 #[tokio::test]
@@ -313,7 +357,10 @@ async fn cancel_interrupts_the_running_turn() {
         .into_iter()
         .find(|r| r["method"] == "turn/interrupt")
         .expect("turn/interrupt sent");
-    assert_eq!(interrupt["params"], json!({"threadId": THREAD_ID, "turnId": "T1"}));
+    assert_eq!(
+        interrupt["params"],
+        json!({"threadId": THREAD_ID, "turnId": "T1"})
+    );
 }
 
 impl Harness {

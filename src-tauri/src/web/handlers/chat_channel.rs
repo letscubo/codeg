@@ -318,7 +318,9 @@ pub async fn inject_chat_channel_message(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<InjectChatChannelMessageParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    use crate::chat_channel::types::{ChannelMessageTarget, ChannelSessionDefaults, IncomingCommand, RichMessage, TelegramConfig};
+    use crate::chat_channel::types::{
+        ChannelMessageTarget, ChannelSessionDefaults, IncomingCommand, RichMessage, TelegramConfig,
+    };
     use crate::db::service::{
         chat_channel_service, sender_context_service, thread_binding_service,
     };
@@ -369,7 +371,9 @@ pub async fn inject_chat_channel_message(
     if route.is_none() {
         // 会话不是任何渠道聊天的"当前会话"(用户在网页上打开了一条历史渠道
         // 会话)。单发送者实例的合理语义:视为在渠道里 /tasks 切换到它。
-        let ctxs = sender_context_service::list_all(db).await.unwrap_or_default();
+        let ctxs = sender_context_service::list_all(db)
+            .await
+            .unwrap_or_default();
         let mut candidates: Vec<_> = ctxs
             .into_iter()
             .filter(|c| c.current_conversation_id.is_some() || c.current_folder_id.is_some())
@@ -436,8 +440,8 @@ pub async fn inject_chat_channel_message(
         match chat_channel_service::get_by_id(db, channel_id).await {
             Ok(Some(row)) => serde_json::from_str::<TelegramConfig>(&row.config_json)
                 .ok()
-                .and_then(|cfg| {
-                    match (cfg.default_folder_path, cfg.default_agent_type) {
+                .and_then(
+                    |cfg| match (cfg.default_folder_path, cfg.default_agent_type) {
                         (Some(f), Some(a)) if !f.trim().is_empty() && !a.trim().is_empty() => {
                             Some(ChannelSessionDefaults {
                                 folder_path: f,
@@ -445,8 +449,8 @@ pub async fn inject_chat_channel_message(
                             })
                         }
                         _ => None,
-                    }
-                }),
+                    },
+                ),
             _ => None,
         };
 

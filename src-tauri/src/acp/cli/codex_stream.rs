@@ -197,7 +197,14 @@ impl CodexStreamMapper {
                     description: None,
                     tool_call_id: id.to_string(),
                     title: None,
-                    status: Some(if tool_failed(item) { "failed" } else { "completed" }.to_string()),
+                    status: Some(
+                        if tool_failed(item) {
+                            "failed"
+                        } else {
+                            "completed"
+                        }
+                        .to_string(),
+                    ),
                     content: None,
                     raw_input: None,
                     // Same convention as the claude / dsh mappers: serialized JSON.
@@ -215,7 +222,8 @@ impl CodexStreamMapper {
 
     fn on_usage(&mut self, usage: &Value) {
         let last = &usage["last"];
-        let (Some(input), Some(output)) = (last["inputTokens"].as_u64(), last["outputTokens"].as_u64())
+        let (Some(input), Some(output)) =
+            (last["inputTokens"].as_u64(), last["outputTokens"].as_u64())
         else {
             return;
         };
@@ -266,7 +274,9 @@ impl CodexStreamMapper {
             other => {
                 let message = error_message(&turn["error"])
                     .or_else(|| self.last_error.take())
-                    .unwrap_or_else(|| format!("Codex turn ended with {}", other.unwrap_or("no status")));
+                    .unwrap_or_else(|| {
+                        format!("Codex turn ended with {}", other.unwrap_or("no status"))
+                    });
                 let auth = is_auth_error(&message);
                 TurnFinish {
                     stop_reason: if auth { "auth_required" } else { STOP_UNKNOWN }.to_string(),
@@ -330,7 +340,9 @@ fn tool_input(item: &Value) -> Value {
 /// What the card shows as the call's result.
 fn tool_output(item: &Value) -> Value {
     match item["type"].as_str().unwrap_or("") {
-        "commandExecution" => Value::String(item["aggregatedOutput"].as_str().unwrap_or("").to_string()),
+        "commandExecution" => {
+            Value::String(item["aggregatedOutput"].as_str().unwrap_or("").to_string())
+        }
         "fileChange" => Value::String(
             item["changes"]
                 .as_array()
@@ -354,7 +366,8 @@ fn tool_output(item: &Value) -> Value {
             let content = &item["result"]["content"];
             match content.as_array() {
                 Some(blocks) => {
-                    let text: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+                    let text: Vec<&str> =
+                        blocks.iter().filter_map(|b| b["text"].as_str()).collect();
                     if text.is_empty() {
                         content.clone()
                     } else {
@@ -409,7 +422,11 @@ pub fn codex_tool_info(item: &Value, cwd: Option<&Path>) -> ToolInfo {
             info(&title, "edit", locations)
         }
         "mcpToolCall" => info(
-            &format!("{}: {}", s("server").unwrap_or("mcp"), s("tool").unwrap_or("tool")),
+            &format!(
+                "{}: {}",
+                s("server").unwrap_or("mcp"),
+                s("tool").unwrap_or("tool")
+            ),
             "other",
             None,
         ),
@@ -493,7 +510,10 @@ mod tests {
     const FIXTURE: &str = include_str!("../../../resources/test-fixtures/codex/turn.jsonl");
 
     fn mapper() -> CodexStreamMapper {
-        CodexStreamMapper::new(Some(PathBuf::from("/tmp/codex-probe/work")), Some("gpt-5.4-mini".into()))
+        CodexStreamMapper::new(
+            Some(PathBuf::from("/tmp/codex-probe/work")),
+            Some("gpt-5.4-mini".into()),
+        )
     }
 
     /// Replay the recorded turn: every server notification through the mapper.
@@ -501,7 +521,9 @@ mod tests {
         let mut m = mapper();
         let mut events = Vec::new();
         for line in FIXTURE.lines() {
-            let Some(json) = line.strip_prefix("<< ") else { continue };
+            let Some(json) = line.strip_prefix("<< ") else {
+                continue;
+            };
             let msg: Value = serde_json::from_str(json).unwrap();
             if msg.get("method").is_none() || msg.get("id").is_some() {
                 continue;
@@ -524,8 +546,14 @@ mod tests {
         assert_eq!(finish.stop_reason, STOP_END_TURN);
         assert!(finish.error.is_none());
 
-        let deltas = events.iter().filter(|e| matches!(e, AcpEvent::ContentDelta { .. })).count();
-        assert!(deltas > 10, "text should arrive as many small deltas, got {deltas}");
+        let deltas = events
+            .iter()
+            .filter(|e| matches!(e, AcpEvent::ContentDelta { .. }))
+            .count();
+        assert!(
+            deltas > 10,
+            "text should arrive as many small deltas, got {deltas}"
+        );
 
         let calls: Vec<(&str, &str)> = events
             .iter()
@@ -534,7 +562,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(calls, vec![("ls -1 /etc", "execute"), ("Edit note.txt", "edit")]);
+        assert_eq!(
+            calls,
+            vec![("ls -1 /etc", "execute"), ("Edit note.txt", "edit")]
+        );
 
         let updates: Vec<&str> = events
             .iter()
@@ -545,7 +576,9 @@ mod tests {
             .collect();
         assert_eq!(updates, vec!["completed", "completed"]);
 
-        assert!(events.iter().any(|e| matches!(e, AcpEvent::UsageUpdate { size, .. } if *size > 0)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AcpEvent::UsageUpdate { size, .. } if *size > 0)));
     }
 
     #[test]
@@ -567,9 +600,14 @@ mod tests {
         m.map_notification(&json!({"method":"error","params":{"error":{"message":"{\"error\":{\"message\":\"The encrypted content could not be verified.\"}}"},"willRetry":false}}));
         let LineOutcome::Finished { finish, .. } = m.map_notification(&json!({
             "method":"turn/completed","params":{"turn":{"id":"t","status":"failed","error":null}}
-        })) else { panic!() };
+        })) else {
+            panic!()
+        };
         assert_eq!(finish.stop_reason, STOP_UNKNOWN);
-        assert_eq!(finish.error.unwrap().message, "The encrypted content could not be verified.");
+        assert_eq!(
+            finish.error.unwrap().message,
+            "The encrypted content could not be verified."
+        );
 
         let mut m = mapper();
         let LineOutcome::Finished { finish, .. } = m.map_notification(&json!({
@@ -594,7 +632,9 @@ mod tests {
         m.set_turn_id("mine");
         let LineOutcome::Events(e) = m.map_notification(&json!({
             "method":"item/agentMessage/delta","params":{"turnId":"other","itemId":"x","delta":"hi"}
-        })) else { panic!() };
+        })) else {
+            panic!()
+        };
         assert!(e.is_empty());
     }
 
@@ -602,12 +642,22 @@ mod tests {
     fn message_without_deltas_is_emitted_on_completion_once() {
         let mut m = mapper();
         let item = json!({"type":"agentMessage","id":"m1","text":"whole"});
-        let LineOutcome::Events(e) = m.map_notification(&json!({"method":"item/completed","params":{"item":item}})) else { panic!() };
+        let LineOutcome::Events(e) =
+            m.map_notification(&json!({"method":"item/completed","params":{"item":item}}))
+        else {
+            panic!()
+        };
         assert!(matches!(&e[..], [AcpEvent::ContentDelta { text, .. }] if text == "whole"));
 
         let mut m = mapper();
-        m.map_notification(&json!({"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"who"}}));
-        let LineOutcome::Events(e) = m.map_notification(&json!({"method":"item/completed","params":{"item":item}})) else { panic!() };
+        m.map_notification(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"who"}}),
+        );
+        let LineOutcome::Events(e) =
+            m.map_notification(&json!({"method":"item/completed","params":{"item":item}}))
+        else {
+            panic!()
+        };
         assert!(e.is_empty());
     }
 
@@ -615,7 +665,10 @@ mod tests {
     fn mcp_tool_call_title_and_failure() {
         let item = json!({"type":"mcpToolCall","id":"c1","server":"app-notion","tool":"notion-fetch",
             "status":"failed","arguments":{"id":"x"},"result":null,"error":{"message":"boom"}});
-        assert_eq!(codex_tool_info(&item, None).title, "app-notion: notion-fetch");
+        assert_eq!(
+            codex_tool_info(&item, None).title,
+            "app-notion: notion-fetch"
+        );
         assert!(tool_failed(&item));
         assert_eq!(tool_output(&item), Value::String("boom".into()));
     }

@@ -402,7 +402,8 @@ async fn process_envelope(
          */
         let mut context = context;
         if let Some(ctx) = context.as_mut() {
-            match automation_service::automation_for_conversation(db_conn, ctx.conversation_id).await
+            match automation_service::automation_for_conversation(db_conn, ctx.conversation_id)
+                .await
             {
                 Ok(Some(auto)) => {
                     ctx.timezone = Some(auto.timezone);

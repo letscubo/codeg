@@ -341,7 +341,10 @@ mod tests {
         );
         assert!(validate_cli_session_id(AgentType::DeepSeek, "session-nope").is_err());
         // codex thread ids (uuid v7) are uuids
-        assert!(validate_cli_session_id(AgentType::Codex, "01a0b54e-568c-7310-aa4d-f777c3663fb7").is_ok());
+        assert!(
+            validate_cli_session_id(AgentType::Codex, "01a0b54e-568c-7310-aa4d-f777c3663fb7")
+                .is_ok()
+        );
         assert!(validate_cli_session_id(AgentType::Codex, "thread-x").is_err());
     }
 

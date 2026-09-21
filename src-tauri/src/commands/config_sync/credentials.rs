@@ -185,7 +185,10 @@ mod tests {
             assert_eq!(load(WEBDAV_PASSWORD), "");
         }
 
-        assert!(read(WEBDAV_PASSWORD).is_ok(), "the guard must restore the store");
+        assert!(
+            read(WEBDAV_PASSWORD).is_ok(),
+            "the guard must restore the store"
+        );
         store(WEBDAV_PASSWORD, "").expect("clean up");
     }
 

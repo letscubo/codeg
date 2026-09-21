@@ -434,8 +434,12 @@ mod tests {
             .open(&victim)
             .expect("open");
         let past = SystemTime::now() - Duration::from_secs(60 * 60);
-        file.set_times(std::fs::FileTimes::new().set_accessed(past).set_modified(past))
-            .expect("backdate");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(past)
+                .set_modified(past),
+        )
+        .expect("backdate");
         drop(file);
 
         let report = reclaim(vec![victim.to_string_lossy().into_owned()]);
@@ -456,8 +460,12 @@ mod tests {
             .open(&bystander)
             .expect("open");
         let past = SystemTime::now() - Duration::from_secs(60 * 60);
-        file.set_times(std::fs::FileTimes::new().set_accessed(past).set_modified(past))
-            .expect("backdate");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(past)
+                .set_modified(past),
+        )
+        .expect("backdate");
         drop(file);
 
         let report = reclaim(vec![bystander.to_string_lossy().into_owned()]);

@@ -366,7 +366,8 @@ async fn migrate_legacy_password(conn: &DatabaseConnection, password: &str) {
     match serde_json::to_string(&value) {
         Ok(serialized) => {
             if let Err(err) =
-                app_metadata_service::upsert_value(conn, CONFIG_SYNC_SETTINGS_KEY, &serialized).await
+                app_metadata_service::upsert_value(conn, CONFIG_SYNC_SETTINGS_KEY, &serialized)
+                    .await
             {
                 // The keyring copy is authoritative from here on, so the stale
                 // plaintext is redundant rather than load-bearing — but it is
@@ -398,10 +399,7 @@ pub async fn save_settings_core(
     // usable keyring at all: a setting that needs no credential no longer
     // fails because a credential could not be reached.
     let new_password = input.password.clone().filter(|value| !value.is_empty());
-    let new_passphrase = input
-        .passphrase
-        .clone()
-        .filter(|value| !value.is_empty());
+    let new_passphrase = input.passphrase.clone().filter(|value| !value.is_empty());
     let keeps_account = same_account(&existing, &input.server_url, &input.username);
 
     let merged = merge_settings(&existing, input)?;
@@ -512,9 +510,7 @@ pub fn merge_settings(
         remote_dir,
         profile,
         auto_sync: input.auto_sync,
-        interval_minutes: input
-            .interval_minutes
-            .clamp(1, MAX_INTERVAL_MINUTES),
+        interval_minutes: input.interval_minutes.clamp(1, MAX_INTERVAL_MINUTES),
     })
 }
 
@@ -561,8 +557,16 @@ pub async fn save_state(conn: &DatabaseConnection, state: &ConfigSyncState) {
 
 /// `{remoteDir}/v1/{profile}` — the directory the two files live in.
 pub fn remote_dir_path(settings: &ConfigSyncSettings) -> Result<String, AppCommandError> {
-    let dir = normalize_segment(Some(settings.remote_dir.clone()), DEFAULT_REMOTE_DIR, DEFAULT_REMOTE_DIR)?;
-    let profile = normalize_segment(Some(settings.profile.clone()), DEFAULT_PROFILE, DEFAULT_PROFILE)?;
+    let dir = normalize_segment(
+        Some(settings.remote_dir.clone()),
+        DEFAULT_REMOTE_DIR,
+        DEFAULT_REMOTE_DIR,
+    )?;
+    let profile = normalize_segment(
+        Some(settings.profile.clone()),
+        DEFAULT_PROFILE,
+        DEFAULT_PROFILE,
+    )?;
     Ok(format!("{dir}/v{PROTOCOL_VERSION}/{profile}"))
 }
 
@@ -1122,7 +1126,10 @@ mod tests {
             .await
             .expect("read row")
             .expect("row exists");
-        assert!(!row.contains("legacy-secret"), "the password must be gone: {row}");
+        assert!(
+            !row.contains("legacy-secret"),
+            "the password must be gone: {row}"
+        );
         assert!(
             row.contains("written by a newer build"),
             "the migration overwrote a field it does not own: {row}"
@@ -1148,7 +1155,9 @@ mod tests {
         credentials::store(SNAPSHOT_PASSPHRASE, "hunter2").expect("seed");
         // Establish the account first, so the save below is not an account
         // change (which deliberately DOES erase the password).
-        save_settings_core(&db.conn, input()).await.expect("seed settings");
+        save_settings_core(&db.conn, input())
+            .await
+            .expect("seed settings");
 
         {
             let _unreadable = credentials::unreadable_store();
@@ -1463,7 +1472,9 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let state = ConfigSyncState {
             last_uploaded_sha256: Some("abc".to_string()),
-            last_uploaded_target: Some("https://dav.example.com/dav\u{0}codeg\u{0}work".to_string()),
+            last_uploaded_target: Some(
+                "https://dav.example.com/dav\u{0}codeg\u{0}work".to_string(),
+            ),
             last_sync_at: Some("2026-01-01T00:00:00Z".to_string()),
             last_error: None,
         };

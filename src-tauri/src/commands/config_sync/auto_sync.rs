@@ -157,11 +157,7 @@ pub async fn run_auto_sync_loop(
     }
 }
 
-fn emit_status(
-    emitter: &EventEmitter,
-    last_sync_at: &Option<String>,
-    last_error: &Option<String>,
-) {
+fn emit_status(emitter: &EventEmitter, last_sync_at: &Option<String>, last_error: &Option<String>) {
     emit_event(
         emitter,
         CONFIG_SYNC_STATUS_EVENT,

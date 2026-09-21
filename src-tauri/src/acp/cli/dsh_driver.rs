@@ -660,7 +660,9 @@ mod tests {
             title: Some("officecli save a.pptx".into()),
             status: Some("in_progress".into()),
             content: None,
-            raw_input: Some("{\"command\":\"officecli save a.pptx\",\"description\":\"保存 PPT\"}".into()),
+            raw_input: Some(
+                "{\"command\":\"officecli save a.pptx\",\"description\":\"保存 PPT\"}".into(),
+            ),
             raw_output: None,
             raw_output_append: None,
             locations: None,
@@ -734,7 +736,11 @@ mod tests {
         })
         .unwrap();
         let v = serde_json::to_value(&update).unwrap();
-        assert!(v.get("_meta").is_none_or(|m| m.get("codeg.toolName").is_none()), "{v}");
+        assert!(
+            v.get("_meta")
+                .is_none_or(|m| m.get("codeg.toolName").is_none()),
+            "{v}"
+        );
     }
 
     /// 只带状态的更新(最常见)不要凭空写出 title / rawInput 字段。
@@ -757,6 +763,9 @@ mod tests {
         .unwrap();
         let v = serde_json::to_value(&update).unwrap();
         assert!(v.get("title").is_none() || v["title"].is_null(), "{v}");
-        assert!(v.get("rawInput").is_none() || v["rawInput"].is_null(), "{v}");
+        assert!(
+            v.get("rawInput").is_none() || v["rawInput"].is_null(),
+            "{v}"
+        );
     }
 }

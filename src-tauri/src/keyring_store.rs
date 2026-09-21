@@ -97,9 +97,7 @@ fn read_tokens_at_checked(
     #[cfg(unix)]
     if path.exists() {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(err) =
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        {
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             // Keep reading (a read-only mount is not made worse), but make the
             // failed hardening observable instead of silently world-readable.
             tracing::warn!(
@@ -109,8 +107,9 @@ fn read_tokens_at_checked(
         }
     }
     match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map_err(|e| format!("token store is not readable JSON: {e}")),
+        Ok(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("token store is not readable JSON: {e}"))
+        }
         // A store that was never written is legitimately empty.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             Ok(std::collections::HashMap::new())
@@ -355,7 +354,11 @@ mod tests {
     #[cfg(unix)]
     fn mode_bits(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     /// A fresh store must be 0600 from its very first byte on disk — there is
@@ -371,12 +374,19 @@ mod tests {
         tokens.insert("github-token:a".to_string(), "secret".to_string());
         write_tokens_at(&path, &tokens).expect("write");
         assert_eq!(mode_bits(&path), 0o600);
-        assert_eq!(read_tokens_at(&path).get("github-token:a").unwrap(), "secret");
+        assert_eq!(
+            read_tokens_at(&path).get("github-token:a").unwrap(),
+            "secret"
+        );
         // No temp residue left behind.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tokens.json.tmp"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".tokens.json.tmp")
+            })
             .collect();
         assert!(leftovers.is_empty(), "temp files must not survive a write");
     }

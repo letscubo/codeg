@@ -146,8 +146,7 @@ async fn handle_acp_envelope(
                 // session was re-minted (codeg#500). Whichever of this
                 // subscriber and the lifecycle one wins the race, the loser
                 // gets `None` and the row is preserved exactly once.
-                let continues =
-                    crate::acp::continued_session_ids(session.agent_type, session_id);
+                let continues = crate::acp::continued_session_ids(session.agent_type, session_id);
                 match conversation_service::bind_external_id(
                     db,
                     session.conversation_id,
@@ -215,7 +214,8 @@ async fn handle_acp_envelope(
 
                         let is_current = match conn_mgr.get_state(connection_id).await {
                             Some(state) => {
-                                state.read().await.external_id.as_deref() == Some(session_id.as_str())
+                                state.read().await.external_id.as_deref()
+                                    == Some(session_id.as_str())
                             }
                             None => false,
                         };
@@ -260,8 +260,7 @@ async fn handle_acp_envelope(
                                 &target,
                                 &RichMessage::error(match lang {
                                     Lang::ZhCn | Lang::ZhTw => {
-                                        "无法启动任务：该智能体会话已归属于另一个对话。"
-                                            .to_string()
+                                        "无法启动任务：该智能体会话已归属于另一个对话。".to_string()
                                     }
                                     _ => "Could not start the task: this agent session \
                                           already belongs to another conversation."
@@ -717,7 +716,9 @@ async fn handle_acp_envelope(
                                  next TurnComplete"
                             );
                         } else {
-                            tracing::error!("[SessionEventSub] failed to send deferred kickoff: {e}");
+                            tracing::error!(
+                                "[SessionEventSub] failed to send deferred kickoff: {e}"
+                            );
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
                             let _ = manager.send_to_target(&target, &msg).await;
                         }
@@ -869,9 +870,7 @@ async fn mirror_targets_for_connection(
     let conv_id = match state_conv {
         Some(id) => Some(id),
         None => {
-            let sid = session_id_hint
-                .map(|s| s.to_string())
-                .or(state_ext);
+            let sid = session_id_hint.map(|s| s.to_string()).or(state_ext);
             match sid {
                 Some(sid) => crate::db::service::conversation_service::get_by_external_id(db, &sid)
                     .await
@@ -1295,9 +1294,7 @@ mod delegation_relay_tests {
         assert!(is_delegation_title("delegate_to_agent"));
         assert!(is_delegation_title("Delegate To Agent"));
         assert!(is_delegation_title("delegate-to-agent"));
-        assert!(is_delegation_title(
-            "mcp__codeg-mcp__delegate_to_agent"
-        ));
+        assert!(is_delegation_title("mcp__codeg-mcp__delegate_to_agent"));
         assert!(is_delegation_title("Run mcp__codeg__delegate_to_agent"));
         assert!(!is_delegation_title("agent"));
         assert!(!is_delegation_title("write"));
@@ -1603,7 +1600,9 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 1, "exactly one line, got {msgs:?}");
@@ -1618,7 +1617,15 @@ mod async_relay_dedup_tests {
         let (bridge, chat, rec) = harness().await;
         let conn = ConnectionManager::new();
         let db = test_helpers::fresh_in_memory_db().await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &delegation_completed_ok(),
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         // The later terminal update carries raw_input (re-creating the old
         // input-map token) AND terminal output.
@@ -1628,7 +1635,9 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(
@@ -1652,9 +1661,19 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &delegation_completed_ok(),
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 2, "ack + result, got {msgs:?}");
@@ -1669,7 +1688,15 @@ mod async_relay_dedup_tests {
         let (bridge, chat, rec) = harness().await;
         let conn = ConnectionManager::new();
         let db = test_helpers::fresh_in_memory_db().await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &delegation_completed_ok(),
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         // Host re-emits the running ack after completion, with raw_input.
         handle_acp_envelope(
@@ -1678,7 +1705,9 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 1, "no stale ack after the result, got {msgs:?}");
@@ -1699,7 +1728,9 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 1, "one failure line, got {msgs:?}");
@@ -1741,7 +1772,15 @@ mod async_relay_dedup_tests {
                 session_id: "S1".into(),
             },
         };
-        handle_acp_envelope(&started, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &started,
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         assert_eq!(
@@ -1784,7 +1823,15 @@ mod async_relay_dedup_tests {
                 duration_ms: None,
             },
         };
-        handle_acp_envelope(&complete, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &complete,
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         assert!(
@@ -1923,7 +1970,15 @@ mod error_terminal_gate_tests {
                 session_id: "S2".to_string(),
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &emitter, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &envelope,
+            &bridge,
+            &chat_mgr,
+            &conn_mgr,
+            &db.conn,
+            &emitter,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         // The bound row advanced; the old session kept a row of its own.
@@ -1932,7 +1987,11 @@ mod error_terminal_gate_tests {
             .all(&db.conn)
             .await
             .expect("list rows");
-        assert_eq!(rows.len(), 2, "the old session must keep a row, got {rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the old session must keep a row, got {rows:?}"
+        );
         let preserved = rows
             .iter()
             .find(|r| r.external_id.as_deref() == Some("S1"))
@@ -2043,7 +2102,9 @@ mod error_terminal_gate_tests {
             &ChatChannelManager::new(),
             &conn_mgr,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         assert!(
@@ -2080,7 +2141,9 @@ mod error_terminal_gate_tests {
             &ChatChannelManager::new(),
             &conn_mgr,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
         assert!(
             !matches!(cmd_rx.try_recv(), Ok(ConnectionCommand::Prompt { .. })),
@@ -2148,7 +2211,12 @@ mod error_terminal_gate_tests {
 
         let conn_mgr = ConnectionManager::new();
         let _cmd_rx = conn_mgr
-            .insert_test_connection_live("conn-moved-on", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .insert_test_connection_live(
+                "conn-moved-on",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
             .await;
         // The LIVE session is S2 — S1 is a straggler.
         conn_mgr
@@ -2171,7 +2239,9 @@ mod error_terminal_gate_tests {
             &ChatChannelManager::new(),
             &conn_mgr,
             &db.conn,
-            &EventEmitter::Noop, &mut std::collections::HashMap::new(),)
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         assert!(
@@ -2212,7 +2282,15 @@ mod error_terminal_gate_tests {
                 terminal: false,
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &envelope,
+            &bridge,
+            &chat_mgr,
+            &conn_mgr,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         // Session bridge entry is preserved — the next user message on the
@@ -2246,7 +2324,15 @@ mod error_terminal_gate_tests {
                 terminal: true,
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &EventEmitter::Noop, &mut std::collections::HashMap::new())
+        handle_acp_envelope(
+            &envelope,
+            &bridge,
+            &chat_mgr,
+            &conn_mgr,
+            &db.conn,
+            &EventEmitter::Noop,
+            &mut std::collections::HashMap::new(),
+        )
         .await;
 
         assert!(

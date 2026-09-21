@@ -141,7 +141,11 @@ pub fn bad_passphrase_error() -> AppCommandError {
         .with_i18n(CONFIG_SYNC_I18N_KEY_BAD_PASSPHRASE, BTreeMap::new())
 }
 
-fn derive_key(passphrase: &str, salt: &[u8], params: &KdfParams) -> Result<[u8; 32], AppCommandError> {
+fn derive_key(
+    passphrase: &str,
+    salt: &[u8],
+    params: &KdfParams,
+) -> Result<[u8; 32], AppCommandError> {
     let p = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32)).map_err(|e| {
         AppCommandError::task_execution_failed("Invalid KDF parameters").with_detail(e.to_string())
     })?;
@@ -155,7 +159,8 @@ fn derive_key(passphrase: &str, salt: &[u8], params: &KdfParams) -> Result<[u8; 
     argon2
         .hash_password_into(passphrase.as_bytes(), salt, &mut key)
         .map_err(|e| {
-            AppCommandError::task_execution_failed("Key derivation failed").with_detail(e.to_string())
+            AppCommandError::task_execution_failed("Key derivation failed")
+                .with_detail(e.to_string())
         })?;
     Ok(key)
 }
@@ -216,7 +221,9 @@ pub fn decrypt(payload: &EncryptedPayload, passphrase: &str) -> Result<Vec<u8>, 
 
     let params = &payload.kdf_params;
     if params.m_cost > MAX_M_COST || params.t_cost > MAX_T_COST || params.p_cost > MAX_P_COST {
-        return Err(invalid("Encrypted snapshot asks for an unsupported KDF cost"));
+        return Err(invalid(
+            "Encrypted snapshot asks for an unsupported KDF cost",
+        ));
     }
 
     let salt = B64
@@ -308,7 +315,9 @@ mod tests {
         // And it is still JSON with the marker the import path branches on.
         let value: Value = serde_json::from_str(&text).expect("json");
         assert!(is_encrypted_value(&value));
-        assert!(!is_encrypted_value(&serde_json::json!({"schemaVersion": 1})));
+        assert!(!is_encrypted_value(
+            &serde_json::json!({"schemaVersion": 1})
+        ));
     }
 
     #[test]
@@ -340,7 +349,9 @@ mod tests {
         assert!(decrypt(&bumped_cost, "pw").is_err());
 
         let mut flipped = original;
-        let mut ct = B64.decode(flipped.ciphertext_b64.as_bytes()).expect("decode");
+        let mut ct = B64
+            .decode(flipped.ciphertext_b64.as_bytes())
+            .expect("decode");
         ct[0] ^= 0xff;
         flipped.ciphertext_b64 = B64.encode(&ct);
         assert!(decrypt(&flipped, "pw").is_err());

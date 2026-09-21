@@ -316,7 +316,11 @@ fn classify_plugin(
     if modern.exists() {
         (PluginStatus::Installed, read_pkg_version(&modern), None)
     } else if legacy.exists() {
-        (PluginStatus::NeedsMigration, read_pkg_version(&legacy), None)
+        (
+            PluginStatus::NeedsMigration,
+            read_pkg_version(&legacy),
+            None,
+        )
     } else {
         (PluginStatus::Missing, None, None)
     }
@@ -597,7 +601,6 @@ fn pin_latest_specs(
         }
         Ok(())
     })?;
-
 
     // Only NOW, with the config committed, move each package directory to the
     // key the pinned spec produces. opencode keys `packages/<spec>` on the spec
@@ -930,9 +933,7 @@ async fn run_bun_add(
 fn package_dirs_for(cache_dir: &Path, name: &str) -> Vec<PathBuf> {
     let packages = cache_dir.join("packages");
     let (parent, prefix) = match name.split_once('/') {
-        Some((scope, bare)) if name.starts_with('@') => {
-            (packages.join(scope), format!("{bare}@"))
-        }
+        Some((scope, bare)) if name.starts_with('@') => (packages.join(scope), format!("{bare}@")),
         _ => (packages, format!("{name}@")),
     };
     let prefix = sanitize_spec(&prefix);
@@ -941,11 +942,7 @@ fn package_dirs_for(cache_dir: &Path, name: &str) -> Vec<PathBuf> {
     };
     entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(prefix.as_str())
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix.as_str()))
         .map(|e| e.path())
         .collect()
 }

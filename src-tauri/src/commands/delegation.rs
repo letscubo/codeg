@@ -184,7 +184,9 @@ pub async fn set_delegation_enabled_core(
         .await
         .map_err(AppCommandError::from)?;
     let settings = load_delegation_settings(conn).await;
-    broker.set_config(settings.clone().into_broker_config()).await;
+    broker
+        .set_config(settings.clone().into_broker_config())
+        .await;
     emit_event(emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &settings);
     Ok(settings)
 }

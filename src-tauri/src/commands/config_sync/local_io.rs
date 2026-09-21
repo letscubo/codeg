@@ -489,7 +489,9 @@ mod tests {
     async fn a_reformatted_export_still_imports() {
         let source = fresh_in_memory_db().await;
         seed_message(&source.conn, "Reformatted").await;
-        let export = build_export_core(&source.conn, "1.0.0").await.expect("build");
+        let export = build_export_core(&source.conn, "1.0.0")
+            .await
+            .expect("build");
 
         let compact = serde_json::to_vec(&export).expect("compact bytes");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -569,7 +571,9 @@ mod tests {
         let rollbacks = tempfile::tempdir().expect("tempdir");
         let source = fresh_in_memory_db().await;
         seed_message(&source.conn, "Incoming").await;
-        let export = build_export_core(&source.conn, "9.9.9").await.expect("export");
+        let export = build_export_core(&source.conn, "9.9.9")
+            .await
+            .expect("export");
         let bytes = serde_json::to_vec(&export).expect("bytes");
 
         let target = fresh_in_memory_db().await;

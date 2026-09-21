@@ -23,9 +23,7 @@ use crate::commands::config_sync::local_io::{
     apply_rollback_core, export_content_core, import_bytes_core, list_rollbacks_core,
     peek_import_bytes_core, ConfigExportContent, ConfigImportPreview, ConfigImportResult,
 };
-use crate::commands::config_sync::snapshot::{
-    rollback_dir, ConfigManifest, RollbackSnapshotInfo,
-};
+use crate::commands::config_sync::snapshot::{rollback_dir, ConfigManifest, RollbackSnapshotInfo};
 use crate::commands::config_sync::webdav_sync::{
     download_and_apply_core, load_settings, load_state, merge_settings, peek_remote_core,
     save_settings_core, test_connection_core, upload_snapshot_core, ConfigSyncSettingsInput,
@@ -126,8 +124,8 @@ pub async fn config_sync_import_content(
         .map(Json)
 }
 
-pub async fn config_sync_list_rollbacks(
-) -> Result<Json<Vec<RollbackSnapshotInfo>>, AppCommandError> {
+pub async fn config_sync_list_rollbacks() -> Result<Json<Vec<RollbackSnapshotInfo>>, AppCommandError>
+{
     let infos = tokio::task::spawn_blocking(|| list_rollbacks_core(&rollback_dir()))
         .await
         .map_err(|e| {

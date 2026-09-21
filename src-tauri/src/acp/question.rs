@@ -30,9 +30,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sacp::schema::{
-    CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction,
-    ElicitationContentValue, ElicitationMode, ElicitationPropertySchema, ElicitationScope,
-    MultiSelectItems, StringPropertySchema,
+    CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
+    ElicitationAction, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
+    ElicitationScope, MultiSelectItems, StringPropertySchema,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -352,7 +352,9 @@ pub fn validate_specs(specs: &[QuestionSpec]) -> Result<(), String> {
         let mut seen_labels = std::collections::HashSet::new();
         for (oi, o) in q.options.iter().enumerate() {
             if o.label.trim().is_empty() {
-                return Err(format!("questions[{qi}].options[{oi}] has an empty `label`"));
+                return Err(format!(
+                    "questions[{qi}].options[{oi}] has an empty `label`"
+                ));
             }
             if o.label.chars().count() > MAX_QUESTION_TEXT_CHARS {
                 return Err(format!(
@@ -892,7 +894,10 @@ fn is_other_companion(id: &str) -> bool {
     let Some(pos) = id.rfind("__other") else {
         return false;
     };
-    pos > 0 && id[pos + "__other".len()..].chars().all(|c| c.is_ascii_digit())
+    pos > 0
+        && id[pos + "__other".len()..]
+            .chars()
+            .all(|c| c.is_ascii_digit())
 }
 
 /// True when the raw schema property carries codex's own companion marker, the
@@ -1028,10 +1033,7 @@ fn codex_form_shape(raw: &Value, peer: ElicitationPeer) -> Option<CodexUserInput
     let ElicitationPeer::Codex(running) = peer else {
         return None;
     };
-    let properties = raw
-        .get("requestedSchema")?
-        .get("properties")?
-        .as_object()?;
+    let properties = raw.get("requestedSchema")?.get("properties")?.as_object()?;
     let mut is_codex_form = false;
     let mut companion_shape = None;
     for id in properties.keys() {
@@ -1039,8 +1041,8 @@ fn codex_form_shape(raw: &Value, peer: ElicitationPeer) -> Option<CodexUserInput
             companion_shape = Some(shape);
             continue;
         }
-        is_codex_form |= codex_property_meta(raw, id)
-            .is_some_and(|codex| codex.get("isOther").is_some());
+        is_codex_form |=
+            codex_property_meta(raw, id).is_some_and(|codex| codex.get("isOther").is_some());
     }
     if !is_codex_form && companion_shape.is_none() {
         return None;
@@ -1205,10 +1207,7 @@ pub fn elicitation_auto_resolution_ms(raw: &Value) -> Option<u64> {
 /// [`crate::acp::manager::ConnectionManager::register_question`] re-runs
 /// [`validate_specs`]. Errors only on non-form / undeserializable requests,
 /// which the connection handler turns into a graceful decline.
-pub fn classify_elicitation(
-    raw: &Value,
-    peer: ElicitationPeer,
-) -> Result<ElicitationPlan, String> {
+pub fn classify_elicitation(raw: &Value, peer: ElicitationPeer) -> Result<ElicitationPlan, String> {
     let req: CreateElicitationRequest = serde_json::from_value(raw.clone())
         .map_err(|e| format!("unparseable elicitation request: {e}"))?;
     let ElicitationMode::Form(form) = &req.mode else {
@@ -1307,7 +1306,11 @@ fn approval_from_form(
                 label: if c.label.trim().is_empty() {
                     value.to_string()
                 } else {
-                    c.label.trim().chars().take(MAX_QUESTION_TEXT_CHARS).collect()
+                    c.label
+                        .trim()
+                        .chars()
+                        .take(MAX_QUESTION_TEXT_CHARS)
+                        .collect()
                 },
                 kind: if value == "once" {
                     "allow_once"
@@ -1563,7 +1566,13 @@ pub fn build_elicitation_response(
         let mapped: Vec<String> = item
             .selected
             .iter()
-            .map(|l| field.value_by_label.get(l).cloned().unwrap_or_else(|| l.clone()))
+            .map(|l| {
+                field
+                    .value_by_label
+                    .get(l)
+                    .cloned()
+                    .unwrap_or_else(|| l.clone())
+            })
             .collect();
         let value = match field.kind {
             ElicitationFieldKind::Text => match mapped.into_iter().next() {
@@ -1816,7 +1825,11 @@ mod tests {
         assert_eq!(q.specs[0].header, "Approach");
         assert!(!q.specs[0].multi_select);
         assert!(!q.specs[0].is_secret);
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Incremental", "Rewrite"]);
         assert_eq!(q.fields[0].kind, ElicitationFieldKind::Text);
         // The elicitation's toolCallId rides along so the connection handler can
@@ -1873,7 +1886,11 @@ mod tests {
             q.specs[0].header, "Approach",
             "…and the short tab label in `description`"
         );
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(
             labels,
             ["Incremental", "Rewrite"],
@@ -1907,7 +1924,11 @@ mod tests {
             json!(["q1"]),
         );
         let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Incremental", "None of the above"]);
     }
 
@@ -1970,7 +1991,11 @@ mod tests {
 
         // Running ≥1.12.0 — `title` is the question.
         let q = expect_questions(
-            classify_elicitation(&raw, ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle))).unwrap(),
+            classify_elicitation(
+                &raw,
+                ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle)),
+            )
+            .unwrap(),
         );
         assert_eq!(q.specs[0].question, "Which approach should I take?");
         assert_eq!(q.specs[0].header, "Approach");
@@ -1978,7 +2003,11 @@ mod tests {
         // Running ≤1.11.0 — the old reading, even though no marker dates the
         // form. A custom pin is a supported configuration.
         let q = expect_questions(
-            classify_elicitation(&raw, ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInDescription))).unwrap(),
+            classify_elicitation(
+                &raw,
+                ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInDescription)),
+            )
+            .unwrap(),
         );
         assert_eq!(q.specs[0].question, "Approach");
         // …and the question text lands in the header slot, where the
@@ -2020,7 +2049,11 @@ mod tests {
             json!([]),
         );
         let q = expect_questions(
-            classify_elicitation(&raw, ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle))).unwrap(),
+            classify_elicitation(
+                &raw,
+                ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle)),
+            )
+            .unwrap(),
         );
         assert_eq!(q.specs[0].question, "Approach", "running version wins");
         // …and with no running version, the marker dates it the old way.
@@ -2059,7 +2092,11 @@ mod tests {
             ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInDescription)),
         ] {
             let q = expect_questions(classify_elicitation(&raw, peer).unwrap());
-            let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+            let labels: Vec<_> = q.specs[0]
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect();
             assert_eq!(
                 labels,
                 ["Incremental", "None of the above"],
@@ -2117,7 +2154,11 @@ mod tests {
         );
         assert_eq!(q.specs[0].question, "Which approach should I take?");
         assert_eq!(q.specs[0].header, "Approach");
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Incremental", "None of the above"]);
 
         // The identical payload from codex: companion skipped, 1.12 orientation,
@@ -2132,7 +2173,11 @@ mod tests {
         );
         assert_eq!(q.specs.len(), 1);
         assert_eq!(q.specs[0].question, "Approach");
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Incremental"]);
     }
 
@@ -2177,7 +2222,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(
             labels,
             ["None of the above"],
@@ -2214,9 +2263,17 @@ mod tests {
             json!(["q1"]),
         );
         let q = expect_questions(
-            classify_elicitation(&raw, ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle))).unwrap(),
+            classify_elicitation(
+                &raw,
+                ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle)),
+            )
+            .unwrap(),
         );
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Incremental", "None of the above"]);
     }
 
@@ -2236,7 +2293,10 @@ mod tests {
             json!(["port"]),
         );
         let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
-        assert_eq!(q.specs[0].question, "Which port should the server listen on?");
+        assert_eq!(
+            q.specs[0].question,
+            "Which port should the server listen on?"
+        );
         assert_eq!(q.specs[0].header, "Port");
     }
 
@@ -2391,7 +2451,11 @@ mod tests {
         assert_eq!(q.specs.len(), 1);
         assert!(q.specs[0].multi_select);
         // Titles display; consts ride back on accept.
-        let labels: Vec<_> = q.specs[0].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Rust", "TS"]);
         let answer = QuestionAnswer {
             answers: vec![QuestionAnswerItem {
@@ -2419,7 +2483,11 @@ mod tests {
         assert_eq!(q.specs.len(), 3);
         // Booleans render as Yes/No; numbers as free text.
         let confirm = q.specs.iter().position(|s| s.id == "confirm").unwrap();
-        let labels: Vec<_> = q.specs[confirm].options.iter().map(|o| o.label.as_str()).collect();
+        let labels: Vec<_> = q.specs[confirm]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
         assert_eq!(labels, ["Yes", "No"]);
 
         let answer = QuestionAnswer {
@@ -2510,20 +2578,27 @@ mod tests {
             },
             "_meta": {"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"]}
         });
-        let approval = expect_approval(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
+        let approval =
+            expect_approval(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
         assert_eq!(approval.message, "Allow tool call?");
         assert_eq!(approval.tool_call_id.as_deref(), Some("call-1"));
         assert!(approval.persist_in_content);
-        let ids: Vec<_> = approval.options.iter().map(|o| o.option_id.as_str()).collect();
-        assert_eq!(ids, ["once", "session", "always", ELICITATION_DECLINE_OPTION_ID]);
+        let ids: Vec<_> = approval
+            .options
+            .iter()
+            .map(|o| o.option_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["once", "session", "always", ELICITATION_DECLINE_OPTION_ID]
+        );
         assert_eq!(approval.options[0].label, "Allow once");
         assert_eq!(approval.options[0].kind, "allow_once");
         assert_eq!(approval.options[1].kind, "allow_always");
 
         // Accepting echoes the chosen persist back in content…
-        let v =
-            serde_json::to_value(build_elicitation_approval_response(&approval, "session"))
-                .unwrap();
+        let v = serde_json::to_value(build_elicitation_approval_response(&approval, "session"))
+            .unwrap();
         assert_eq!(v["action"], "accept");
         assert_eq!(v["content"]["persist"], "session");
         // …declining (or an unknown option) maps to decline.
@@ -2533,8 +2608,8 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["action"], "decline");
-        let v = serde_json::to_value(build_elicitation_approval_response(&approval, "bogus"))
-            .unwrap();
+        let v =
+            serde_json::to_value(build_elicitation_approval_response(&approval, "bogus")).unwrap();
         assert_eq!(v["action"], "decline");
     }
 
@@ -2551,12 +2626,17 @@ mod tests {
             "requestedSchema": {"type": "object", "properties": {}},
             "_meta": {"codex_approval_kind": "mcp_tool_call"}
         });
-        let approval = expect_approval(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
+        let approval =
+            expect_approval(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
         assert!(!approval.persist_in_content);
-        let ids: Vec<_> = approval.options.iter().map(|o| o.option_id.as_str()).collect();
+        let ids: Vec<_> = approval
+            .options
+            .iter()
+            .map(|o| o.option_id.as_str())
+            .collect();
         assert_eq!(ids, ["accept", ELICITATION_DECLINE_OPTION_ID]);
-        let v = serde_json::to_value(build_elicitation_approval_response(&approval, "accept"))
-            .unwrap();
+        let v =
+            serde_json::to_value(build_elicitation_approval_response(&approval, "accept")).unwrap();
         assert_eq!(v["action"], "accept");
         assert!(
             v.get("content").is_none() || v["content"].is_null(),
@@ -2569,9 +2649,14 @@ mod tests {
         // A non-approval form with nothing to fill in (a bare MCP server
         // confirmation) renders Accept/Decline rather than auto-declining.
         let raw = elicitation_raw(json!({}), json!([]));
-        let approval = expect_approval(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
+        let approval =
+            expect_approval(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
         assert_eq!(approval.message, "Input requested");
-        let ids: Vec<_> = approval.options.iter().map(|o| o.option_id.as_str()).collect();
+        let ids: Vec<_> = approval
+            .options
+            .iter()
+            .map(|o| o.option_id.as_str())
+            .collect();
         assert_eq!(ids, ["accept", ELICITATION_DECLINE_OPTION_ID]);
     }
 
@@ -2678,7 +2763,10 @@ mod tests {
             validate_specs(&[spec("ok", 2, MAX_QUESTION_TEXT_CHARS + 1)]).is_err(),
             "oversized option label"
         );
-        assert!(validate_specs(&[spec("   ", 2, 0)]).is_err(), "blank question");
+        assert!(
+            validate_specs(&[spec("   ", 2, 0)]).is_err(),
+            "blank question"
+        );
 
         // Duplicate question id across the set (spec() hardcodes id "q") — answer
         // routing + UI state key on id, so duplicates must be rejected.
@@ -2820,7 +2908,13 @@ mod tests {
                 labels: vec!["x".into()],
             });
         }
-        let outcome = build_outcome(&qs, &QuestionAnswer { answers: items, declined: false });
+        let outcome = build_outcome(
+            &qs,
+            &QuestionAnswer {
+                answers: items,
+                declined: false,
+            },
+        );
         assert_eq!(outcome.answers.len(), 1);
         // Cap = options.len() + 1 = 3 (every real option plus one "Other"); the
         // FIRST three are kept (early break — labels past the cap and the 10k
@@ -2961,7 +3055,10 @@ mod tests {
             .collect();
         let specs = parse_grok_ext_questions(&grok_params(json!(many))).unwrap();
         assert_eq!(specs.len(), MAX_QUESTIONS, "questions clamped");
-        assert!(specs.iter().all(|s| s.options.len() == MAX_OPTIONS), "options clamped");
+        assert!(
+            specs.iter().all(|s| s.options.len() == MAX_OPTIONS),
+            "options clamped"
+        );
         validate_specs(&specs).unwrap();
     }
 
@@ -3188,8 +3285,14 @@ mod tests {
             answers: vec![],
             declined: true,
         };
-        assert_eq!(build_grok_ext_response(&outcome), json!({ "outcome": "skip_interview" }));
-        assert_eq!(grok_ext_skip_response(), json!({ "outcome": "skip_interview" }));
+        assert_eq!(
+            build_grok_ext_response(&outcome),
+            json!({ "outcome": "skip_interview" })
+        );
+        assert_eq!(
+            grok_ext_skip_response(),
+            json!({ "outcome": "skip_interview" })
+        );
     }
 
     #[test]
@@ -3284,7 +3387,10 @@ mod tests {
         );
         let input = grok_result_card_input(&specs);
         let output = grok_result_card_output(&outcome);
-        assert_eq!(input["questions"][0]["question"], output["answers"][0]["question"]);
+        assert_eq!(
+            input["questions"][0]["question"],
+            output["answers"][0]["question"]
+        );
         assert_eq!(output["answers"][0]["header"], "");
     }
 }

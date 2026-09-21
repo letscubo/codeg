@@ -96,8 +96,7 @@ impl From<WebdavError> for AppCommandError {
             WebdavError::Server(status) => {
                 let mut params = std::collections::BTreeMap::new();
                 params.insert("status".to_string(), status.to_string());
-                AppCommandError::network(message)
-                    .with_i18n(CONFIG_SYNC_I18N_KEY_SERVER, params)
+                AppCommandError::network(message).with_i18n(CONFIG_SYNC_I18N_KEY_SERVER, params)
             }
         }
     }
@@ -113,11 +112,7 @@ pub struct WebdavClient {
 }
 
 impl WebdavClient {
-    pub fn new(
-        server_url: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<Self, WebdavError> {
+    pub fn new(server_url: &str, username: &str, password: &str) -> Result<Self, WebdavError> {
         let trimmed = server_url.trim();
         if trimmed.is_empty() {
             return Err(WebdavError::InvalidUrl);
@@ -351,7 +346,9 @@ mod tests {
 
     #[test]
     fn base_url_without_trailing_slash_still_appends() {
-        let url = client().url_for("codeg/v1/default/config.json").expect("url");
+        let url = client()
+            .url_for("codeg/v1/default/config.json")
+            .expect("url");
         assert_eq!(
             url.as_str(),
             "https://dav.example.com/dav/codeg/v1/default/config.json"
@@ -416,15 +413,24 @@ mod tests {
             );
 
             let app_error: AppCommandError = variant.into();
-            assert!(app_error.i18n_key.is_some(), "every variant needs a message");
+            assert!(
+                app_error.i18n_key.is_some(),
+                "every variant needs a message"
+            );
             assert!(!app_error.message.contains("hunter2"));
         }
     }
 
     #[test]
     fn status_codes_map_to_actionable_errors() {
-        assert_eq!(classify(StatusCode::UNAUTHORIZED), WebdavError::Unauthorized);
-        assert_eq!(classify(StatusCode::CONFLICT), WebdavError::RemotePathMissing);
+        assert_eq!(
+            classify(StatusCode::UNAUTHORIZED),
+            WebdavError::Unauthorized
+        );
+        assert_eq!(
+            classify(StatusCode::CONFLICT),
+            WebdavError::RemotePathMissing
+        );
         assert_eq!(
             classify(StatusCode::INSUFFICIENT_STORAGE),
             WebdavError::InsufficientStorage

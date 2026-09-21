@@ -372,9 +372,7 @@ pub async fn create_node(
             CanvasNodeKind::Note => input.content.filter(|s| !s.is_empty()),
             _ => {
                 if input.content.as_deref().is_some_and(|s| !s.is_empty()) {
-                    return Err(DbError::Validation(
-                        "content only applies to notes".into(),
-                    ));
+                    return Err(DbError::Validation("content only applies to notes".into()));
                 }
                 None
             }
@@ -569,9 +567,9 @@ pub async fn group_into_region(
             active.update(&txn).await?
         }
         None => {
-            let geometry = input.geometry.ok_or_else(|| {
-                DbError::Validation("a new region needs its geometry".into())
-            })?;
+            let geometry = input
+                .geometry
+                .ok_or_else(|| DbError::Validation("a new region needs its geometry".into()))?;
             canvas_node::ActiveModel {
                 id: NotSet,
                 kind: Set(CanvasNodeKind::Custom),
@@ -849,14 +847,13 @@ pub async fn detach_member(
 
 /// Delete a node. `None` when the node was already gone — nothing changed, so
 /// the caller must not bump-broadcast a phantom event.
-pub async fn delete_node(
-    conn: &DatabaseConnection,
-    node_id: i32,
-) -> Result<Option<i64>, DbError> {
+pub async fn delete_node(conn: &DatabaseConnection, node_id: i32) -> Result<Option<i64>, DbError> {
     let _guard = revision_lock().lock().await;
     let txn = conn.begin().await?;
     claim_writer(&txn).await?;
-    let removed = canvas_node::Entity::delete_by_id(node_id).exec(&txn).await?;
+    let removed = canvas_node::Entity::delete_by_id(node_id)
+        .exec(&txn)
+        .await?;
     if removed.rows_affected == 0 {
         txn.commit().await?;
         return Ok(None);
@@ -1013,12 +1010,10 @@ mod tests {
         // read and every watch join is keyed on, so nothing may rewrite it.
         assert_eq!(file.path.as_deref(), Some("/repo/src/main.rs"));
 
-        let (terminal, _) = create_node(
-            &db.conn,
-            new_node(CanvasNodeKind::Terminal, Some("/repo")),
-        )
-        .await
-        .expect("create terminal node");
+        let (terminal, _) =
+            create_node(&db.conn, new_node(CanvasNodeKind::Terminal, Some("/repo")))
+                .await
+                .expect("create terminal node");
         assert_eq!(terminal.path.as_deref(), Some("/repo"));
     }
 
@@ -1087,10 +1082,9 @@ mod tests {
         }
 
         let db = fresh_in_memory_db().await;
-        let (file, _) =
-            create_node(&db.conn, new_node(CanvasNodeKind::File, Some("/repo/a.rs")))
-                .await
-                .expect("create file node");
+        let (file, _) = create_node(&db.conn, new_node(CanvasNodeKind::File, Some("/repo/a.rs")))
+            .await
+            .expect("create file node");
         // Grid axes are forced to 0 for non-regions, so nothing downstream can
         // read a shape off a card that has no grid.
         assert_eq!((file.grid_columns, file.grid_rows), (0, 0));

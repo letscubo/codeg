@@ -124,12 +124,9 @@ impl TelegramBackend {
                 ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
             })?;
 
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| {
-                ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
-            })?;
+        let result: serde_json::Value = resp.json().await.map_err(|e| {
+            ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
+        })?;
 
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let desc = result
@@ -225,12 +222,9 @@ impl ChatChannelBackend for TelegramBackend {
                 ChatChannelError::ConnectionFailed(redact_token(e.to_string(), &self.bot_token))
             })?;
 
-        let me_body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| {
-                ChatChannelError::ConnectionFailed(redact_token(e.to_string(), &self.bot_token))
-            })?;
+        let me_body: serde_json::Value = resp.json().await.map_err(|e| {
+            ChatChannelError::ConnectionFailed(redact_token(e.to_string(), &self.bot_token))
+        })?;
 
         if me_body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             *self.status.lock().await = ChannelConnectionStatus::Error;
@@ -527,12 +521,9 @@ impl ChatChannelBackend for TelegramBackend {
             .map_err(|e| {
                 ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
             })?;
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| {
-                ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
-            })?;
+        let result: serde_json::Value = resp.json().await.map_err(|e| {
+            ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
+        })?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let desc = result
                 .get("description")
@@ -585,12 +576,9 @@ impl ChatChannelBackend for TelegramBackend {
             .map_err(|e| {
                 ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
             })?;
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| {
-                ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
-            })?;
+        let result: serde_json::Value = resp.json().await.map_err(|e| {
+            ChatChannelError::SendFailed(redact_token(e.to_string(), &self.bot_token))
+        })?;
         if result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             Ok(())
         } else {
@@ -612,12 +600,9 @@ impl ChatChannelBackend for TelegramBackend {
                 ChatChannelError::ConnectionFailed(redact_token(e.to_string(), &self.bot_token))
             })?;
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| {
-                ChatChannelError::ConnectionFailed(redact_token(e.to_string(), &self.bot_token))
-            })?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            ChatChannelError::ConnectionFailed(redact_token(e.to_string(), &self.bot_token))
+        })?;
 
         if body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             Ok(())
@@ -894,7 +879,10 @@ mod tests {
             "error sending request for url (https://api.telegram.org/bot{token}/createForumTopic)"
         );
         let scrubbed = redact_token(leaked, token);
-        assert!(!scrubbed.contains(token), "token must be scrubbed: {scrubbed}");
+        assert!(
+            !scrubbed.contains(token),
+            "token must be scrubbed: {scrubbed}"
+        );
         assert!(scrubbed.contains("bot***/createForumTopic"), "{scrubbed}");
     }
 

@@ -136,8 +136,8 @@ pub async fn codeg_mcp_service_status_core(
         None => Default::default(),
     };
 
-    let binary_path = crate::acp::connection::locate_codeg_mcp_binary()
-        .map(|p| p.to_string_lossy().to_string());
+    let binary_path =
+        crate::acp::connection::locate_codeg_mcp_binary().map(|p| p.to_string_lossy().to_string());
 
     let delegation_cfg = sources.broker.config_snapshot().await;
     let authoring_cfg = sources.authoring.snapshot().await;

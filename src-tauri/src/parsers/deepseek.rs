@@ -1164,14 +1164,18 @@ fn parse_session_events(text: &str, attachments: Option<&Path>) -> SessionParse 
             // stopped remembering them.
             "compaction/start" => {
                 let Some(data) = data else { continue };
-                let Some(id) = compaction_id(data) else { continue };
+                let Some(id) = compaction_id(data) else {
+                    continue;
+                };
                 let entry = open_compactions.entry(id).or_default();
                 entry.started_at = ts;
                 entry.manual = data.get("sourceCommandId").is_some();
             }
             "compaction/summary" => {
                 let Some(data) = data else { continue };
-                let Some(id) = compaction_id(data) else { continue };
+                let Some(id) = compaction_id(data) else {
+                    continue;
+                };
                 // `or_default` rather than a lookup: a log can begin AFTER the
                 // opening marker (a fork seed, or a truncated prefix from a
                 // half-written final frame), and a compaction with no visible
@@ -1189,7 +1193,9 @@ fn parse_session_events(text: &str, attachments: Option<&Path>) -> SessionParse 
             }
             "compaction/end" => {
                 let Some(data) = data else { continue };
-                let Some(id) = compaction_id(data) else { continue };
+                let Some(id) = compaction_id(data) else {
+                    continue;
+                };
                 let entry = open_compactions.remove(&id).unwrap_or_default();
                 let error = data
                     .get("error")
@@ -1379,7 +1385,11 @@ mod tests {
         );
         // Absent from the launch → codeg's own process value is what the child inherits.
         assert_eq!(
-            resolve_dsh_home_for_launch_from(None, Some(OsString::from("/opt/codeg-dsh")), home.clone()),
+            resolve_dsh_home_for_launch_from(
+                None,
+                Some(OsString::from("/opt/codeg-dsh")),
+                home.clone()
+            ),
             PathBuf::from("/opt/codeg-dsh")
         );
         // Blank in the launch = removed for the child → default under the CHILD's home,
@@ -1420,7 +1430,10 @@ mod tests {
         // Upstream `resolveDshHome` treats a WHITESPACE-only override as unset
         // too ("a blank override never resolves the home to the cwd").
         assert_eq!(
-            resolve_dsh_home_from(Some(OsString::from("   ")), Some(PathBuf::from("/home/demo"))),
+            resolve_dsh_home_from(
+                Some(OsString::from("   ")),
+                Some(PathBuf::from("/home/demo"))
+            ),
             PathBuf::from("/home/demo/.dsh")
         );
         // ... and expands a leading `~` (`expandHomePath`) before use, so a
@@ -1439,7 +1452,10 @@ mod tests {
         );
         // `~user` is NOT a prefix upstream expands — kept verbatim.
         assert_eq!(
-            resolve_dsh_home_from(Some(OsString::from("~root/x")), Some(PathBuf::from("/home/demo"))),
+            resolve_dsh_home_from(
+                Some(OsString::from("~root/x")),
+                Some(PathBuf::from("/home/demo"))
+            ),
             PathBuf::from("~root/x")
         );
     }
@@ -1892,7 +1908,13 @@ mod tests {
     /// `<dir>/<bucket>/<id>/`. One call must never leave a second generation
     /// behind: a test that means to stage a lone v3 would otherwise be passing
     /// on a v0 companion nobody asked for.
-    fn write_log_bytes(dir: &Path, bucket: &str, id: &str, filename: &str, bytes: &[u8]) -> PathBuf {
+    fn write_log_bytes(
+        dir: &Path,
+        bucket: &str,
+        id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
         let session_dir = dir.join(bucket).join(id);
         fs::create_dir_all(&session_dir).expect("mkdir");
         let path = session_dir.join(filename);
@@ -1934,7 +1956,12 @@ mod tests {
         for (index, text) in texts.iter().enumerate() {
             let turn = index as u64 + 1;
             let base = turn * 10;
-            lines.push(event("turn/start", base, 1_000 + base as i64, json!({"turn": turn})));
+            lines.push(event(
+                "turn/start",
+                base,
+                1_000 + base as i64,
+                json!({"turn": turn}),
+            ));
             lines.push(event(
                 "user/message",
                 base + 1,
@@ -2216,11 +2243,7 @@ mod tests {
         );
         let mut bytes = zstd_frames(&tagged_log(&["new"]));
         let tail = zstd::stream::encode_all(
-            format!(
-                "\n{}",
-                event("turn/start", 50, 2_000, json!({"turn": 2}))
-            )
-            .as_bytes(),
+            format!("\n{}", event("turn/start", 50, 2_000, json!({"turn": 2}))).as_bytes(),
             0,
         )
         .expect("tail frame");
@@ -2329,7 +2352,13 @@ mod tests {
     #[test]
     fn a_mixed_encoding_root_reads_the_compressed_set() {
         let dir = scratch_dir("gen-mixed");
-        write_log(&dir, "--w--", GEN_ID, "session.v3.jsonl", &tagged_log(&["raw"]));
+        write_log(
+            &dir,
+            "--w--",
+            GEN_ID,
+            "session.v3.jsonl",
+            &tagged_log(&["raw"]),
+        );
         write_log(
             &dir,
             "--w--",
@@ -2380,10 +2409,7 @@ mod tests {
         assert_eq!(
             select_generation_log(
                 &session_dir,
-                vec![
-                    Ok((name(&old), old.clone())),
-                    Ok((name(&new), new.clone())),
-                ],
+                vec![Ok((name(&old), old.clone())), Ok((name(&new), new.clone())),],
             ),
             Some((new.clone(), LogEncoding::Zstd))
         );
@@ -2767,10 +2793,7 @@ mod tests {
         )));
         // The compaction's replacement message is plugin-sourced, so no user
         // turn was invented out of the summary text.
-        assert!(!sp
-            .turns
-            .iter()
-            .any(|t| matches!(t.role, TurnRole::User)));
+        assert!(!sp.turns.iter().any(|t| matches!(t.role, TurnRole::User)));
     }
 
     #[test]
@@ -2789,10 +2812,11 @@ mod tests {
         assert!(marker.get("preTokens").is_none());
         assert!(marker.get("postTokens").is_none());
 
-        assert!(sp.turns.iter().flat_map(|t| &t.blocks).any(|b| matches!(
-            b,
-            ContentBlock::ToolResult { is_error: true, .. }
-        )));
+        assert!(sp
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })));
     }
 
     // A log can begin after the opening marker (a fork seed, or a prefix left
@@ -2834,10 +2858,20 @@ mod tests {
         let parser = DeepSeekParser::with_base_dir(dir.clone());
         let conversations = parser.list_conversations().expect("list");
         assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].id, prefixed, "the directory name is the id");
+        assert_eq!(
+            conversations[0].id, prefixed,
+            "the directory name is the id"
+        );
         assert_eq!(conversations[0].message_count, 2);
 
-        assert_eq!(parser.get_conversation(&prefixed).expect("prefixed").turns.len(), 2);
+        assert_eq!(
+            parser
+                .get_conversation(&prefixed)
+                .expect("prefixed")
+                .turns
+                .len(),
+            2
+        );
         assert_eq!(parser.get_conversation(bare).expect("bare").turns.len(), 2);
 
         let _ = fs::remove_dir_all(&dir);

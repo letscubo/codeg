@@ -333,8 +333,10 @@ async fn dispatch_command(
             target,
         ),
         "status" => DispatchResponse::current(
-            session_commands::handle_session_status(db, channel_id, sender_id, bridge, lang, prefix)
-                .await,
+            session_commands::handle_session_status(
+                db, channel_id, sender_id, bridge, lang, prefix,
+            )
+            .await,
             target,
         ),
         "new" => DispatchResponse::current(

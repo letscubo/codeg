@@ -109,10 +109,11 @@ pub async fn prepare_source_core(
         let out_c = out.clone();
         let pass = passphrase.unwrap_or_default().to_string();
         let cancel = CancellationToken::new();
-        let decrypted =
-            tokio::task::spawn_blocking(move || crypto::decrypt_file(&src_c, &out_c, &pass, &cancel))
-                .await
-                .map_err(spawn_err)?;
+        let decrypted = tokio::task::spawn_blocking(move || {
+            crypto::decrypt_file(&src_c, &out_c, &pass, &cancel)
+        })
+        .await
+        .map_err(spawn_err)?;
         if let Err(e) = decrypted {
             // A wrong passphrase must not leave a partial plaintext behind.
             let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -179,7 +180,9 @@ pub fn resolve_prepared_zip(data_dir: &Path, source_id: &str) -> Result<PathBuf,
         .ok_or_else(|| AppCommandError::not_found("Prepared backup source not found"))?;
     let zip = PathBuf::from(&meta.zip_path);
     if !zip.is_file() {
-        return Err(AppCommandError::not_found("Prepared backup source not found"));
+        return Err(AppCommandError::not_found(
+            "Prepared backup source not found",
+        ));
     }
     meta.last_used_epoch = now_epoch();
     let _ = write_meta(&dir, &meta);
@@ -238,8 +241,7 @@ async fn preview_zip(zip_path: &Path, encrypted: bool) -> Result<BackupPreview, 
     // "compatible" for a backup that stage will reject.
     if compatible && archive::validate_manifest(&manifest).is_err() {
         compatible = false;
-        reject_reason =
-            Some(crate::app_error::BACKUP_I18N_KEY_UNKNOWN_FORMAT.to_string());
+        reject_reason = Some(crate::app_error::BACKUP_I18N_KEY_UNKNOWN_FORMAT.to_string());
     }
     Ok(BackupPreview {
         encrypted,
@@ -290,7 +292,9 @@ mod tests {
     use super::*;
 
     fn plaintext_archive(dir: &Path) -> PathBuf {
-        use crate::commands::backup::manifest::{BackupManifest, BACKUP_FORMAT_VERSION, BACKUP_KIND};
+        use crate::commands::backup::manifest::{
+            BackupManifest, BACKUP_FORMAT_VERSION, BACKUP_KIND,
+        };
         use sea_orm_migration::MigratorTrait;
         let zip = dir.join("backup.codeg.zip");
         let db = dir.join("db.bin");
@@ -354,7 +358,9 @@ mod tests {
         crypto::encrypt_file(&plain, &enc, "s3cret", &CancellationToken::new()).unwrap();
 
         // No passphrase: nothing is decrypted and no handle is issued.
-        let locked = prepare_source_core(&enc, &data_dir, None, false).await.unwrap();
+        let locked = prepare_source_core(&enc, &data_dir, None, false)
+            .await
+            .unwrap();
         assert!(locked.source_id.is_none());
         assert!(locked.preview.needs_passphrase);
 
@@ -363,7 +369,9 @@ mod tests {
             .await
             .is_err());
         assert_eq!(
-            std::fs::read_dir(data_dir.join(PREPARED_DIR)).unwrap().count(),
+            std::fs::read_dir(data_dir.join(PREPARED_DIR))
+                .unwrap()
+                .count(),
             0,
             "a failed decryption must not leave a partial plaintext"
         );

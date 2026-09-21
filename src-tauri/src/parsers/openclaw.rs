@@ -633,7 +633,7 @@ impl OpenClawParser {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 "assistant" => {
@@ -657,7 +657,7 @@ impl OpenClawParser {
                         duration_ms: None,
                         model: msg_model,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 "toolResult" => {
@@ -671,7 +671,7 @@ impl OpenClawParser {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 _ => {}
@@ -1135,7 +1135,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
             i += 1;
@@ -1149,7 +1149,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
             i += 1;
@@ -1185,7 +1185,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
         }
@@ -1249,8 +1249,14 @@ mod tests {
     #[test]
     fn a_truncated_prefix_never_eats_a_normal_title() {
         // 兜底只认「整条都是前缀残骸」;正常标题里出现方括号不受影响
-        assert_eq!(strip_openclaw_user_prefix("[Working directory: ~] 你好"), "你好");
-        assert_eq!(strip_openclaw_user_prefix("修一下 [Working directory: x"), "修一下 [Working directory: x");
+        assert_eq!(
+            strip_openclaw_user_prefix("[Working directory: ~] 你好"),
+            "你好"
+        );
+        assert_eq!(
+            strip_openclaw_user_prefix("修一下 [Working directory: x"),
+            "修一下 [Working directory: x"
+        );
     }
 
     #[test]

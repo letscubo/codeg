@@ -379,7 +379,7 @@ impl OpenCodeParser {
                 duration_ms,
                 model: msg_model,
                 completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
         }
 
@@ -503,9 +503,12 @@ impl OpenCodeParser {
                         input_preview: None,
                         status: None,
                         meta: Some(serde_json::Value::Object(
-                            [("contextCompaction".to_string(), serde_json::Value::Object(marker))]
-                                .into_iter()
-                                .collect(),
+                            [(
+                                "contextCompaction".to_string(),
+                                serde_json::Value::Object(marker),
+                            )]
+                            .into_iter()
+                            .collect(),
                         )),
                     });
                     // The pair is required: a ToolUse with no result reads as a
@@ -1022,7 +1025,8 @@ fn pick_str<'a>(value: Option<&'a serde_json::Value>, keys: &[&str]) -> Option<&
 /// as-is (an empty `oldString` is OpenCode's create-file form of `edit`).
 fn pick_str_verbatim<'a>(value: Option<&'a serde_json::Value>, keys: &[&str]) -> Option<&'a str> {
     let obj = value?;
-    keys.iter().find_map(|key| obj.get(*key).and_then(|v| v.as_str()))
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(|v| v.as_str()))
 }
 
 /// Copy `value[from]` into `out[to]` verbatim when present and not null.
@@ -1040,7 +1044,10 @@ fn copy_field(
 }
 
 fn insert_str(out: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: &str) {
-    out.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    out.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
 }
 
 /// Start line of the first hunk in a unified diff (`@@ -12,7 +12,8 @@` → 12).
@@ -1312,10 +1319,7 @@ pub(crate) fn structure_read_output(metadata: Option<&serde_json::Value>) -> Opt
                 .and_then(|v| v.as_u64())
                 .filter(|n| *n > 0)
                 .unwrap_or(1);
-            Some(
-                serde_json::json!({ "start_line": start_line, "content": text })
-                    .to_string(),
-            )
+            Some(serde_json::json!({ "start_line": start_line, "content": text }).to_string())
         }
         "directory" => {
             let entries: Vec<&str> = display
@@ -1575,7 +1579,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
             i += 1;
@@ -1589,7 +1593,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
             i += 1;
@@ -1630,7 +1634,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
         }
@@ -2190,7 +2194,10 @@ mod tests {
         // rendered as single-select.
         let call = normalized("question", question_state());
         let input = input_of(&call);
-        assert_eq!(input["questions"][1]["multiSelect"], serde_json::json!(true));
+        assert_eq!(
+            input["questions"][1]["multiSelect"],
+            serde_json::json!(true)
+        );
         // Untouched where the source said nothing, and the rest is verbatim.
         assert!(input["questions"][0].get("multiSelect").is_none());
         assert_eq!(
@@ -2309,7 +2316,9 @@ mod tests {
         assert!(super::is_compaction_only(&[compaction(), result()]));
         // Anything the user actually said keeps the message theirs.
         assert!(!super::is_compaction_only(&[
-            ContentBlock::Text { text: "carry on".into() },
+            ContentBlock::Text {
+                text: "carry on".into()
+            },
             compaction(),
         ]));
         // A different tool's pair is not a compaction, and neither is nothing.
@@ -2360,7 +2369,9 @@ mod tests {
     /// renaming one to that must not send it back to the fallback.
     #[test]
     fn only_opencodes_own_generated_name_counts_as_untitled() {
-        assert!(super::is_default_title("New session - 2026-09-16T03:09:14.543Z"));
+        assert!(super::is_default_title(
+            "New session - 2026-09-16T03:09:14.543Z"
+        ));
         assert!(super::is_default_title(
             "Child session - 2026-09-16T03:09:14.543Z"
         ));
@@ -2450,7 +2461,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(super::resolve_title(None, Some("hi".into())).as_deref(), Some("hi"));
+        assert_eq!(
+            super::resolve_title(None, Some("hi".into())).as_deref(),
+            Some("hi")
+        );
     }
 
     /// The fallback runs the same folding and capping every other agent's

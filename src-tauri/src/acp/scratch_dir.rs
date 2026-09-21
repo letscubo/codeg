@@ -502,7 +502,10 @@ fn verify_root_is_ours(root: &Path) -> std::io::Result<()> {
     if meta.uid() != us {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("scratch root belongs to uid {}, not to us ({us})", meta.uid()),
+            format!(
+                "scratch root belongs to uid {}, not to us ({us})",
+                meta.uid()
+            ),
         ));
     }
     // Ours, but reachable by others — a root left behind by a codeg that
@@ -725,7 +728,12 @@ pub fn probe_pid(pid: u32) -> PidState {
 /// spawn, so the agent has no pid yet. It is what lets a startup sweep tell
 /// "some other codeg owns this" from "its owner is gone".
 fn new_dir_name(pid: u32) -> String {
-    let suffix: String = uuid::Uuid::new_v4().simple().to_string().chars().take(8).collect();
+    let suffix: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect();
     format!("{pid}-{suffix}")
 }
 
@@ -931,7 +939,9 @@ mod tests {
         // `create` mints a new name on this error rather than adopting the
         // directory, so it has to keep arriving as `AlreadyExists`.
         assert_eq!(
-            create_leaf(&leaf).expect_err("second create must fail").kind(),
+            create_leaf(&leaf)
+                .expect_err("second create must fail")
+                .kind(),
             std::io::ErrorKind::AlreadyExists
         );
     }
@@ -979,13 +989,13 @@ mod tests {
     #[test]
     fn pid_parser_rejects_foreign_names() {
         for name in [
-            "_MEI123456",          // another PyInstaller app
-            "not-a-pid",           // suffix is not hex
-            "123-abc",             // suffix too short
-            "123-0123456789",      // suffix too long
-            "123",                 // no suffix at all
-            "",                    // empty
-            "-deadbeef",           // no pid
+            "_MEI123456",     // another PyInstaller app
+            "not-a-pid",      // suffix is not hex
+            "123-abc",        // suffix too short
+            "123-0123456789", // suffix too long
+            "123",            // no suffix at all
+            "",               // empty
+            "-deadbeef",      // no pid
         ] {
             assert_eq!(pid_from_dir_name(name), None, "{name} must not parse");
         }
@@ -1037,7 +1047,10 @@ mod tests {
             released: false,
         });
 
-        assert!(!is_registered(&name), "a dropped name must not stay claimed");
+        assert!(
+            !is_registered(&name),
+            "a dropped name must not stay claimed"
+        );
         assert!(!path.exists(), "and the directory must be gone");
     }
 

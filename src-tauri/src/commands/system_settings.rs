@@ -9,14 +9,14 @@ use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
+use crate::models::{
+    AvailableTerminalShells, SystemLanguageSettings, SystemProxySettings, SystemTerminalSettings,
+    TerminalShellOption,
+};
 #[cfg(feature = "tauri-runtime")]
 use crate::models::{
     CloseWindowBehavior, SystemAutostartSettings, SystemCloseBehaviorSettings,
     SystemCloseBehaviorSettingsView, SystemRenderingSettings,
-};
-use crate::models::{
-    AvailableTerminalShells, SystemLanguageSettings, SystemProxySettings, SystemTerminalSettings,
-    TerminalShellOption,
 };
 use crate::network::proxy;
 #[cfg(feature = "tauri-runtime")]
@@ -306,8 +306,7 @@ static CLOSE_BEHAVIOR_CACHE: std::sync::atomic::AtomicU8 =
 /// while the dialog is up, and every click re-enters `CloseRequested` — without
 /// this the user stacks a dialog per click and has to dismiss all of them.
 #[cfg(feature = "tauri-runtime")]
-static CLOSE_PROMPT_OPEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CLOSE_PROMPT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// When the outstanding claim was taken, so an unanswered one can expire.
 #[cfg(feature = "tauri-runtime")]
@@ -381,7 +380,8 @@ pub(crate) fn store_close_behavior_cache(behavior: CloseWindowBehavior) {
 pub(crate) async fn load_system_close_behavior_settings(
     conn: &DatabaseConnection,
 ) -> SystemCloseBehaviorSettings {
-    let raw = match app_metadata_service::get_value(conn, SYSTEM_CLOSE_BEHAVIOR_SETTINGS_KEY).await {
+    let raw = match app_metadata_service::get_value(conn, SYSTEM_CLOSE_BEHAVIOR_SETTINGS_KEY).await
+    {
         Ok(Some(raw)) => raw,
         Ok(None) => return SystemCloseBehaviorSettings::default(),
         Err(err) => {
@@ -1060,7 +1060,10 @@ mod tests {
         // An IPv6 literal keeps its brackets — without them the address is
         // indistinguishable from a host and a port.
         assert_eq!(normalized_url("[::1]:7890"), "http://[::1]:7890");
-        assert_eq!(normalized_url("  127.0.0.1:7890  "), "http://127.0.0.1:7890");
+        assert_eq!(
+            normalized_url("  127.0.0.1:7890  "),
+            "http://127.0.0.1:7890"
+        );
     }
 
     /// The repaired value is the user's own string with a prefix, never the
@@ -1073,7 +1076,10 @@ mod tests {
             normalized_url("proxy.corp.com:8080/gateway"),
             "http://proxy.corp.com:8080/gateway"
         );
-        assert_eq!(normalized_url("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+        assert_eq!(
+            normalized_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
     }
 
     /// Re-running normalization over its own output must be a no-op: the value

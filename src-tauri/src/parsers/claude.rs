@@ -218,10 +218,9 @@ enum PendingCommandVerdict {
 /// The stripping requirement excludes the `<local-command-caveat>` the CLI
 /// writes around local commands — same submission, but it instructs nothing.
 fn is_same_submission_injection(value: &serde_json::Value, prompt_id: Option<&str>) -> bool {
-    let (Some(command_prompt_id), Some(record_prompt_id)) = (
-        prompt_id,
-        value.get("promptId").and_then(|p| p.as_str()),
-    ) else {
+    let (Some(command_prompt_id), Some(record_prompt_id)) =
+        (prompt_id, value.get("promptId").and_then(|p| p.as_str()))
+    else {
         return false;
     };
     if command_prompt_id != record_prompt_id || !is_meta_message(value) {
@@ -338,9 +337,9 @@ fn pending_command_verdict(
                 .and_then(|c| c.as_array())
                 .is_some_and(|blocks| {
                     !blocks.is_empty()
-                        && blocks.iter().all(|b| {
-                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        })
+                        && blocks
+                            .iter()
+                            .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
                 });
             if tool_results_only || extract_user_content(value).is_empty() {
                 PendingCommandVerdict::Wait
@@ -520,7 +519,7 @@ fn push_goal_marker(messages: &mut Vec<UnifiedMessage>, goal: &PendingGoal) -> O
         duration_ms: None,
         model: None,
         completed_at: Some(goal.timestamp),
-    agent_message_id: None,
+        agent_message_id: None,
     });
     Some(marker.objective)
 }
@@ -872,9 +871,8 @@ fn compaction_post_tokens(turn: &MessageTurn) -> Option<u64> {
 /// usage.
 fn latest_claude_context_window_used_tokens(turns: &[MessageTurn]) -> Option<u64> {
     turns.iter().rev().find_map(|turn| {
-        compaction_post_tokens(turn).or_else(|| super::latest_turn_prompt_usage_tokens(
-            std::slice::from_ref(turn),
-        ))
+        compaction_post_tokens(turn)
+            .or_else(|| super::latest_turn_prompt_usage_tokens(std::slice::from_ref(turn)))
     })
 }
 
@@ -969,7 +967,6 @@ pub(crate) fn find_session_file_in(base_dir: &Path, session_id: &str) -> Option<
 }
 
 impl ClaudeParser {
-
     fn parse_jsonl_summary(
         &self,
         path: &PathBuf,
@@ -1561,7 +1558,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     },
                     prompt_id,
                 ));
@@ -1585,26 +1582,15 @@ impl ClaudeRecordAccumulator {
                     .and_then(|c| c.as_str())
                 {
                     if raw.trim_start().starts_with("<task-notification>") {
-                        if let Some(task_id) =
-                            capture_tag(task_notification_task_id_regex(), raw)
-                        {
+                        if let Some(task_id) = capture_tag(task_notification_task_id_regex(), raw) {
                             background_notifications.insert(
                                 task_id,
                                 BackgroundNotification {
-                                    status: capture_tag(
-                                        task_notification_status_regex(),
-                                        raw,
-                                    )
-                                    .unwrap_or_else(|| "completed".to_string()),
-                                    summary: capture_tag(
-                                        task_notification_summary_regex(),
-                                        raw,
-                                    ),
-                                    result: capture_tag(
-                                        task_notification_result_regex(),
-                                        raw,
-                                    )
-                                    .map(|r| truncate_str(&r, BACKGROUND_RESULT_MAX_CHARS)),
+                                    status: capture_tag(task_notification_status_regex(), raw)
+                                        .unwrap_or_else(|| "completed".to_string()),
+                                    summary: capture_tag(task_notification_summary_regex(), raw),
+                                    result: capture_tag(task_notification_result_regex(), raw)
+                                        .map(|r| truncate_str(&r, BACKGROUND_RESULT_MAX_CHARS)),
                                 },
                             );
                         }
@@ -1674,17 +1660,14 @@ impl ClaudeRecordAccumulator {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                         {
-                            if let Some(ack_tool_use_id) =
-                                content.iter().find_map(|b| match b {
-                                    ContentBlock::ToolResult {
-                                        tool_use_id: Some(id),
-                                        ..
-                                    } => Some(id.clone()),
-                                    _ => None,
-                                })
-                            {
-                                background_acks
-                                    .insert(ack_tool_use_id, task_id.to_string());
+                            if let Some(ack_tool_use_id) = content.iter().find_map(|b| match b {
+                                ContentBlock::ToolResult {
+                                    tool_use_id: Some(id),
+                                    ..
+                                } => Some(id.clone()),
+                                _ => None,
+                            }) {
+                                background_acks.insert(ack_tool_use_id, task_id.to_string());
                             }
                         }
                     }
@@ -1703,8 +1686,7 @@ impl ClaudeRecordAccumulator {
                                 let subagent_path =
                                     subagent_dir.join(format!("agent-{}.jsonl", agent_id));
                                 if subagent_path.exists() {
-                                    stats.tool_calls =
-                                        parse_subagent_tool_calls(&subagent_path).0;
+                                    stats.tool_calls = parse_subagent_tool_calls(&subagent_path).0;
                                 }
                             }
                         }
@@ -1730,7 +1712,7 @@ impl ClaudeRecordAccumulator {
                     duration_ms: None,
                     model: None,
                     completed_at: Some(timestamp),
-                agent_message_id: None,
+                    agent_message_id: None,
                 });
             }
             "assistant" => {
@@ -1978,7 +1960,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
             }
@@ -2099,7 +2081,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
             }
@@ -2928,7 +2910,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
             i += 1;
@@ -2942,7 +2924,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             });
             i += 1;
@@ -3214,7 +3196,10 @@ mod tests {
         lines.extend(compact_records("1", ""));
         let shapes = turn_shapes(&parse_lines("sess-compact-replay", &lines));
         assert_eq!(
-            shapes.iter().filter(|s| s.as_str() == "User:/compact").count(),
+            shapes
+                .iter()
+                .filter(|s| s.as_str() == "User:/compact")
+                .count(),
             1,
             "got {shapes:?}"
         );
@@ -3532,10 +3517,8 @@ mod tests {
         let settled = &previews.iter().find(|(id, _)| id == "toolu_01").unwrap().1;
         assert!(settled.starts_with(BACKGROUND_TASK_MARKER));
         assert!(!settled.contains("never quote"));
-        let payload: serde_json::Value = serde_json::from_str(
-            settled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap(),
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(settled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap()).unwrap();
         assert_eq!(payload["task_id"], "abc123");
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["summary"], "Agent \"Run pnpm build\" finished");
@@ -3544,10 +3527,8 @@ mod tests {
         // Unsettled: marker present, status null (frontend must NOT claim
         // "running" from the transcript alone — CC's zombie trap).
         let unsettled = &previews.iter().find(|(id, _)| id == "toolu_02").unwrap().1;
-        let payload: serde_json::Value = serde_json::from_str(
-            unsettled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap(),
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(unsettled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap()).unwrap();
         assert_eq!(payload["task_id"], "nores99");
         assert!(payload["status"].is_null());
     }
@@ -3614,7 +3595,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             },
             MessageTurn {
@@ -3631,7 +3612,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
-            agent_message_id: None,
+                agent_message_id: None,
                 outcome: None,
             },
         ];
@@ -4181,10 +4162,8 @@ mod tests {
     }
 
     fn parse_lines_into_detail(lines: &[String]) -> crate::models::ConversationDetail {
-        let path = std::env::temp_dir().join(format!(
-            "codeg-claude-usage-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("codeg-claude-usage-{}.jsonl", uuid::Uuid::new_v4()));
         let mut file = fs::File::create(&path).expect("create temp jsonl");
         for line in lines {
             writeln!(file, "{line}").unwrap();
@@ -4256,7 +4235,9 @@ mod tests {
             .iter()
             .filter_map(|t| t.usage.as_ref())
             .map(|u| {
-                u.input_tokens + u.output_tokens + u.cache_creation_input_tokens
+                u.input_tokens
+                    + u.output_tokens
+                    + u.cache_creation_input_tokens
                     + u.cache_read_input_tokens
             })
             .sum()
@@ -4690,8 +4671,10 @@ mod tests {
             })
             .to_string()
         };
-        let detail =
-            parse_lines_into_detail(&[line("a1", "2026-03-01T10:00:00Z"), line("a2", "2026-03-01T10:00:01Z")]);
+        let detail = parse_lines_into_detail(&[
+            line("a1", "2026-03-01T10:00:00Z"),
+            line("a2", "2026-03-01T10:00:01Z"),
+        ]);
         assert_eq!(total_usage_tokens(&detail), 30);
     }
 
@@ -4793,7 +4776,12 @@ mod tests {
             &session_launching("abc", 1),
             &[(
                 "abc",
-                vec![subagent_line("s1", "msg_sub", "2026-03-01T10:02:00Z", 7_000)],
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    7_000,
+                )],
             )],
         );
         assert_eq!(total_usage_tokens(&detail), 8_000);
@@ -4807,7 +4795,12 @@ mod tests {
             &session_launching("abc", 3),
             &[(
                 "abc",
-                vec![subagent_line("s1", "msg_sub", "2026-03-01T10:02:00Z", 7_000)],
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    7_000,
+                )],
             )],
         );
         assert_eq!(total_usage_tokens(&detail), 8_000);
@@ -4822,7 +4815,12 @@ mod tests {
             &session_launching("abc", 0),
             &[(
                 "orphan",
-                vec![subagent_line("s1", "msg_sub", "2026-03-01T10:02:00Z", 7_000)],
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    7_000,
+                )],
             )],
         );
         assert_eq!(total_usage_tokens(&detail), 8_000);
@@ -4849,7 +4847,12 @@ mod tests {
             )],
             &[(
                 "abc",
-                vec![subagent_line("s1", "msg_sub", "2026-03-01T10:02:00Z", 900_000)],
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    900_000,
+                )],
             )],
         );
         let stats = detail.session_stats.expect("session stats");
@@ -4862,15 +4865,13 @@ mod tests {
     fn sub_agent_spend_lands_on_the_turn_that_was_running_when_it_started() {
         // A session working across midnight must not report a sub-agent's
         // tokens on whichever day the session happened to end.
-        let mut lines = vec![
-            assistant_block_line(
-                "a1",
-                "msg_before",
-                "2026-03-01T23:00:00Z",
-                json!({"type": "tool_use", "id": "tu1", "name": "Task", "input": {}}),
-                json!({"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
-            ),
-        ];
+        let mut lines = vec![assistant_block_line(
+            "a1",
+            "msg_before",
+            "2026-03-01T23:00:00Z",
+            json!({"type": "tool_use", "id": "tu1", "name": "Task", "input": {}}),
+            json!({"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+        )];
         lines.push(assistant_block_line(
             "a2",
             "msg_after",
@@ -4883,7 +4884,12 @@ mod tests {
             &lines,
             &[(
                 "abc",
-                vec![subagent_line("s1", "msg_sub", "2026-03-01T23:10:00Z", 5_000)],
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T23:10:00Z",
+                    5_000,
+                )],
             )],
         );
         let carrying: Vec<_> = detail
@@ -4899,7 +4905,9 @@ mod tests {
             .collect();
         assert_eq!(total_usage_tokens(&detail), 5_030);
         assert!(
-            carrying.iter().any(|(ts, n)| ts.starts_with("2026-03-01") && *n == 5_010),
+            carrying
+                .iter()
+                .any(|(ts, n)| ts.starts_with("2026-03-01") && *n == 5_010),
             "sub-agent spend belongs to the turn that launched it, got {carrying:?}"
         );
     }
@@ -5183,9 +5191,10 @@ mod tests {
         ));
         // The hook instruction is addressed to the model, not spoken by the
         // user — it must stay out of the transcript.
-        assert!(!turns.iter().any(|t| t.blocks.iter().any(
-            |b| matches!(b, ContentBlock::Text { text } if text.contains("Stop hook"))
-        )));
+        assert!(!turns.iter().any(|t| t
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Stop hook")))));
 
         // Mid-turn (the model is still thinking, no assistant record yet): the
         // hook injection alone must already resolve it, because the transcript
@@ -5681,7 +5690,10 @@ mod tests {
         acc.finalize_background_lifecycle();
         let cards = goal_cards(&group_into_turns(acc.messages));
         assert_eq!(
-            cards.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            cards
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
             vec!["create_goal", "update_goal"]
         );
         assert_eq!(cards[1].1["status"], "complete");
@@ -5899,9 +5911,10 @@ mod tests {
         acc.finalize_background_lifecycle();
         let turns = group_into_turns(acc.messages);
         assert!(
-            !turns.iter().any(|t| t.blocks.iter().any(
-                |b| matches!(b, ContentBlock::Text { text } if text.contains("/model"))
-            )),
+            !turns.iter().any(|t| t
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("/model")))),
             "the cron owns that reply — the command must not claim its prompt slot"
         );
     }
@@ -5944,9 +5957,10 @@ mod tests {
         }
         acc.finalize_background_lifecycle();
         let turns = group_into_turns(acc.messages);
-        assert!(!turns.iter().any(|t| t.blocks.iter().any(
-            |b| matches!(b, ContentBlock::Text { text } if text.contains("/model"))
-        )));
+        assert!(!turns.iter().any(|t| t
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("/model")))));
     }
 
     /// A client-only command stays hidden even when the CLI writes several
@@ -5990,9 +6004,10 @@ mod tests {
         let turns = group_into_turns(acc.messages);
         let roles: Vec<_> = turns.iter().map(role_name).collect();
         assert_eq!(roles, vec!["user", "assistant"]);
-        assert!(!turns.iter().any(|t| t.blocks.iter().any(
-            |b| matches!(b, ContentBlock::Text { text } if text.contains("/model"))
-        )));
+        assert!(!turns.iter().any(|t| t
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("/model")))));
     }
 
     #[test]

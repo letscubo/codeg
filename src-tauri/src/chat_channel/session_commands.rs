@@ -423,7 +423,11 @@ pub async fn handle_callback(
                 .await;
         let raw = conv.title.as_deref().unwrap_or("");
         let cleaned = crate::parsers::openclaw::strip_openclaw_user_prefix(raw);
-        let title = if cleaned.is_empty() { raw } else { cleaned.as_str() };
+        let title = if cleaned.is_empty() {
+            raw
+        } else {
+            cleaned.as_str()
+        };
         return RichMessage::info(format!("#{conv_id} {title}")).with_title(match lang {
             Lang::ZhCn | Lang::ZhTw => "已切换会话",
             _ => "Switched conversation",
@@ -1960,21 +1964,28 @@ pub async fn handle_tasks(
     let ctx = match sender_context_service::get_or_create(db, channel_id, sender_id).await {
         Ok(c) => c,
         Err(e) => {
-            return SessionCommandMessage::Rich(RichMessage::error(format!("{}{e}", i18n::failed_to_load_context_label(lang))));
+            return SessionCommandMessage::Rich(RichMessage::error(format!(
+                "{}{e}",
+                i18n::failed_to_load_context_label(lang)
+            )));
         }
     };
     let Some(folder_id) = ctx.current_folder_id else {
-        return SessionCommandMessage::Rich(RichMessage::info(i18n::no_folder_selected(lang, prefix)));
+        return SessionCommandMessage::Rich(RichMessage::info(i18n::no_folder_selected(
+            lang, prefix,
+        )));
     };
 
-    let mut convs = match conversation_service::list_by_folder(db, folder_id, None, None, None, None)
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return SessionCommandMessage::Rich(RichMessage::error(format!("{}{e}", i18n::failed_to_list_sessions_label(lang))));
-        }
-    };
+    let mut convs =
+        match conversation_service::list_by_folder(db, folder_id, None, None, None, None).await {
+            Ok(c) => c,
+            Err(e) => {
+                return SessionCommandMessage::Rich(RichMessage::error(format!(
+                    "{}{e}",
+                    i18n::failed_to_list_sessions_label(lang)
+                )));
+            }
+        };
     convs.truncate(10);
 
     if convs.is_empty() {
@@ -2000,18 +2011,24 @@ pub async fn handle_tasks(
         };
         // Point the route at the chosen conversation. No process is spawned
         // here — the next message auto-resumes it, so switching is free.
-        let _ = sender_context_service::update_session(db, channel_id, sender_id, Some(conv.id), None)
-            .await;
+        let _ =
+            sender_context_service::update_session(db, channel_id, sender_id, Some(conv.id), None)
+                .await;
         let title = conv.title.as_deref().unwrap_or("(untitled)");
         let _ = manager; // reserved: title sync is topic-only today
-        // 标题剥掉 OpenClaw 注入的前缀 —— 用户看的是自己说过的话,不是工作目录
+                         // 标题剥掉 OpenClaw 注入的前缀 —— 用户看的是自己说过的话,不是工作目录
         let switched_title = crate::parsers::openclaw::strip_openclaw_user_prefix(title);
-        let switched_title = if switched_title.is_empty() { title } else { switched_title.as_str() };
-        return SessionCommandMessage::Rich(RichMessage::info(format!("#{} {}", conv.id, switched_title))
-            .with_title(match lang {
+        let switched_title = if switched_title.is_empty() {
+            title
+        } else {
+            switched_title.as_str()
+        };
+        return SessionCommandMessage::Rich(
+            RichMessage::info(format!("#{} {}", conv.id, switched_title)).with_title(match lang {
                 Lang::ZhCn | Lang::ZhTw => "已切换会话",
                 _ => "Switched conversation",
-            }));
+            }),
+        );
     }
 
     let _ = (conn_mgr, emitter, bridge, data_dir, target); // switching spawns nothing
@@ -2068,7 +2085,6 @@ pub async fn handle_tasks(
         callback_context: serde_json::json!({}),
     })
 }
-
 
 /// `/status` — the sender's current conversation, agent, model and whether a
 /// live process is attached right now (a reclaimed one auto-revives on the
@@ -2269,7 +2285,14 @@ async fn run_openclaw_cli(args: &[&str], stdin: Option<&str>) -> Result<String, 
 async fn openclaw_sessions_patch(session_key: &str, model: &str) -> Result<(), String> {
     let params = serde_json::json!({ "key": session_key, "model": model }).to_string();
     let stdout = run_openclaw_cli(
-        &["gateway", "call", "sessions.patch", "--params", &params, "--json"],
+        &[
+            "gateway",
+            "call",
+            "sessions.patch",
+            "--params",
+            &params,
+            "--json",
+        ],
         None,
     )
     .await?;
@@ -2299,8 +2322,7 @@ async fn openclaw_heal_whitelist() -> Result<(), String> {
     for id in ids {
         wl.insert(id, serde_json::json!({}));
     }
-    let patch =
-        serde_json::json!({ "agents": { "defaults": { "models": serde_json::Value::Object(wl) } } });
+    let patch = serde_json::json!({ "agents": { "defaults": { "models": serde_json::Value::Object(wl) } } });
     run_openclaw_cli(&["config", "patch", "--stdin"], Some(&patch.to_string()))
         .await
         .map(|_| ())
@@ -2409,7 +2431,9 @@ pub async fn handle_models(
             Lang::ZhCn | Lang::ZhTw => {
                 format!("{prefix}model <名称> 修改该 Agent 的模型(下一条消息生效)")
             }
-            _ => format!("{prefix}model <name> sets this agent's model (takes effect next message)"),
+            _ => {
+                format!("{prefix}model <name> sets this agent's model (takes effect next message)")
+            }
         });
     }
 

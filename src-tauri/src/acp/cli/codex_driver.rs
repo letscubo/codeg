@@ -628,8 +628,9 @@ fn request_failed(id: u64, error: &Value) -> CliTurnError {
         .unwrap_or("Codex rejected the request")
         .to_string();
     let code = match id {
-        ID_THREAD if message.to_ascii_lowercase().contains("not found")
-            || message.to_ascii_lowercase().contains("no rollout") =>
+        ID_THREAD
+            if message.to_ascii_lowercase().contains("not found")
+                || message.to_ascii_lowercase().contains("no rollout") =>
         {
             "cli_resume_failed"
         }
@@ -668,7 +669,11 @@ fn initialize_request() -> Value {
     })
 }
 
-pub(crate) fn thread_request(session_id: Option<&str>, cwd: &std::path::Path, model: Option<&str>) -> Value {
+pub(crate) fn thread_request(
+    session_id: Option<&str>,
+    cwd: &std::path::Path,
+    model: Option<&str>,
+) -> Value {
     let mut params = json!({
         "cwd": cwd.display().to_string(),
         "approvalPolicy": APPROVAL_POLICY,
@@ -764,7 +769,9 @@ pub(crate) fn build_input(
     if text_bytes > MAX_PROMPT_BYTES {
         return Err(CliTurnError {
             code: "prompt_too_large",
-            message: format!("the prompt is {text_bytes} bytes; Codex takes at most {MAX_PROMPT_BYTES}"),
+            message: format!(
+                "the prompt is {text_bytes} bytes; Codex takes at most {MAX_PROMPT_BYTES}"
+            ),
             details: None,
         });
     }
@@ -785,9 +792,16 @@ mod tests {
         assert_eq!(start["params"]["model"], "gpt-5.4-mini");
         assert!(start["params"].get("threadId").is_none());
 
-        let resume = thread_request(Some("01a0b54e-568c-7310-aa4d-f777c3663fb7"), Path::new("/ws"), None);
+        let resume = thread_request(
+            Some("01a0b54e-568c-7310-aa4d-f777c3663fb7"),
+            Path::new("/ws"),
+            None,
+        );
         assert_eq!(resume["method"], "thread/resume");
-        assert_eq!(resume["params"]["threadId"], "01a0b54e-568c-7310-aa4d-f777c3663fb7");
+        assert_eq!(
+            resume["params"]["threadId"],
+            "01a0b54e-568c-7310-aa4d-f777c3663fb7"
+        );
         assert!(resume["params"].get("model").is_none());
     }
 
@@ -802,7 +816,9 @@ mod tests {
         };
         let args = app_server_args(Some(&spec));
         assert_eq!(args[0], "app-server");
-        assert!(args.contains(&r#"mcp_servers.codeg-mcp.command="/opt/codeg/codeg-mcp""#.to_string()));
+        assert!(
+            args.contains(&r#"mcp_servers.codeg-mcp.command="/opt/codeg/codeg-mcp""#.to_string())
+        );
         assert!(args.contains(&r#"mcp_servers.codeg-mcp.args=["--parent","c1"]"#.to_string()));
         assert_eq!(app_server_args(None), vec!["app-server".to_string()]);
     }
@@ -823,24 +839,48 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
-        assert_eq!(input[0], json!({"type":"text","text":"hi","text_elements":[]}));
+        assert_eq!(
+            input[0],
+            json!({"type":"text","text":"hi","text_elements":[]})
+        );
         assert_eq!(input[1]["text"], "[x](https://x)");
-        assert_eq!(build_input(&[], tmp.path()).unwrap_err().code, "invalid_params");
+        assert_eq!(
+            build_input(&[], tmp.path()).unwrap_err().code,
+            "invalid_params"
+        );
     }
 
     #[test]
     fn server_requests_are_refused_and_responses_classified() {
-        assert!(matches!(classify(&json!({"id": 9, "method": "item/commandExecution/requestApproval"})), Message::ServerRequest(_)));
-        assert!(matches!(classify(&json!({"id": 3, "result": {}})), Message::Response(3)));
-        assert!(matches!(classify(&json!({"method": "turn/started"})), Message::Notification));
+        assert!(matches!(
+            classify(&json!({"id": 9, "method": "item/commandExecution/requestApproval"})),
+            Message::ServerRequest(_)
+        ));
+        assert!(matches!(
+            classify(&json!({"id": 3, "result": {}})),
+            Message::Response(3)
+        ));
+        assert!(matches!(
+            classify(&json!({"method": "turn/started"})),
+            Message::Notification
+        ));
         let refusal = refuse_request(json!(9));
         assert_eq!(refusal["id"], 9);
-        assert!(refusal["error"]["message"].as_str().unwrap().contains("approvals"));
+        assert!(refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("approvals"));
     }
 
     #[test]
     fn resume_errors_are_classified() {
-        assert_eq!(request_failed(ID_THREAD, &json!({"message": "thread not found"})).code, "cli_resume_failed");
-        assert_eq!(request_failed(ID_TURN, &json!({"message": "bad"})).code, "cli_execution_error");
+        assert_eq!(
+            request_failed(ID_THREAD, &json!({"message": "thread not found"})).code,
+            "cli_resume_failed"
+        );
+        assert_eq!(
+            request_failed(ID_TURN, &json!({"message": "bad"})).code,
+            "cli_execution_error"
+        );
     }
 }
