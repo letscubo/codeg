@@ -179,11 +179,14 @@ pub struct AcpPromptParams {
     pub conversation_id: Option<i32>,
     #[serde(default)]
     pub client_message_id: Option<String>,
+    /// fork(letscubo)专属: 本轮边生成边推到渠道(见 chat_channel::turn_relay)。
+    #[serde(default)]
+    pub outbound: Option<crate::chat_channel::turn_relay::OutboundSpec>,
 }
 
 pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
-    Json(params): Json<AcpPromptParams>,
+    Json(mut params): Json<AcpPromptParams>,
 ) -> Result<Json<()>, AppCommandError> {
     crate::web::handlers::cli::reject_cli_connection(
         &state.connection_manager,
@@ -191,6 +194,20 @@ pub async fn acp_prompt(
         "transport_mismatch",
     )
     .await?;
+    // 须在提交之前登记,这一轮的事件才不会漏
+    let relay_turn = match params.outbound.take() {
+        Some(spec) => {
+            crate::chat_channel::turn_relay::register_for_prompt(
+                &state,
+                &params.connection_id,
+                params.conversation_id,
+                spec,
+            )
+            .await
+        }
+        None => None,
+    };
+    let connection_id = params.connection_id.clone();
     state
         .connection_manager
         .send_prompt_linked_with_message_id(
@@ -204,6 +221,9 @@ pub async fn acp_prompt(
         )
         .await
         .map_err(|e| {
+            if let Some(turn_id) = &relay_turn {
+                crate::chat_channel::turn_relay::abort(&connection_id, turn_id);
+            }
             let message = e.to_string();
             // A concurrent send while a turn is in flight is an expected,
             // recoverable condition (409), not a server fault (500). The

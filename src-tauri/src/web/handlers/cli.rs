@@ -51,6 +51,9 @@ pub struct CliPromptParams {
     pub provider: Option<String>,
     #[serde(default)]
     pub runtime_env: Option<BTreeMap<String, String>>,
+    /// fork(letscubo)专属: 本轮边生成边推到渠道(见 chat_channel::turn_relay)。
+    #[serde(default)]
+    pub outbound: Option<crate::chat_channel::turn_relay::OutboundSpec>,
 }
 
 #[derive(Serialize)]
@@ -69,7 +72,7 @@ pub struct CliCancelParams {
 
 pub async fn cli_prompt(
     Extension(state): Extension<Arc<AppState>>,
-    Json(params): Json<CliPromptParams>,
+    Json(mut params): Json<CliPromptParams>,
 ) -> Result<Json<CliPromptResult>, AppCommandError> {
     if params.blocks.is_empty() {
         return Err(coded_invalid(
@@ -106,6 +109,19 @@ pub async fn cli_prompt(
         }
     }
 
+    // 须在提交之前登记,这一轮的事件才不会漏
+    let relay_turn = match params.outbound.take() {
+        Some(spec) => {
+            crate::chat_channel::turn_relay::register_for_prompt(
+                &state,
+                &connection_id,
+                params.conversation_id,
+                spec,
+            )
+            .await
+        }
+        None => None,
+    };
     let sent = manager
         .send_prompt_linked_with_message_id(
             &state.db,
@@ -120,6 +136,9 @@ pub async fn cli_prompt(
     let conversation_id = match sent {
         Ok(conversation_id) => conversation_id,
         Err(err) => {
+            if let Some(turn_id) = &relay_turn {
+                crate::chat_channel::turn_relay::abort(&connection_id, turn_id);
+            }
             if created {
                 let _ = manager.disconnect(&connection_id).await;
             }

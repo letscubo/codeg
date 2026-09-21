@@ -36,7 +36,7 @@ const CONFIG_CACHE_TTL_SECS: u64 = 30;
 
 const MESSAGE_LANGUAGE_KEY: &str = "chat_message_language";
 const EVENT_FILTER_KEY: &str = "chat_event_filter";
-const EVENT_WEBHOOKS_KEY: &str = "chat_event_webhooks";
+pub(crate) const EVENT_WEBHOOKS_KEY: &str = "chat_event_webhooks";
 
 /// Bumped whenever the Events-tab config (event filter, webhooks, message
 /// language) is written. The subscriber's config cache compares this against
@@ -419,12 +419,20 @@ async fn process_envelope(
                 ),
             }
         }
-        let payload = super::webhook::build_webhook_payload_with_context(
+        let mut payload = super::webhook::build_webhook_payload_with_context(
             &event_type,
             &envelope.connection_id,
             &msg,
             context.as_ref(),
         );
+        // fork(letscubo)专属: 本轮由 turn_relay 直推渠道 → 告诉平台别再自己发回复。
+        // turn_complete 是一轮的终点,取走认领;error 可能不是终点,只读。
+        if let Some(turn_id) = super::turn_relay::relay_turn_id_for(
+            &envelope.connection_id,
+            event_type == "turn_complete",
+        ) {
+            payload["relay_turn_id"] = serde_json::json!(turn_id);
+        }
         super::webhook::spawn_webhook_delivery(
             webhook_client.clone(),
             config.webhooks.clone(),

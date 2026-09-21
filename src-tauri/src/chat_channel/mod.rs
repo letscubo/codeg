@@ -12,5 +12,6 @@ pub mod session_commands;
 pub mod session_event_subscriber;
 pub mod tool_detail;
 pub mod traits;
+pub mod turn_relay;
 pub mod types;
 pub mod webhook;
