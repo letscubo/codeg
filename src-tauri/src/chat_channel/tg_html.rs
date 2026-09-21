@@ -17,8 +17,9 @@
 //! | `|表格|`                  | `<pre>` 原样等宽(Telegram 没有表格)          |
 //! | `---`                    | 一条横线字符                                 |
 //!
-//! 只用于**正式消息**。流式草稿里写到一半的 `**` 没闭合,解析必报错,草稿一律纯文本。
-//! 发送方在 Telegram 报解析错误时退回纯文本重发,所以这里转换不完美也不会丢消息。
+//! 正式消息和流式草稿都用它。只给**成对闭合**的标记加格式,写到一半的 `**` / `` ` `` 原样留着,
+//! 没闭合的代码块自动补上 —— 所以半截的草稿也产出合法 HTML。发送方在 Telegram 报解析错误时
+//! 退回纯文本重发,所以这里转换不完美也不会丢消息。
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -206,6 +207,14 @@ mod tests {
         assert_eq!(r("> 引用一\n> 引用二"), "<blockquote>引用一\n引用二</blockquote>");
         assert_eq!(r("---"), "──────────");
         assert_eq!(r("|a|b|\n|-|-|\n|1|2|"), "<pre>|a|b|\n|-|-|\n|1|2|</pre>");
+    }
+
+    #[test]
+    fn half_written_markdown_stays_valid_for_drafts() {
+        // 草稿里写到一半:没闭合的标记原样留着,不产出半截标签
+        assert_eq!(r("## 服务器 **内存状态"), "<b>服务器 **内存状态</b>");
+        assert_eq!(r("看 `df -h"), "看 `df -h");
+        assert_eq!(r("```bash\ndf -h"), "<pre><code class=\"language-bash\">df -h</code></pre>");
     }
 
     #[test]
