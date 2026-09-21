@@ -11,6 +11,7 @@ pub mod session_bridge;
 pub mod session_commands;
 pub mod session_event_subscriber;
 pub mod tool_detail;
+pub mod tg_html;
 pub mod traits;
 pub mod turn_relay;
 pub mod types;

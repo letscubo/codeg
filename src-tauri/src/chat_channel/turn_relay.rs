@@ -4,11 +4,15 @@
 //! `cli_prompt` 驱动这一轮,并在参数里带上 `outbound`(bot token + 私聊 chat_id)。本模块
 //! 按连接订阅这一轮的事件,**边生成边推到 Telegram**:
 //!
-//! - 开始:`sendMessageDraft(text="")` —— Telegram 显示「Thinking…」占位
-//! - 有新正文:更新草稿(`sendMessageDraft`,同一 draft_id 动画续写)
+//! - 还没有正文时,草稿显示一行状态:开始是「💭 思考中…」(平台按用户语言给),调用工具时换成
+//!   「🔧 <工具的一句话说明>」,工具结束回到「思考中」。空草稿在 Telegram 桌面端只是个「…」气泡,
+//!   看不出 agent 在干什么(2026-09-21 用户反馈)
+//! - 有新正文:草稿换成正文(`sendMessageDraft`,同一 draft_id 动画续写)
 //! - 插入工具调用:工具前那段正文先 `sendMessage` 正式发出,工具后的正文进新草稿
 //!   (与平台「一块一行」的历史一致)
 //! - 结束:剩余正文 `sendMessage` 正式发出(草稿随之消失);取消 / 失败补一句提示
+//! - 正式消息把 Markdown 转成 Telegram HTML(见 `tg_html`),Telegram 报解析错误就退回纯文本
+//!   重发;草稿写到一半的 `**` 没闭合,一律纯文本
 //!
 //! ## 节奏(2026-09-21 实测,A1-HM 托管 bot)
 //! - 草稿每秒 1 次连续 90 秒不限流;每秒 1.5 次会 429 → 两次草稿至少间隔 1 秒。
@@ -41,6 +45,8 @@ use tokio::time::Instant;
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::db::service::app_metadata_service;
+
+use super::tg_html;
 
 /// 两次草稿最小间隔(实测 1/s 稳定,1.5/s 触发 429)。
 const MIN_DRAFT_INTERVAL: Duration = Duration::from_secs(1);
@@ -97,10 +103,12 @@ impl OutboundSpec {
     }
 }
 
-/// 收尾提示语。平台按用户语言给;没给用英文。
+/// 状态 / 收尾提示语。平台按用户语言给;没给用英文。
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RelayTexts {
+    /// 还没有正文、也没在跑工具时草稿显示的状态。
+    pub thinking: String,
     pub failed: String,
     pub cancelled: String,
     pub empty: String,
@@ -109,6 +117,7 @@ pub struct RelayTexts {
 impl Default for RelayTexts {
     fn default() -> Self {
         Self {
+            thinking: "💭 Thinking…".into(),
             failed: "⚠️ Something went wrong while generating this reply. Please try again.".into(),
             cancelled: "⏹ Stopped.".into(),
             empty: "(No reply was generated.)".into(),
@@ -286,6 +295,26 @@ pub(crate) struct TurnReport {
     pub delivery_failed: bool,
 }
 
+/// 工具状态行最长多少字(工具说明是模型写的,可能很长)。
+const STATUS_MAX: usize = 120;
+
+/// 工具调用的状态行:优先用一句话说明,没有就用标题。
+fn tool_status(description: Option<&str>, title: &str) -> Option<String> {
+    let label = description
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| title.trim());
+    if label.is_empty() {
+        return None;
+    }
+    let mut chars = label.chars();
+    let mut clipped: String = chars.by_ref().take(STATUS_MAX).collect();
+    if chars.next().is_some() {
+        clipped.push('…');
+    }
+    Some(format!("🔧 {clipped}"))
+}
+
 pub(crate) struct TelegramTurn {
     pub api: Arc<dyn TgApi>,
     pub chat_id: i64,
@@ -303,13 +332,18 @@ impl TelegramTurn {
         let mut shown: Option<(u32, String)> = None;
         let mut last_draft: Option<Instant> = None;
         let mut blocked_until: Option<Instant> = None;
+        // 长回复被切成多条时,跨条的未闭合代码块(见 tg_html::render_chunk)
+        let mut fence: Option<String> = None;
+        // 没有正文时草稿显示的状态行,及它对应的工具(工具结束时回到「思考中」)
+        let mut status = self.texts.thinking.clone();
+        let mut status_tool: Option<String> = None;
 
-        // 立刻给出「Thinking…」占位
-        self.draft(&seg, &mut shown, &mut last_draft, &mut blocked_until)
+        // 立刻给出状态
+        self.draft(seg.segment(), self.display(&seg, &status), &mut shown, &mut last_draft, &mut blocked_until)
             .await;
 
         let outcome = loop {
-            let dirty = shown.as_ref() != Some(&(seg.segment(), seg.draft_text().to_string()));
+            let dirty = shown.as_ref() != Some(&(seg.segment(), self.display(&seg, &status)));
             let base = last_draft.unwrap_or_else(Instant::now);
             let mut next = if dirty {
                 base + MIN_DRAFT_INTERVAL
@@ -328,13 +362,33 @@ impl TelegramTurn {
                         AcpEvent::ContentDelta { text, parent_tool_use_id: None } => {
                             for m in seg.push(text) {
                                 sent_any = true;
-                                delivery_failed |= !self.message(&m).await;
+                                delivery_failed |= !self.message(&m, &mut fence).await;
                             }
                         }
-                        AcpEvent::ToolCall { .. } => {
+                        AcpEvent::ToolCall { tool_call_id, title, description, .. } => {
                             for m in seg.break_segment() {
                                 sent_any = true;
-                                delivery_failed |= !self.message(&m).await;
+                                delivery_failed |= !self.message(&m, &mut fence).await;
+                            }
+                            if let Some(line) = tool_status(description.as_deref(), title) {
+                                status = line;
+                                status_tool = Some(tool_call_id.clone());
+                            }
+                        }
+                        AcpEvent::ToolCallUpdate { tool_call_id, title, description, status: tool_state, .. }
+                            if status_tool.as_deref() == Some(tool_call_id.as_str()) =>
+                        {
+                            if matches!(tool_state.as_deref(), Some("completed" | "failed")) {
+                                status = self.texts.thinking.clone();
+                                status_tool = None;
+                            } else if let Some(line) = description
+                                .as_deref()
+                                .map(|d| tool_status(Some(d), ""))
+                                .or_else(|| title.as_deref().map(|t| tool_status(None, t)))
+                                .flatten()
+                            {
+                                // 首帧没带说明、更新时才补上的
+                                status = line;
                             }
                         }
                         AcpEvent::TurnComplete { stop_reason, .. } => {
@@ -352,7 +406,7 @@ impl TelegramTurn {
                     },
                 },
                 _ = tokio::time::sleep_until(next) => {
-                    self.draft(&seg, &mut shown, &mut last_draft, &mut blocked_until).await;
+                    self.draft(seg.segment(), self.display(&seg, &status), &mut shown, &mut last_draft, &mut blocked_until).await;
                 }
                 _ = tokio::time::sleep_until(deadline) => break Outcome::Failed,
             }
@@ -367,7 +421,7 @@ impl TelegramTurn {
 
         for m in seg.finish() {
             sent_any = true;
-            delivery_failed |= !self.message(&m).await;
+            delivery_failed |= !self.message(&m, &mut fence).await;
         }
         let note = match outcome {
             Outcome::Completed if !sent_any => Some(&self.texts.empty),
@@ -376,7 +430,7 @@ impl TelegramTurn {
             _ => None,
         };
         if let Some(note) = note {
-            delivery_failed |= !self.message(note).await;
+            delivery_failed |= !self.send_message(serde_json::json!({ "chat_id": self.chat_id, "text": note })).await.is_ok();
         }
         TurnReport {
             outcome,
@@ -384,24 +438,33 @@ impl TelegramTurn {
         }
     }
 
+    /// 草稿该显示什么:当前段有正文就显示正文,否则显示状态行。
+    fn display(&self, seg: &Segmenter, status: &str) -> String {
+        if seg.draft_text().trim().is_empty() {
+            status.to_string()
+        } else {
+            seg.draft_text().to_string()
+        }
+    }
+
     /// 更新草稿。纯展示:失败只记日志,429 记下冷却时间。
     async fn draft(
         &self,
-        seg: &Segmenter,
+        segment: u32,
+        text: String,
         shown: &mut Option<(u32, String)>,
         last_draft: &mut Option<Instant>,
         blocked_until: &mut Option<Instant>,
     ) {
-        let text = seg.draft_text().to_string();
         let body = serde_json::json!({
             "chat_id": self.chat_id,
-            "draft_id": self.draft_base + i64::from(seg.segment()),
+            "draft_id": self.draft_base + i64::from(segment),
             "text": text,
         });
         *last_draft = Some(Instant::now());
         match self.api.call("sendMessageDraft", body).await {
             Ok(()) => {
-                *shown = Some((seg.segment(), text));
+                *shown = Some((segment, text));
                 *blocked_until = None;
             }
             Err(TgError::RetryAfter(s)) => {
@@ -410,27 +473,44 @@ impl TelegramTurn {
             Err(TgError::Other(e)) => {
                 tracing::warn!("[TurnRelay] telegram draft failed: {e}");
                 // 当作已显示,免得每个 tick 都重试同一段;有新字会再发
-                *shown = Some((seg.segment(), text));
+                *shown = Some((segment, text));
             }
         }
     }
 
-    /// 发一条正式消息;429 等待后重试。返回是否发出。
-    async fn message(&self, text: &str) -> bool {
-        for _ in 0..SEND_RETRIES {
-            let body = serde_json::json!({ "chat_id": self.chat_id, "text": text });
-            match self.api.call("sendMessage", body).await {
-                Ok(()) => return true,
-                Err(TgError::RetryAfter(s)) => {
-                    tokio::time::sleep(Duration::from_secs(s).min(MAX_RETRY_WAIT)).await;
-                }
-                Err(TgError::Other(e)) => {
-                    tracing::warn!("[TurnRelay] telegram sendMessage failed: {e}");
-                    return false;
+    /// 发一条正式消息:Markdown 转 Telegram HTML 发;Telegram 拒收(解析错误等)就退回纯文本
+    /// 再发一次。返回是否发出。
+    async fn message(&self, md: &str, fence: &mut Option<String>) -> bool {
+        let html = tg_html::render_chunk(md, fence);
+        let formatted = serde_json::json!({ "chat_id": self.chat_id, "text": html, "parse_mode": "HTML" });
+        match self.send_message(formatted).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("[TurnRelay] telegram HTML message rejected ({e}); retrying as plain text");
+                let plain = serde_json::json!({ "chat_id": self.chat_id, "text": md });
+                match self.send_message(plain).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("[TurnRelay] telegram sendMessage failed: {e}");
+                        false
+                    }
                 }
             }
         }
-        false
+    }
+
+    /// sendMessage;429 按 Telegram 给的秒数等待后重试。
+    async fn send_message(&self, body: serde_json::Value) -> Result<(), String> {
+        for _ in 0..SEND_RETRIES {
+            match self.api.call("sendMessage", body.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(TgError::RetryAfter(s)) => {
+                    tokio::time::sleep(Duration::from_secs(s).min(MAX_RETRY_WAIT)).await;
+                }
+                Err(TgError::Other(e)) => return Err(e),
+            }
+        }
+        Err("rate limited".into())
     }
 }
 
@@ -720,6 +800,8 @@ mod tests {
     struct FakeTg {
         calls: StdMutex<Vec<(String, String)>>,
         fail_messages: bool,
+        /// 模拟 Telegram 拒收 HTML(can't parse entities)
+        reject_html: bool,
     }
 
     #[async_trait]
@@ -729,6 +811,9 @@ mod tests {
             self.calls.lock().unwrap().push((method.to_string(), text));
             if self.fail_messages && method == "sendMessage" {
                 return Err(TgError::Other("Forbidden".into()));
+            }
+            if self.reject_html && body.get("parse_mode").is_some() {
+                return Err(TgError::Other("Bad Request: can't parse entities".into()));
             }
             Ok(())
         }
@@ -812,8 +897,8 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Completed);
         assert!(!r.delivery_failed);
         assert_eq!(messages(&api), vec!["我先看看", "结论是 42"]);
-        // 第一次调用就是「Thinking…」占位
-        assert_eq!(api.calls.lock().unwrap()[0], ("sendMessageDraft".into(), String::new()));
+        // 第一次调用就是「思考中」状态,不是空草稿
+        assert_eq!(api.calls.lock().unwrap()[0], ("sendMessageDraft".into(), RelayTexts::default().thinking));
     }
 
     #[tokio::test(start_paused = true)]
@@ -843,6 +928,89 @@ mod tests {
         let r = run_with(Arc::clone(&api), vec![delta("半截")]).await; // tx 已丢 → 关闭
         assert_eq!(r.outcome, Outcome::Aborted);
         assert!(messages(&api).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn markdown_is_sent_as_html_and_falls_back_to_plain() {
+        let api = Arc::new(FakeTg::default());
+        run_with(Arc::clone(&api), vec![delta("**总结**:磁盘 `/` 充裕"), complete("end_turn")]).await;
+        assert_eq!(messages(&api), vec!["<b>总结</b>:磁盘 <code>/</code> 充裕"]);
+
+        let api = Arc::new(FakeTg {
+            reject_html: true,
+            ..Default::default()
+        });
+        let r = run_with(Arc::clone(&api), vec![delta("**总结**"), complete("end_turn")]).await;
+        assert!(!r.delivery_failed);
+        // 先试 HTML 被拒,再以原文纯文本发出
+        assert_eq!(messages(&api), vec!["<b>总结</b>", "**总结**"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_status_shows_while_running_then_back_to_thinking() {
+        let api = Arc::new(FakeTg::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let turn = TelegramTurn {
+            api: Arc::clone(&api) as Arc<dyn TgApi>,
+            chat_id: 1,
+            draft_base: 100,
+            texts: RelayTexts::default(),
+        };
+        let handle = tokio::spawn(turn.run(rx));
+        let drafts = |api: &FakeTg| {
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "sendMessageDraft")
+                .map(|(_, t)| t.clone())
+                .collect::<Vec<_>>()
+        };
+        tx.send(env(AcpEvent::ToolCall {
+            tool_call_id: "t1".into(),
+            title: "df -h".into(),
+            kind: "execute".into(),
+            status: "in_progress".into(),
+            tool_name: Some("Bash".into()),
+            description: Some("查看磁盘使用情况".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        }))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(drafts(&api).last().unwrap(), "🔧 查看磁盘使用情况");
+        tx.send(env(AcpEvent::ToolCallUpdate {
+            tool_call_id: "t1".into(),
+            title: None,
+            tool_name: None,
+            description: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        }))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(drafts(&api).last().unwrap(), &RelayTexts::default().thinking);
+        tx.send(complete("end_turn")).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn tool_status_prefers_description_and_clips() {
+        assert_eq!(tool_status(Some("读取 a.txt"), "cat a.txt").unwrap(), "🔧 读取 a.txt");
+        assert_eq!(tool_status(None, "cat a.txt").unwrap(), "🔧 cat a.txt");
+        assert_eq!(tool_status(Some("  "), "").as_deref(), None);
+        let long = "x".repeat(200);
+        assert_eq!(tool_status(Some(&long), "").unwrap().chars().count(), 2 + STATUS_MAX + 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -880,7 +1048,7 @@ mod tests {
                 .map(|(_, t)| t.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(drafts(&api), vec!["".to_string(), "abcd".to_string()]);
+        assert_eq!(drafts(&api), vec![RelayTexts::default().thinking, "abcd".to_string()]);
         // 没有新字:20 秒后续一次同样的草稿
         tokio::time::sleep(Duration::from_secs(21)).await;
         assert_eq!(drafts(&api).last().unwrap(), "abcd");
