@@ -15,12 +15,13 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
     BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerResponse,
-    BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
+    BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerUploadRequest,
     BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
 use crate::acp::delegation::types::{
@@ -30,7 +31,6 @@ use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 #[cfg(unix)]
 use crate::acp::scratch_dir::SUN_PATH_CAP;
-use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use crate::models::AgentType;
@@ -41,7 +41,6 @@ use serde_json::Value;
 /// keeps running past this; the LLM simply re-issues the wait. An explicit
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
-
 
 /// The bound-but-not-yet-served socket handed from [`DelegationListener::bind`]
 /// to [`DelegationListener::accept_loop`]. A UDS listener on unix; on Windows,
@@ -146,6 +145,9 @@ pub struct DelegationListener {
     /// feature flags at call time, so flipping the setting off stops writes
     /// from sessions that were launched while it was on.
     pub authoring: Arc<dyn ChatAuthoringAccess>,
+    /// fork(letscubo)专属: 交付产物上传(`upload_file` 工具)。与其它 arm 一样只做
+    /// token 校验 —— 上传不属于任何会话, 平台按实例决定文件落在谁的命名空间下。
+    pub uploads: Arc<dyn crate::commands::myclaw_upload::ArtifactUploadAccess>,
 }
 
 impl DelegationListener {
@@ -159,6 +161,7 @@ impl DelegationListener {
         session_info: Arc<dyn SessionInfoAccess>,
         tasks: Arc<dyn WorkTaskToolAccess>,
         authoring: Arc<dyn ChatAuthoringAccess>,
+        uploads: Arc<dyn crate::commands::myclaw_upload::ArtifactUploadAccess>,
     ) -> Arc<Self> {
         Arc::new(Self {
             broker,
@@ -169,6 +172,7 @@ impl DelegationListener {
             session_info,
             tasks,
             authoring,
+            uploads,
         })
     }
 
@@ -547,6 +551,11 @@ impl DelegationListener {
             BrokerMessage::CreateWorkTask(req) => {
                 authoring_response(self.process_create_work_task(req).await)?
             }
+            BrokerMessage::UploadFile(req) => {
+                // 一次有界的网络往返(换预签名 + 直传), 不长轮询、无可取消的副作用:
+                // 与 SessionInfo 同类, 直接在这里等完再回。
+                upload_response(self.process_upload(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -827,6 +836,14 @@ impl DelegationListener {
         self.authoring.create_automation(ctx, req.spec).await
     }
 
+    /// 校验 token 后把上传交给实现。失败原因原样回给模型 —— 它要据此决定重试还是收手。
+    async fn process_upload(&self, req: BrokerUploadRequest) -> Result<String, String> {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return Err("invalid token".to_string());
+        }
+        self.uploads.upload(&req.path).await
+    }
+
     /// Validate the token and hand the task spec to the authoring impl.
     async fn process_create_work_task(&self, req: BrokerCreateWorkTaskRequest) -> AuthoringOutcome {
         let Some(ctx) = self.authoring_context(&req.token).await else {
@@ -974,6 +991,15 @@ fn task_ack_response(ack: TaskReportAck) -> std::io::Result<BrokerResponse> {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
         })?,
     })
+}
+
+/// fork(letscubo)专属: 把上传结果编成 `{ ok, url }` / `{ ok: false, error }`。
+fn upload_response(result: Result<String, String>) -> std::io::Result<BrokerResponse> {
+    let outcome = match result {
+        Ok(url) => serde_json::json!({ "ok": true, "url": url }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    };
+    Ok(BrokerResponse { outcome })
 }
 
 /// Serialize an [`AuthoringOutcome`] into a [`BrokerResponse`] for the
@@ -1352,6 +1378,16 @@ mod tests {
         broker
     }
 
+    /// 上传桩: 单测不碰网络, 只要有个实现能装进 listener。
+    struct StubUploads;
+
+    #[async_trait::async_trait]
+    impl crate::commands::myclaw_upload::ArtifactUploadAccess for StubUploads {
+        async fn upload(&self, path: &str) -> Result<String, String> {
+            Ok(format!("https://example.invalid/{path}"))
+        }
+    }
+
     fn make_listener(
         broker: Arc<DelegationBroker>,
         tokens: Arc<TokenRegistry>,
@@ -1366,6 +1402,7 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
+            Arc::new(StubUploads),
         )
     }
 
@@ -1388,6 +1425,7 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
+            Arc::new(StubUploads),
         )
     }
 
@@ -1411,6 +1449,7 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
+            Arc::new(StubUploads),
         )
     }
 
@@ -1433,6 +1472,7 @@ mod tests {
             session_info,
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
+            Arc::new(StubUploads),
         )
     }
 
@@ -1457,6 +1497,7 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             Arc::new(StubTaskTools),
             authoring,
+            Arc::new(StubUploads),
         )
     }
 

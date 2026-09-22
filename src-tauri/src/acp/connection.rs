@@ -5013,6 +5013,10 @@ struct CompanionFeatureFlags {
     automations: bool,
     /// `create_work_task`, gated by the chat-authoring setting.
     taskboard: bool,
+    /// fork(letscubo)专属: `upload_file`。没有设置开关 —— 它只对**平台托管**的实例
+    /// 有意义,而那个判定(有没有指向平台的出站 webhook)只有调用那一刻才看得到,
+    /// 就放在工具里做:非托管实例调一次会拿到一句明确的原因,而不是一个消失的工具。
+    uploads: bool,
 }
 
 /// The `--features` value for a companion launch, or `None` when no group is
@@ -5042,6 +5046,9 @@ fn companion_features_arg(flags: CompanionFeatureFlags) -> Option<String> {
     }
     if flags.taskboard {
         features.push("taskboard");
+    }
+    if flags.uploads {
+        features.push("uploads");
     }
     if features.is_empty() {
         return None;
@@ -5186,6 +5193,7 @@ where
         tasks: tasks_enabled,
         automations: authoring.automations_enabled,
         taskboard: authoring.work_tasks_enabled,
+        uploads: true,
     };
     // `None` (no feature enabled) short-circuits BEFORE the binary lookup, the
     // token registration and the server append: there is no companion to launch,
@@ -23877,8 +23885,11 @@ mod tests {
                 tasks: true,
                 automations: true,
                 taskboard: true,
+                uploads: true,
             }),
-            Some("delegation,feedback,ask,sessions,tasks,automations,taskboard".to_string())
+            Some(
+                "delegation,feedback,ask,sessions,tasks,automations,taskboard,uploads".to_string()
+            )
         );
     }
 

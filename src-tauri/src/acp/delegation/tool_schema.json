@@ -274,5 +274,20 @@
         }
       }
     }
+  },
+  {
+    "name": "upload_file",
+    "description": "Upload a finished file and get a public download link the user can open. The user CANNOT open a path on this machine — a file path, an attachment or a MEDIA: marker delivers nothing, so every deliverable ends with this tool and you put the returned link in your reply as a plain markdown link. Call it once per file, after the file is fully written and flushed to disk (a tool that keeps the document open in memory must save or close it first, or you upload stale bytes). Any file type is accepted, up to 200MB. On failure the error says why; do not fall back to curl or to handing out a path.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path of the file to upload, e.g. /home/ubuntu/workspace/deck.pptx"
+        }
+      },
+      "additionalProperties": false
+    }
   }
 ]

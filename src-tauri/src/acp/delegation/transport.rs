@@ -244,6 +244,14 @@ pub struct BrokerCreateWorkTaskRequest {
     pub spec: NewWorkTaskSpec,
 }
 
+/// fork(letscubo)专属: 把一个本地文件传到 MyClaw 的对象存储(`upload_file` 工具)。
+/// 路径由 companion 原样转发; 认证与端点在父进程侧从 webhook 配置派生。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerUploadRequest {
+    pub token: String,
+    pub path: String,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
@@ -263,6 +271,8 @@ pub enum BrokerMessage {
     TaskComplete(BrokerTaskCompleteRequest),
     CreateAutomation(BrokerCreateAutomationRequest),
     CreateWorkTask(BrokerCreateWorkTaskRequest),
+    /// fork(letscubo)专属: 交付产物上传。
+    UploadFile(BrokerUploadRequest),
     /// Liveness probe. Unlike every other variant this one is NOT sent by a
     /// companion — it comes from codeg's own service-status check
     /// (`acp::delegation::service`), which is why it carries no `token`: a
@@ -428,6 +438,14 @@ pub async fn client_session_round_trip(
     req: &BrokerSessionRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::SessionInfo(req.clone())).await
+}
+
+/// fork(letscubo)专属: 转发一次上传并读回 `{ ok, url | error }`。
+pub async fn client_upload_round_trip(
+    socket_path: &str,
+    req: &BrokerUploadRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::UploadFile(req.clone())).await
 }
 
 /// Dispatch a `task_progress` report and read back the `{ recorded }` ack.

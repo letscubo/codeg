@@ -378,6 +378,11 @@ async fn async_main() -> ExitCode {
                 state.emitter.clone(),
                 chat_authoring_config.clone(),
             )),
+            Arc::new(codeg_lib::commands::myclaw_upload::DbArtifactUpload::new(
+                Arc::new(codeg_lib::db::AppDatabase {
+                    conn: state.db.conn.clone(),
+                }),
+            )),
         );
         // Bind through the service handle rather than a bare `listener.run`
         // spawn: it keeps the bind error and the accept-loop handle around, so

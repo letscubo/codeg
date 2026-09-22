@@ -274,6 +274,13 @@ mod tests {
     }
 
     #[async_trait]
+    impl crate::commands::myclaw_upload::ArtifactUploadAccess for Stub {
+        async fn upload(&self, _path: &str) -> Result<String, String> {
+            Err("stub".to_string())
+        }
+    }
+
+    #[async_trait]
     impl ParentSessionLookup for Stub {
         async fn current_conversation_id(&self, _parent_connection_id: &str) -> Option<i32> {
             None
@@ -413,6 +420,7 @@ mod tests {
         let listener = DelegationListener::new(
             broker,
             Arc::new(TokenRegistry::default()),
+            Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),

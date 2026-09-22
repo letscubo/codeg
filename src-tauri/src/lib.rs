@@ -984,6 +984,13 @@ mod tauri_app {
                                 chat_authoring_config.clone(),
                             ),
                         ),
+                        std::sync::Arc::new(
+                            crate::commands::myclaw_upload::DbArtifactUpload::new(
+                                std::sync::Arc::new(db::AppDatabase {
+                                    conn: db_conn.clone(),
+                                }),
+                            ),
+                        ),
                     );
                     // Bind through the service handle rather than a bare
                     // `listener.run` spawn: it keeps the bind error and the

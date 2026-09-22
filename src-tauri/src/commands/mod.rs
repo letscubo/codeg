@@ -26,6 +26,8 @@ pub mod mcp;
 pub mod mcp_service;
 pub mod model_provider;
 pub mod office_tools;
+// fork(letscubo)专属: 交付产物直传 MyClaw 对象存储(MCP 工具 upload_file 用)
+pub mod myclaw_upload;
 pub mod open_in;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;

@@ -49,11 +49,11 @@ use crate::acp::delegation::transport::{
     client_create_automation_round_trip, client_create_work_task_round_trip,
     client_feedback_round_trip, client_resume_task_round_trip, client_round_trip,
     client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
-    client_task_progress_round_trip, BrokerAskRequest, BrokerCancelRequest,
+    client_task_progress_round_trip, client_upload_round_trip, BrokerAskRequest, BrokerCancelRequest,
     BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerCreateAutomationRequest,
     BrokerCreateWorkTaskRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
     BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    BrokerTaskCompleteRequest, BrokerTaskProgressRequest, BrokerUploadRequest,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
@@ -153,6 +153,8 @@ pub struct CompanionFeatures {
     pub automations: bool,
     /// `create_work_task` — queue a card on the work-task board from chat.
     pub taskboard: bool,
+    /// fork(letscubo)专属: `upload_file` —— 交付产物传到 MyClaw 的对象存储。
+    pub uploads: bool,
 }
 
 impl CompanionFeatures {
@@ -172,6 +174,7 @@ impl CompanionFeatures {
                 tasks: false,
                 automations: false,
                 taskboard: false,
+                uploads: false,
             };
         };
         let mut f = Self {
@@ -182,6 +185,7 @@ impl CompanionFeatures {
             tasks: false,
             automations: false,
             taskboard: false,
+            uploads: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -192,6 +196,7 @@ impl CompanionFeatures {
                 "tasks" => f.tasks = true,
                 "automations" => f.automations = true,
                 "taskboard" => f.taskboard = true,
+                "uploads" => f.uploads = true,
                 _ => {}
             }
         }
@@ -207,6 +212,7 @@ impl CompanionFeatures {
             "task_progress" | "task_complete" => self.tasks,
             "create_automation" => self.automations,
             "create_work_task" => self.taskboard,
+            "upload_file" => self.uploads,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation"
             | "resume_delegation" => self.delegation,
             _ => false,
@@ -684,6 +690,30 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_session_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_session_result).await
+        }
+        "upload_file" => {
+            // 路径是必填的非空字符串; 其余校验(存在、大小、类型)在父进程那边做 ——
+            // 那里才看得到文件, 而且要把「为什么不行」原样回给模型。
+            let path = arguments
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let Some(path) = path else {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "upload_file requires a non-empty `path` string (the file to upload)",
+                ));
+            };
+            let req = BrokerUploadRequest {
+                token: ctx.token.clone(),
+                path,
+            };
+            // 没有 external_handle: 取消只是不再要这次结果, 父进程那边没有要拆的东西。
+            let round_trip = Box::pin(async move { client_upload_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_upload_result).await
         }
         "task_progress" => {
             let message = arguments
@@ -1375,6 +1405,32 @@ pub fn render_session_result(outcome: &Value) -> Value {
     })
 }
 
+/// fork(letscubo)专属: 把 `{ ok, url | error }` 渲染成 `tools/call` 结果。
+///
+/// 成功只回链接一行 —— 模型要把它原样放进回复里。失败回 `isError`, 正文是父进程给的
+/// 那句原因(平台拒了 / 文件太大 / 路径读不到), 让模型据此决定重试还是收手。
+pub fn render_upload_result(outcome: &Value) -> Value {
+    let ok = outcome.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let text = if ok {
+        outcome
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        outcome
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the upload failed")
+            .to_string()
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": !ok,
+        "structuredContent": outcome.clone(),
+    })
+}
+
 /// Map a `task_progress` / `task_complete` round-trip outcome (a
 /// `{ recorded, note? }` ack) into an MCP `tools/call` result. A report that
 /// could not be attributed (no active work task for this session) is readable
@@ -1583,6 +1639,7 @@ mod tests {
             tasks: false,
             automations: false,
             taskboard: false,
+            uploads: false,
         })
     }
 
@@ -2174,6 +2231,7 @@ mod tests {
         tasks: false,
         automations: false,
         taskboard: false,
+        uploads: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2183,6 +2241,7 @@ mod tests {
         tasks: false,
         automations: false,
         taskboard: false,
+        uploads: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2192,6 +2251,7 @@ mod tests {
         tasks: false,
         automations: false,
         taskboard: false,
+        uploads: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2201,6 +2261,7 @@ mod tests {
         tasks: false,
         automations: false,
         taskboard: false,
+        uploads: false,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -2529,6 +2590,70 @@ mod tests {
         assert!(e.message.contains("unknown tool"));
     }
 
+    // -- upload_file(fork 专属)feature gating + parsing + rendering --------
+
+    const UPLOADS_ONLY: CompanionFeatures = CompanionFeatures {
+        delegation: false,
+        feedback: false,
+        ask: false,
+        sessions: false,
+        tasks: false,
+        automations: false,
+        taskboard: false,
+        uploads: true,
+    };
+
+    #[tokio::test]
+    async fn upload_file_listed_only_under_its_feature() {
+        let line = json!({ "jsonrpc": "2.0", "id": 40, "method": "tools/list" }).to_string();
+        let off = list_tool_names(dispatch_for_test(&line).await);
+        assert!(!off.contains(&"upload_file".to_string()));
+        let on = list_tool_names(dispatch_with_features(UPLOADS_ONLY, &line).await);
+        assert_eq!(on, vec!["upload_file".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn upload_file_spawns_the_round_trip_when_path_is_given() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+            "params": { "name": "upload_file", "arguments": { "path": "/tmp/deck.pptx" } }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(UPLOADS_ONLY, &line).await,
+            LineAction::Spawn(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn upload_file_missing_or_blank_path_rejected_synchronously() {
+        for args in [json!({}), json!({ "path": "   " }), json!({ "path": 5 })] {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+                "params": { "name": "upload_file", "arguments": args }
+            })
+            .to_string();
+            let resp = unwrap_respond(dispatch_with_features(UPLOADS_ONLY, &line).await);
+            let e = resp.error.expect("a missing path must be rejected");
+            assert_eq!(e.code, -32602);
+            assert!(e.message.contains("path"));
+        }
+    }
+
+    #[test]
+    fn render_upload_result_gives_the_link_on_success_and_errors_otherwise() {
+        let ok = render_upload_result(&json!({ "ok": true, "url": "https://cdn/x.pptx" }));
+        assert_eq!(ok["isError"], json!(false));
+        assert_eq!(ok["content"][0]["text"], json!("https://cdn/x.pptx"));
+
+        let bad = render_upload_result(&json!({ "ok": false, "error": "file is 300000000 bytes" }));
+        assert_eq!(bad["isError"], json!(true));
+        assert!(bad["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("300000000"));
+    }
+
     // -- chat authoring: feature gating + parsing + rendering ---------------
 
     const AUTOMATIONS_ONLY: CompanionFeatures = CompanionFeatures {
@@ -2539,6 +2664,7 @@ mod tests {
         tasks: false,
         automations: true,
         taskboard: false,
+        uploads: false,
     };
     const TASKBOARD_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2548,6 +2674,7 @@ mod tests {
         tasks: false,
         automations: false,
         taskboard: true,
+        uploads: false,
     };
 
     /// The two authoring groups gate independently: enabling one must not
