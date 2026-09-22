@@ -168,10 +168,10 @@ pub(crate) fn render_patch(
     let mut inserts: Vec<Value> = Vec::new();
     if let Some(companion) = &profile.companion {
         inserts.push(json!({
-            "id": "codeg-mcp",
+            "id": crate::acp::delegation::companion::COMPANION_SERVER_NAME,
             "name": "@deepseek-ai/dsh-mcp-client",
             "config": {
-                "serverName": "codeg-mcp",
+                "serverName": crate::acp::delegation::companion::COMPANION_SERVER_NAME,
                 "transport": "stdio",
                 "command": companion.command.display().to_string(),
                 "args": companion.args,
@@ -183,7 +183,7 @@ pub(crate) fn render_patch(
         inserts.push(json!({
             "id": "codeg-tool-search",
             "name": profile.plugin_path.display().to_string(),
-            "config": { "mode": profile.tool_search_mode, "exemptServers": ["codeg-mcp"] },
+            "config": { "mode": profile.tool_search_mode, "exemptServers": [crate::acp::delegation::companion::COMPANION_SERVER_NAME] },
         }));
     }
     if !inserts.is_empty() {
@@ -269,11 +269,14 @@ mod tests {
         assert_eq!(parsed[0]["id"], "agent-default-model");
         assert_eq!(parsed[0]["config"]["model"], "kimi-k3");
         let inserts = parsed[1]["insert"].as_sequence().unwrap();
-        assert_eq!(inserts[0]["config"]["serverName"], "codeg-mcp");
+        assert_eq!(inserts[0]["id"], "myclaw");
+        assert_eq!(inserts[0]["config"]["serverName"], "myclaw");
         assert_eq!(inserts[0]["config"]["transport"], "stdio");
         assert_eq!(inserts[0]["config"]["args"][1], "t");
         assert_eq!(inserts[1]["name"], "/h/plugins/codeg-tool-search.mjs");
         assert_eq!(inserts[1]["config"]["mode"], "auto");
+        // 豁免名单必须与 serverName 同名,否则委派工具会被 tool-search 当普通 MCP 工具藏起来
+        assert_eq!(inserts[1]["config"]["exemptServers"][0], inserts[0]["config"]["serverName"]);
     }
 
     #[test]

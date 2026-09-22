@@ -651,9 +651,10 @@ pub(crate) fn app_server_args(companion: Option<&CompanionLaunchSpec>) -> Vec<St
         let command = json!(companion.command.display().to_string()).to_string();
         let list = json!(companion.args).to_string();
         args.push("-c".to_string());
-        args.push(format!("mcp_servers.codeg-mcp.command={command}"));
+        let server = crate::acp::delegation::companion::COMPANION_SERVER_NAME;
+        args.push(format!("mcp_servers.{server}.command={command}"));
         args.push("-c".to_string());
-        args.push(format!("mcp_servers.codeg-mcp.args={list}"));
+        args.push(format!("mcp_servers.{server}.args={list}"));
     }
     args
 }
@@ -663,7 +664,11 @@ fn initialize_request() -> Value {
         "id": ID_INITIALIZE,
         "method": "initialize",
         "params": {
-            "clientInfo": { "name": "codeg", "title": "codeg", "version": env!("CARGO_PKG_VERSION") },
+            "clientInfo": {
+                "name": crate::acp::delegation::companion::CLIENT_NAME,
+                "title": crate::acp::delegation::companion::CLIENT_TITLE,
+                "version": env!("CARGO_PKG_VERSION"),
+            },
             "capabilities": null,
         },
     })
@@ -817,9 +822,9 @@ mod tests {
         let args = app_server_args(Some(&spec));
         assert_eq!(args[0], "app-server");
         assert!(
-            args.contains(&r#"mcp_servers.codeg-mcp.command="/opt/codeg/codeg-mcp""#.to_string())
+            args.contains(&r#"mcp_servers.myclaw.command="/opt/codeg/codeg-mcp""#.to_string())
         );
-        assert!(args.contains(&r#"mcp_servers.codeg-mcp.args=["--parent","c1"]"#.to_string()));
+        assert!(args.contains(&r#"mcp_servers.myclaw.args=["--parent","c1"]"#.to_string()));
         assert_eq!(app_server_args(None), vec!["app-server".to_string()]);
     }
 

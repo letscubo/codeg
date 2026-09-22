@@ -5122,7 +5122,9 @@ where
         locate_binary,
     )
     .await?;
-    let server = McpServerStdio::new("codeg-mcp", spec.command.clone()).args(spec.args.clone());
+    // fork(letscubo):agent 看到的 server 名 = 工具前缀(mcp__myclaw__…)。历史识别按工具名后缀
+    // (delegate_to_agent 等),与 server 名无关,旧转录里的 mcp__codeg-mcp__… 照样认得。
+    let server = McpServerStdio::new(crate::acp::delegation::companion::COMPANION_SERVER_NAME, spec.command.clone()).args(spec.args.clone());
     servers.push(McpServer::Stdio(server));
     Some(CompanionInjection {
         token: spec.token,
@@ -5512,7 +5514,7 @@ async fn run_connection(
 
     Client
         .builder()
-        .name("codeg")
+        .name(crate::acp::delegation::companion::CLIENT_NAME)
         .on_receive_request(
             {
                 let emitter_inner = emitter_clone.clone();

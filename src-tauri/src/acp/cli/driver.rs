@@ -546,7 +546,7 @@ impl CliDriver {
 pub(crate) fn mcp_config_json(companion: &CompanionLaunchSpec) -> String {
     json!({
         "mcpServers": {
-            "codeg-mcp": {
+            crate::acp::delegation::companion::COMPANION_SERVER_NAME: {
                 "type": "stdio",
                 "command": companion.command.display().to_string(),
                 "args": companion.args,

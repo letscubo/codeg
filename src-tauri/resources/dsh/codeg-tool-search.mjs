@@ -7,7 +7,7 @@
  * copy of any `@deepseek-ai/*` package in the profile breaks the loader.
  *
  * Mechanism: at `agent/created` every MCP tool (`mcp__<server>__<tool>`) except the
- * exempt servers (codeg-mcp) is hidden from that agent with `agent.ctx.tools.restrict`
+ * exempt servers (myclaw) is hidden from that agent with `agent.ctx.tools.restrict`
  * ({deny}) and a `search_tools` tool is registered in the agent scope. `search_tools`
  * runs BM25 over the hidden catalog and lifts the mask for the hits; from the next
  * request on the model sees their full schemas and calls them directly. Execution,
@@ -26,7 +26,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   mode: 'auto',
   autoMinTools: 10,
   hidePrefixes: ['mcp__'],
-  exemptServers: ['codeg-mcp'],
+  exemptServers: ['myclaw'],
   searchLimit: 8,
   searchToolName: 'search_tools',
   debug: false,

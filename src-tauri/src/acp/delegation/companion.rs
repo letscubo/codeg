@@ -67,6 +67,20 @@ use crate::models::AutomationAction;
 /// won't notice the bound being hit. Misses are absorbed by the codeg
 /// main side's `cancel_by_parent` cascade when the parent ACP connection
 /// eventually ends.
+/// fork(letscubo):注入给 agent 的 MCP server 名。agent 端工具全名是 `mcp__<名字>__<工具>`,
+/// 模型直接看得到,所以不能再叫 `codeg-mcp`(2026-09-22 改名)。四个传入通道(ACP /
+/// Claude CLI / dsh / codex)与 companion 自报的 serverInfo 都引用这一个常量 —— 名字分叉的话,
+/// dsh 的 tool-search 豁免名单对不上,委派工具会被当成普通 MCP 工具藏起来。
+///
+/// 历史识别不依赖它:委派调用按工具名后缀(`delegate_to_agent` 等)认,旧转录里的
+/// `mcp__codeg-mcp__…` 照样识别。二进制文件名(`codeg-mcp`)是另一回事,不随这里改。
+pub const COMPANION_SERVER_NAME: &str = "myclaw";
+
+/// ACP / codex 握手时报给 agent 的客户端名(原为 `codeg`)。
+pub const CLIENT_NAME: &str = "myclaw";
+/// codex 的 `clientInfo.title`。
+pub const CLIENT_TITLE: &str = "MyClaw";
+
 const BROKER_CANCEL_BUDGET: Duration = Duration::from_millis(500);
 
 /// Wrap `client_cancel` in [`BROKER_CANCEL_BUDGET`] so callers can fire
@@ -379,7 +393,7 @@ pub async fn dispatch_line(
             json!({
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
-                    "name": "codeg-mcp",
+                    "name": COMPANION_SERVER_NAME,
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": { "tools": {} },
@@ -1676,7 +1690,7 @@ mod tests {
         let resp = unwrap_respond(dispatch_for_test(line).await);
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
-        assert_eq!(result["serverInfo"]["name"], "codeg-mcp");
+        assert_eq!(result["serverInfo"]["name"], "myclaw");
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ const schema = (name, description = '', props = []) => ({
 
 const CATALOG = [
   schema('bash', 'Run a shell command', ['command']),
-  schema('mcp__a1_codeg-mcp__ask_user_question', 'Ask the user a question'),
+  schema('mcp__a1_myclaw__ask_user_question', 'Ask the user a question'),
   schema('mcp__app-notion__notion-search', 'Search pages and databases in the Notion workspace', ['query']),
   schema('mcp__app-notion__notion-list-recent-pages', 'List pages the user viewed recently', ['limit']),
   schema('mcp__app-higgsfield__generate_video', 'Generate a video from a text prompt', ['prompt', 'duration']),
@@ -27,8 +27,8 @@ test('serverOf / shortNameOf parse the dsh public name', () => {
   assert.equal(shortNameOf('bash'), 'bash')
 })
 
-test('selectCandidates keeps mcp tools, exempts codeg-mcp under a session prefix, drops builtins', () => {
-  const names = selectCandidates(CATALOG, { hidePrefixes: ['mcp__'], exemptServers: ['codeg-mcp'] }).map(s => s.name)
+test('selectCandidates keeps mcp tools, exempts myclaw under a session prefix, drops builtins', () => {
+  const names = selectCandidates(CATALOG, { hidePrefixes: ['mcp__'], exemptServers: ['myclaw'] }).map(s => s.name)
   assert.deepEqual(names, [
     'mcp__app-notion__notion-search',
     'mcp__app-notion__notion-list-recent-pages',
@@ -112,7 +112,7 @@ test('controller hides all candidates, search lifts hits with new-mask-before-ol
   const log = []
   const root = fakeRoot(CATALOG)
   const agent = fakeAgent('a1', log)
-  const c = new AgentToolSearch(root, agent, { mode: 'on', autoMinTools: 10, hidePrefixes: ['mcp__'], exemptServers: ['codeg-mcp'], searchLimit: 8, searchToolName: 'search_tools', debug: false }, op => op())
+  const c = new AgentToolSearch(root, agent, { mode: 'on', autoMinTools: 10, hidePrefixes: ['mcp__'], exemptServers: ['myclaw'], searchLimit: 8, searchToolName: 'search_tools', debug: false }, op => op())
   c.install()
   assert.equal(agent.restrictions.length, 1)
   assert.equal(agent.restrictions[0].deny.length, 4)
@@ -139,7 +139,7 @@ test('controller hides all candidates, search lifts hits with new-mask-before-ol
 test('auto mode below threshold installs nothing', () => {
   const root = fakeRoot(CATALOG)
   const agent = fakeAgent('a2', [])
-  const c = new AgentToolSearch(root, agent, { mode: 'auto', autoMinTools: 10, hidePrefixes: ['mcp__'], exemptServers: ['codeg-mcp'], searchLimit: 8, searchToolName: 'search_tools' }, op => op())
+  const c = new AgentToolSearch(root, agent, { mode: 'auto', autoMinTools: 10, hidePrefixes: ['mcp__'], exemptServers: ['myclaw'], searchLimit: 8, searchToolName: 'search_tools' }, op => op())
   c.install()
   assert.equal(agent.restrictions.length, 0)
   assert.equal(agent.registered.length, 0)
@@ -174,7 +174,7 @@ test('a restrict failure fails open instead of throwing', () => {
   const root = fakeRoot(CATALOG)
   const agent = fakeAgent('a6', [])
   agent.ctx.tools.restrict = () => { throw new Error('unknown global tool') }
-  const c = new AgentToolSearch(root, agent, { mode: 'on', hidePrefixes: ['mcp__'], exemptServers: ['codeg-mcp'], searchLimit: 8, searchToolName: 'search_tools' }, op => op())
+  const c = new AgentToolSearch(root, agent, { mode: 'on', hidePrefixes: ['mcp__'], exemptServers: ['myclaw'], searchLimit: 8, searchToolName: 'search_tools' }, op => op())
   c.install()
   assert.equal(agent.restrictions.length, 0)
   assert.equal(agent.registered.length, 1)
