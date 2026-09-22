@@ -170,8 +170,8 @@ pub fn spawn_webhook_delivery(
 /// (e.g. Slack/Discord tokens) which must not reach logs. Unparseable input
 /// collapses to a non-revealing placeholder.
 ///
-/// `pub(crate)` for `myclaw_route`, which logs failures against a URL derived
-/// from this same webhook config and therefore carrying the same secret. One
+/// `pub(crate)` so other modules logging URLs derived from this same webhook
+/// config (and therefore carrying the same secret) redact them the same way. One
 /// implementation rather than two: a second copy is a second thing to forget.
 pub(crate) fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
