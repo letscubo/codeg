@@ -157,6 +157,14 @@ RUN mkdir -p /home/ubuntu/.local/bin && chown -R ubuntu:ubuntu /home/ubuntu \
  && test -x /home/ubuntu/.local/bin/officecli \
  && su ubuntu -c "/home/ubuntu/.local/bin/officecli --version" || true
 
+# 关掉 officecli 自动升级(~/.officecli/config.json 的 autoUpdate=false),版本只随镜像走。
+# 它首次运行会检查新版并**原地替换自身二进制**,而后台常驻的 `__resident-serve__`
+# 还是旧进程 —— .NET 单文件程序按需从自身文件加载程序集,文件一换就报
+# `Could not load file or assembly 'System.Linq.Expressions'`,那一轮的 office 命令
+# 全部失败(2026-09-22 Cube 实例 C6 实测)。
+RUN su ubuntu -c "/home/ubuntu/.local/bin/officecli config autoUpdate false" \
+ && grep -q '"autoUpdate": false' /home/ubuntu/.officecli/config.json
+
 # ── 通用进程守护 ─────────────────────────────────────────────────────────────
 # supervisord 作 PID1(经 tini),include 目录**出厂为空** —— 预装的是二进制,
 # 服务注册(openclaw gateway / codeg)仍由运行时安装器/开通流程按实例做。
