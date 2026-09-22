@@ -31,6 +31,7 @@ pub mod preflight;
 pub mod prompt_hydration;
 pub mod question;
 pub mod registry;
+pub mod replay_gate;
 pub mod remote_registry;
 pub mod scratch_dir;
 pub mod session_info;

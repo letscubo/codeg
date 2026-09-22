@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use crate::acp::agent_mentions::append_agent_routes;
 use crate::acp::background_watch;
 use crate::acp::error::AcpError;
+use crate::acp::replay_gate::ReplayGuard;
 use crate::acp::file_system_runtime::{
     FileSystemRuntime, FileSystemRuntimeError, FsAccessPolicy, FS_POLICY_ENV,
 };
@@ -1752,6 +1753,74 @@ pub(crate) fn record_transcript_update(agent_type: AgentType, session_id: &str, 
 /// between "the conversation opens with a truncated history and a warning" and
 /// "opening the conversation hangs forever".
 const HYDRATION_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Consume a history replay captured by a [`ReplayGuard`], in wire order.
+///
+/// Returns how many notifications it held. With `record` set (a custom agent
+/// whose transcript codeg never recorded) the replay is the ONLY copy of that
+/// history, so it is written to the transcript; otherwise it is a duplicate of
+/// what codeg already recorded live and is dropped. Either way:
+///
+/// - a past async-task announcement is dropped (that task is not running now,
+///   and its terminal edge may never have been recorded — no zombie rows);
+/// - `AvailableCommandsUpdate` is forwarded (throwaway render state is fine:
+///   it never carries tool output or tool-call titles);
+/// - an extension notification is forwarded unless it raises an ALERT — a
+///   compaction failure or a dropped image recorded in a past session is not
+///   happening now, and that path also fires an OS notification.
+async fn consume_history_replay(
+    replayed: Vec<Dispatch>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    sid: &str,
+    record: bool,
+) -> u32 {
+    let mut consumed = 0u32;
+    // Cleared if the transcript writer ever stalls: the rest of the replay is
+    // still consumed but not recorded, so the transcript ends at a line
+    // boundary instead of growing holes.
+    let mut recording = record;
+    for dispatch in replayed {
+        consumed += 1;
+        let dispatch = fix_usage_update_nulls(dispatch);
+        if air_async_task_delta(&dispatch).is_some() {
+            continue;
+        }
+        let _ = MatchDispatch::new(dispatch)
+            .if_notification(async |notif: SessionNotification| {
+                if recording {
+                    recording = record_hydrated_update(agent_type, sid, &notif.update).await;
+                }
+                if matches!(notif.update, SessionUpdate::AvailableCommandsUpdate(_)) {
+                    let mut replay_cache = ToolCallOutputCache::default();
+                    let mut replay_cb_state = CodeBuddyLiveState::default();
+                    emit_conversation_update(
+                        state,
+                        emitter,
+                        agent_type,
+                        notif.update,
+                        None,
+                        &mut replay_cache,
+                        &mut replay_cb_state,
+                    )
+                    .await;
+                }
+                Ok(())
+            })
+            .await
+            .otherwise(async |dispatch| {
+                let mut replay_cb_state = CodeBuddyLiveState::default();
+                if !grok_ext_notification_is_alert(&dispatch, agent_type) {
+                    maybe_emit_ext_notification(state, emitter, agent_type, dispatch, &mut replay_cb_state)
+                        .await;
+                }
+                Ok(())
+            })
+            .await;
+    }
+    consumed
+}
 
 /// [`record_transcript_update`] **with backpressure**, for the `session/load`
 /// hydration drain. Returns false once the writer has stopped keeping up, after
@@ -6050,8 +6119,25 @@ async fn run_connection(
                         &cwd,
                         mcp_servers.clone(),
                     );
+                    // Armed before the request: agents may replay history on
+                    // resume too (hermes 0.21.2 does), and without the gate that
+                    // replay is read as the next prompt's output.
+                    let resume_gate = ReplayGuard::arm(&cx, &sid, "session/resume");
                     match send_resume_session(&cx, resume_req).await {
                         Ok((resume_resp, grok_models_raw)) => {
+                            let replayed = resume_gate.map(ReplayGuard::finish).unwrap_or_default();
+                            let drained = consume_history_replay(
+                                replayed,
+                                &state,
+                                &emitter_clone,
+                                agent_type,
+                                &sid,
+                                false,
+                            )
+                            .await;
+                            if drained > 0 {
+                                tracing::info!("[ACP] Consumed {drained} historical replay notifications (session/resume)");
+                            }
                             let initial_config_options = resume_resp.config_options.clone();
                             let new_resp = NewSessionResponse::new(SessionId::new(sid.clone()))
                                 .modes(resume_resp.modes)
@@ -6068,10 +6154,10 @@ async fn run_connection(
                                 .then(|| parse_grok_model_specs(grok_models_raw.as_ref()));
                             let mut session = cx.attach_session(new_resp, Default::default())?;
 
-                            // No drain: session/resume does not replay history,
-                            // so there is nothing to discard. Any buffered
-                            // notification (e.g. an early AvailableCommandsUpdate)
-                            // is consumed and forwarded by run_conversation_loop.
+                            // Any replay was captured and consumed above; state
+                            // updates the gate let through (mode / config /
+                            // AvailableCommandsUpdate) are consumed and forwarded
+                            // by run_conversation_loop.
 
                             record_transcript_header(agent_type, &sid, &cwd.to_string_lossy());
                             emit_with_state(
@@ -6156,6 +6242,8 @@ async fn run_connection(
                             tracing::warn!(
                                 "[ACP] session/resume failed ({e}); falling back to session/load"
                             );
+                            // Remove this gate before session/load arms its own.
+                            drop(resume_gate);
                             // fall through to the session/load block below
                         }
                     }
@@ -6176,6 +6264,11 @@ async fn run_connection(
                 // "Method not found" are real, so the whole error ladder below
                 // stays exactly as it was.
                 let attempted_load = init_resp.agent_capabilities.load_session;
+                // Armed before the request so the replay that precedes the
+                // response is captured, not parked for the live stream.
+                let load_gate = attempted_load
+                    .then(|| ReplayGuard::arm(&cx, &sid, "session/load"))
+                    .flatten();
                 let load_result = if attempted_load {
                     let load_req = build_load_session_request(
                         agent_type,
@@ -6226,93 +6319,21 @@ async fn run_connection(
                         // transcript permanently headerless (no cwd, no start
                         // time, hence no folder in the conversation list).
                         record_transcript_header(agent_type, &sid, &cwd.to_string_lossy());
-                        let mut drained = 0u32;
-                        // Cleared if the writer ever stalls: from then on the
-                        // drain still runs to completion (the session is not
-                        // usable until the replay is consumed) but records
-                        // nothing more, so the transcript ends at a line
-                        // boundary instead of growing holes.
-                        let mut recording = hydrate_from_replay;
-                        while let Ok(Ok(msg)) = tokio::time::timeout(
-                            std::time::Duration::from_millis(100),
-                            session.read_update(),
+                        // The replay was captured by the gate armed before the
+                        // request (see replay_gate.rs): everything the agent
+                        // sent before answering, in wire order, nothing after.
+                        let replayed = load_gate.map(ReplayGuard::finish).unwrap_or_default();
+                        let drained = consume_history_replay(
+                            replayed,
+                            &state,
+                            &emitter_clone,
+                            agent_type,
+                            &sid,
+                            hydrate_from_replay,
                         )
-                        .await
-                        {
-                            drained += 1;
-                            if let SessionMessage::SessionMessage(dispatch) = msg {
-                                let h = emitter_clone.clone();
-                                let st = Arc::clone(&state);
-                                let dispatch = fix_usage_update_nulls(dispatch);
-                                // Historical replay: a task announced in a past
-                                // session is not running now, and its terminal
-                                // edge may never have been recorded. Drop rather
-                                // than seed the live strip with zombie rows —
-                                // but drop HERE, so it isn't counted as an
-                                // update codeg failed to read.
-                                if air_async_task_delta(&dispatch).is_some() {
-                                    continue;
-                                }
-                                let _ = MatchDispatch::new(dispatch)
-                                    .if_notification(async |notif: SessionNotification| {
-                                        if recording {
-                                            recording = record_hydrated_update(
-                                                agent_type,
-                                                &sid,
-                                                &notif.update,
-                                            )
-                                            .await;
-                                        }
-                                        if matches!(
-                                            notif.update,
-                                            SessionUpdate::AvailableCommandsUpdate(_)
-                                        ) {
-                                            // Historical-replay path only
-                                            // forwards AvailableCommandsUpdate,
-                                            // which never carries tool output or
-                                            // tool-call titles — throwaway state
-                                            // is fine.
-                                            let mut replay_cache =
-                                                ToolCallOutputCache::default();
-                                            let mut replay_cb_state =
-                                                CodeBuddyLiveState::default();
-                                            emit_conversation_update(
-                                                &st,
-                                                &h,
-                                                agent_type,
-                                                notif.update,
-                                                None,
-                                                &mut replay_cache,
-                                                &mut replay_cb_state,
-                                            )
-                                            .await;
-                                        }
-                                        Ok(())
-                                    })
-                                    .await
-                                    .otherwise(async |dispatch| {
-                                        // Historical replay: throwaway state,
-                                        // mirroring the sibling closure above.
-                                        // An ext notification that raises an
-                                        // ALERT is skipped, though — a
-                                        // compaction failure or a dropped image
-                                        // recorded in a past session is not
-                                        // happening now, and that path also
-                                        // fires an OS notification. The typed
-                                        // closure above draws the same line by
-                                        // forwarding only AvailableCommands.
-                                        let mut replay_cb_state =
-                                            CodeBuddyLiveState::default();
-                                        if !grok_ext_notification_is_alert(&dispatch, agent_type) {
-                                            maybe_emit_ext_notification(&st, &h, agent_type, dispatch, &mut replay_cb_state).await;
-                                        }
-                                        Ok(())
-                                    })
-                                    .await;
-                            }
-                        }
+                        .await;
                         if drained > 0 {
-                            tracing::info!("[ACP] Drained {drained} historical replay notifications");
+                            tracing::info!("[ACP] Consumed {drained} historical replay notifications (session/load)");
                         }
 
                         emit_with_state(
@@ -8841,8 +8862,22 @@ async fn handle_fork_or_exit(
             cwd,
             mcp_servers.to_vec(),
         );
+        // Resume on the fork may replay the forked history (hermes does);
+        // capture and consume it so it is not read as the next turn's output.
+        let fork_gate = ReplayGuard::arm(&cx, &new_sid, "session/resume");
         match send_resume_session(&cx, resume_req).await {
-            Ok(pair) => Some(pair),
+            Ok(pair) => {
+                let replayed = fork_gate.map(ReplayGuard::finish).unwrap_or_default();
+                let drained =
+                    consume_history_replay(replayed, state, emitter, agent_type, &new_sid, false)
+                        .await;
+                if drained > 0 {
+                    tracing::info!(
+                        "[ACP] Consumed {drained} historical replay notifications (fork resume)"
+                    );
+                }
+                Some(pair)
+            }
             Err(e) => {
                 tracing::warn!(
                     "[ACP] session/resume on the forked session failed ({e}); \
