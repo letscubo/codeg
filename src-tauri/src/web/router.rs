@@ -1744,6 +1744,8 @@ pub fn build_router(
         // 受同一 require_token 保护(必须在这组内,不能进 public_api)。
         // exec=同步一次性;task=异步(POST 提交拿 taskId,GET 轮询实时累积输出)。
         .route("/myclaw/exec", post(handlers::myclaw::exec::exec))
+        // 实例自己的 CPU/内存/磁盘(面板负荷环,经 WS invoke 取;见 handlers/myclaw/metrics.rs)
+        .route("/myclaw/metrics", post(handlers::myclaw::metrics::metrics))
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
         .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
         // Catch-all
