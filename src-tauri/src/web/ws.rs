@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::shutdown::ShutdownSignal;
 use super::ws_attach::{self, ClientMsg, DetachReason, ServerMsg, OUTBOUND_CAPACITY};
+use super::ws_invoke::{self, ApiDispatch, InvokeJob};
 use crate::app_state::AppState;
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 
@@ -52,15 +53,17 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
     Extension(shutdown_signal): Extension<Arc<ShutdownSignal>>,
+    Extension(api): Extension<ApiDispatch>,
 ) -> impl IntoResponse {
     ws.protocols([super::auth::WS_EVENT_PROTOCOL])
-        .on_upgrade(|socket| handle_ws_connection(socket, state, shutdown_signal))
+        .on_upgrade(|socket| handle_ws_connection(socket, state, shutdown_signal, api))
 }
 
 async fn handle_ws_connection(
     mut socket: WebSocket,
     state: Arc<AppState>,
     shutdown_signal: Arc<ShutdownSignal>,
+    api: ApiDispatch,
 ) {
     // Late handshake guard: if shutdown already fired before this task
     // even started, exit before subscribing to anything else.
@@ -103,6 +106,9 @@ async fn handle_ws_connection(
     // epoch (see cleanup channel above) alongside the JoinHandle.
     let mut subscriptions: HashMap<String, ActiveSubscription> = HashMap::new();
     let mut next_epoch: u64 = 0;
+
+    // MyClaw fork ext: 这条 WS 上的 invoke 串行 worker(见 ws_invoke)。结果经 outbound 推回。
+    let (invoke_tx, invoke_worker) = ws_invoke::spawn_worker(api.0, outbound_tx.clone());
 
     // Server→client ready handshake (legacy `__ready__` frame). Phase 1
     // keeps this so unmigrated transports still gate `acp_connect` on the
@@ -226,6 +232,7 @@ async fn handle_ws_connection(
                                     &state,
                                     &outbound_tx,
                                     &cleanup_tx,
+                                    &invoke_tx,
                                     &mut subscriptions,
                                     &mut next_epoch,
                                 ).await;
@@ -249,6 +256,7 @@ async fn handle_ws_connection(
     for (_, sub) in subscriptions.drain() {
         sub.handle.abort();
     }
+    invoke_worker.abort();
 }
 
 async fn handle_client_msg(
@@ -256,10 +264,25 @@ async fn handle_client_msg(
     state: &Arc<AppState>,
     outbound_tx: &mpsc::Sender<ServerMsg>,
     cleanup_tx: &mpsc::Sender<(String, u64)>,
+    invoke_tx: &mpsc::Sender<InvokeJob>,
     subscriptions: &mut HashMap<String, ActiveSubscription>,
     next_epoch: &mut u64,
 ) {
     match msg {
+        ClientMsg::Invoke {
+            request_id,
+            name,
+            body,
+        } => {
+            // 排进串行队列(满则等 = 背压);worker 已退出说明 WS 在关,丢弃即可
+            let _ = invoke_tx
+                .send(InvokeJob {
+                    request_id,
+                    name,
+                    body,
+                })
+                .await;
+        }
         ClientMsg::Attach {
             subscription_id,
             connection_id,

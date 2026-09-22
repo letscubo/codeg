@@ -125,6 +125,8 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 axum = { version = "0.8", features = ["ws", "multipart"] }
 async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
 tower-http = { version = "0.6", features = ["fs", "cors", "compression-gzip", "compression-br"] }
+# MyClaw fork: ws_invoke 用 ServiceExt::oneshot 派发 API 路由(axum 已以同版本 + util 引入,不新增 crate)
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # Direct deps (already in the graph via axum) so the compression predicate can
 # name the exact types tower-http's `Predicate` trait is defined over.
 http = "1"

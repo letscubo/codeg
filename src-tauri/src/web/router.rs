@@ -1747,10 +1747,19 @@ pub fn build_router(
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
         .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
         // Catch-all
-        .fallback(api_not_found)
-        .layer(middleware::from_fn(move |req, next| {
-            auth::require_token(req, next, token.clone())
-        }));
+        .fallback(api_not_found);
+
+    // MyClaw fork ext: 同一组受保护路由,挂鉴权**之前**留一份给 `/ws/events` 的 invoke
+    // (那条 WS 已用同一 token 鉴过权,见 ws_invoke)。Extension 要自己挂 —— 顶层的
+    // `.layer(Extension(..))` 只包在外层 Router 上,内部 oneshot 不经过它。
+    let invoke_router = api
+        .clone()
+        .layer(Extension(state.clone()))
+        .layer(Extension(shutdown_signal.clone()));
+
+    let api = api.layer(middleware::from_fn(move |req, next| {
+        auth::require_token(req, next, token.clone())
+    }));
 
     // Public endpoints — no token required.
     // The login page needs to read the user's preferred language before
@@ -1811,7 +1820,8 @@ pub fn build_router(
         .route("/ws/events", get(ws::ws_handler))
         .layer(middleware::from_fn(move |req, next| {
             auth::require_token(req, next, token_for_ws.clone())
-        }));
+        }))
+        .layer(Extension(super::ws_invoke::ApiDispatch(invoke_router)));
 
     // Static file serving.
     // Next.js static export produces "folder.html" for "/folder" route.

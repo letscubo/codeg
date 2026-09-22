@@ -65,6 +65,15 @@ pub enum ClientMsg {
     Detach { subscription_id: String },
     /// Liveness check. Server replies with `pong`.
     Ping,
+    /// MyClaw fork ext: call a protected `/api/<name>` route over this socket
+    /// (see `ws_invoke`). Answered by `invoke_result` with the same `request_id`;
+    /// calls on one socket run strictly in arrival order.
+    Invoke {
+        request_id: String,
+        name: String,
+        #[serde(default)]
+        body: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +115,14 @@ pub enum ServerMsg {
     },
     /// Liveness response.
     Pong,
+    /// MyClaw fork ext: result of a client `invoke`. `status` is the HTTP status
+    /// the route returned; `data` its JSON body (the error body when `ok=false`).
+    InvokeResult {
+        request_id: String,
+        status: u16,
+        ok: bool,
+        data: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
