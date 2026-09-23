@@ -110,7 +110,8 @@ async fn handle_ws_connection(
 
     // MyClaw fork ext: 这条 WS 上的 invoke 串行 worker(见 ws_invoke)。结果经 outbound 推回。
     let (invoke_tx, invoke_worker) = ws_invoke::spawn_worker(api.0, outbound_tx.clone());
-    // MyClaw fork ext: 连上就推一次实例快照(版本 / 新版 / CPU / 内存 / 磁盘),页面不必再问。
+    // MyClaw fork ext: 连上就推一次实例快照(版本 / CPU / 内存 / 磁盘),页面不必再问。
+    // 「有没有新版」不在里面 —— 那要联网,见 ws_snapshot。
     let snapshot_task = tokio::spawn(ws_snapshot::push_snapshot(outbound_tx.clone()));
 
     // Server→client ready handshake (legacy `__ready__` frame). Phase 1
