@@ -1748,6 +1748,10 @@ pub fn build_router(
         .route("/myclaw/metrics", post(handlers::myclaw::metrics::metrics))
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
         .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
+        // 伴生工具的 HTTP 传输 —— 给拿不到 stdio 伴生的 runtime(openclaw / pi)用。
+        // 按 agent 一条条目:身份只能放 URL 里(见 handlers/myclaw/mcp.rs 模块头)。
+        .route("/myclaw/mcp/{agent}", post(handlers::myclaw::mcp::rpc))
+        .route("/myclaw/mcp-entry/{agent}", get(handlers::myclaw::mcp::entry))
         // Catch-all
         .fallback(api_not_found);
 
