@@ -115,6 +115,13 @@ pub enum ServerMsg {
     },
     /// Liveness response.
     Pong,
+    /// MyClaw fork ext: legacy-shaped global frame `{channel, payload}` pushed by the
+    /// server (see `ws_snapshot`). Same envelope the install-log / terminal-output frames
+    /// use; carried through `ServerMsg` so it shares the one outbound sender.
+    Channel {
+        channel: String,
+        payload: Arc<serde_json::Value>,
+    },
     /// MyClaw fork ext: result of a client `invoke`. `status` is the HTTP status
     /// the route returned; `data` its JSON body (the error body when `ok=false`).
     InvokeResult {

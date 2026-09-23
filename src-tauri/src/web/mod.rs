@@ -9,6 +9,7 @@ pub mod socket_inherit;
 pub mod ws;
 pub mod ws_attach;
 pub mod ws_invoke;
+pub mod ws_snapshot;
 
 pub use port_probe::{PortState, WebServicePortProbe};
 

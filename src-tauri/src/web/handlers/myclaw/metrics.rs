@@ -47,10 +47,15 @@ pub struct MetricsResponse {
 static LAST_CPU: Mutex<Option<(Duration, Instant)>> = Mutex::new(None);
 
 pub async fn metrics() -> Json<MetricsResponse> {
+    Json(collect().await)
+}
+
+/// 采一次。handler 与 WS 连上时的主动快照(ws_snapshot)共用。
+pub async fn collect() -> MetricsResponse {
     let cpu_percent = sample_cpu_percent().await;
     let (mem_used_kb, mem_total_kb) = read_memory();
     let (disk_used_bytes, disk_total_bytes) = read_disk();
-    Json(MetricsResponse {
+    MetricsResponse {
         cpu_percent,
         cpu_cores: std::thread::available_parallelism().ok().map(|n| n.get()),
         mem_used_kb,
@@ -58,7 +63,7 @@ pub async fn metrics() -> Json<MetricsResponse> {
         disk_used_bytes,
         disk_total_bytes,
         collected_at: chrono::Utc::now().to_rfc3339(),
-    })
+    }
 }
 
 /// 与上次采样比,算出这段时间的平均 CPU%。没有上次采样就地补采 150ms。
@@ -311,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_reports_something_on_this_machine() {
-        let Json(m) = metrics().await;
+        let m = collect().await;
         assert!(!m.collected_at.is_empty());
         assert!(m.cpu_cores.unwrap_or(0) >= 1);
         // Linux 以外(开发机 macOS)只保证不 panic;容器里三项都应有值
