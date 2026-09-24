@@ -255,6 +255,22 @@ pub struct McpEntry {
     pub tools: Vec<String>,
 }
 
+/// 条目名里用的**短**标识。
+///
+/// 条目名 = 模型看到的工具前缀,而 openclaw 会把过长的工具名截断:2026-09-24 实测,
+/// 条目名 `myclaw-va-c4a9f7cd-c3b1-4ee4-baac-24ae8c8c465f` 到了模型那里变成
+/// `myclaw-va-c4a9f7cd-c3b1-4ee4-b__upload_file` —— 能用,但名字被砍得难看,也不稳定。
+/// URL 里仍然带完整 id(身份要精确),只有名字取前一段:`va-` + uuid 的前 8 位,
+/// 同实例几个 agent 之间足够区分。
+fn short_agent(agent: &str) -> String {
+    let (prefix, rest) = match agent.strip_prefix("va-") {
+        Some(rest) => ("va-", rest),
+        None => ("", agent),
+    };
+    let head: String = rest.chars().take(8).collect();
+    format!("{prefix}{head}")
+}
+
 /// `GET /api/myclaw/mcp-entry/{agent}`
 pub async fn entry(Path(agent): Path<String>, headers: HeaderMap) -> Response {
     if !valid_agent_segment(&agent) {
@@ -280,7 +296,7 @@ pub async fn entry(Path(agent): Path<String>, headers: HeaderMap) -> Response {
         hdrs.insert("Authorization".to_string(), auth.to_string());
     }
     Json(McpEntry {
-        name: format!("{COMPANION_SERVER_NAME}-{agent}"),
+        name: format!("{COMPANION_SERVER_NAME}-{}", short_agent(&agent)),
         transport: "streamable-http",
         // 127.0.0.1:同容器内的 openclaw / pi 直连,不出网、不经公网路由。
         url: format!("http://127.0.0.1:{}/api/myclaw/mcp/{agent}", codeg_port()),
@@ -399,6 +415,19 @@ mod tests {
         let r = initialize_result();
         assert_eq!(r["protocolVersion"], "2024-11-05");
         assert_eq!(r["serverInfo"]["name"], COMPANION_SERVER_NAME);
+    }
+
+    /// 条目名取短标识:openclaw 会截断过长的工具名(见 short_agent 的注释)。
+    #[test]
+    fn entry_name_uses_a_short_agent_id() {
+        assert_eq!(short_agent("va-c4a9f7cd-c3b1-4ee4-baac-24ae8c8c465f"), "va-c4a9f7cd");
+        assert_eq!(short_agent("c4a9f7cd-c3b1-4ee4-baac-24ae8c8c465f"), "c4a9f7cd");
+        assert_eq!(short_agent("main"), "main");
+        // 拼出来的条目名要短到 openclaw 不会砍:`myclaw-` + 11 = 18 字符
+        assert_eq!(
+            format!("{COMPANION_SERVER_NAME}-{}", short_agent("va-c4a9f7cd-c3b1-4ee4-baac-24ae8c8c465f")),
+            "myclaw-va-c4a9f7cd"
+        );
     }
 
     /// 末段会同时进 URL 和配置文件里的条目名 —— 两处都不能被污染。

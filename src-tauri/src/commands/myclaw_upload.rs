@@ -106,6 +106,32 @@ fn guess_mime(path: &Path) -> &'static str {
 }
 
 /// 文件名 —— 平台只拿它取扩展名, 路径部分不会被使用, 但也没必要送过去。
+/// 展开开头的 `~` / `~/…`。
+///
+/// 模型给路径时天然会写 `~/.myclaw/sessions/<id>/output/deck.pptx` —— shell 会展开,
+/// `fs::metadata` 不会,于是第一次调用必然 `No such file or directory`,模型得自己
+/// 反应过来改成绝对路径(2026-09-24 在 C6 上实测踩到:openclaw 那轮第一次上传就这么废掉)。
+/// 与其让每个调用方记住这条,在入口展开一次。
+///
+/// 只认开头那个 `~`(`~user` 形式不认 —— 容器里只有一个用户,而把它当成字面目录名反而
+/// 更安全:真有这种目录时不会被悄悄改写)。
+fn expand_tilde(path: &str) -> PathBuf {
+    let Some(rest) = path.strip_prefix('~') else {
+        return PathBuf::from(path);
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return PathBuf::from(path);
+    }
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return PathBuf::from(path);
+    };
+    let mut out = PathBuf::from(home);
+    if let Some(tail) = rest.strip_prefix('/').filter(|t| !t.is_empty()) {
+        out.push(tail);
+    }
+    out
+}
+
 fn file_name_of(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -118,7 +144,7 @@ fn file_name_of(path: &Path) -> String {
 /// `path` 由调用方(MCP 工具)给出。这里只要求它存在且是普通文件 —— 会话目录的限制
 /// 平台侧与本模块都**不做**(2026-09-20 用户定)。
 pub async fn upload_file(db: &AppDatabase, path: &str) -> Result<String, String> {
-    let path_buf = PathBuf::from(path);
+    let path_buf = expand_tilde(path);
     let meta = tokio::fs::metadata(&path_buf)
         .await
         .map_err(|e| format!("cannot read {}: {e}", path_buf.display()))?;
@@ -308,6 +334,22 @@ mod tests {
             guess_mime(Path::new("/tmp/noext")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn tilde_is_expanded_from_home() {
+        std::env::set_var("HOME", "/home/ubuntu");
+        assert_eq!(
+            expand_tilde("~/.myclaw/sessions/s1/output/deck.pptx"),
+            Path::new("/home/ubuntu/.myclaw/sessions/s1/output/deck.pptx")
+        );
+        assert_eq!(expand_tilde("~"), Path::new("/home/ubuntu"));
+        assert_eq!(expand_tilde("~/"), Path::new("/home/ubuntu"));
+        // 绝对路径与相对路径原样通过
+        assert_eq!(expand_tilde("/tmp/a.pptx"), Path::new("/tmp/a.pptx"));
+        assert_eq!(expand_tilde("./a.pptx"), Path::new("./a.pptx"));
+        // `~user` 不认 —— 当字面目录名处理
+        assert_eq!(expand_tilde("~bob/a.pptx"), Path::new("~bob/a.pptx"));
     }
 
     #[test]
