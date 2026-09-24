@@ -62,7 +62,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::acp::delegation::companion::{
-    render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME, TOOL_SCHEMA_JSON,
+    render_upload_result, CompanionFeatures, COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME,
+    TOOL_SCHEMA_JSON,
 };
 use crate::app_state::AppState;
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
@@ -121,6 +122,8 @@ fn initialize_result() -> Value {
         "protocolVersion": PROTOCOL_VERSION,
         "serverInfo": { "name": COMPANION_SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
         "capabilities": { "tools": {} },
+        // 与 stdio 那条同一段文字 —— 交付义务只写一处,见 COMPANION_INSTRUCTIONS。
+        "instructions": COMPANION_INSTRUCTIONS,
     })
 }
 
@@ -415,6 +418,13 @@ mod tests {
         let r = initialize_result();
         assert_eq!(r["protocolVersion"], "2024-11-05");
         assert_eq!(r["serverInfo"]["name"], COMPANION_SERVER_NAME);
+        // 交付义务只写一处:两条传输自报同一段 instructions
+        assert_eq!(r["instructions"], COMPANION_INSTRUCTIONS);
+        let text = r["instructions"].as_str().unwrap();
+        assert!(text.contains("DELIVERY IS NOT OPTIONAL"));
+        assert!(text.contains("upload_file"));
+        // 不写具体工具名前缀 —— 各 runtime 不同,写死会把模型带错
+        assert!(!text.contains("mcp__myclaw__upload_file"));
     }
 
     /// 条目名取短标识:openclaw 会截断过长的工具名(见 short_agent 的注释)。

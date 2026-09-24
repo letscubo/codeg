@@ -98,6 +98,42 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
 /// broker's [`super::types::DelegationRequest`].
 pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
 
+/// MCP `InitializeResult.instructions` —— 服务器**自述**:客户端把它并进系统提示,
+/// 所以这是"平台自己的地盘"里唯一能对模型常驻说话的位置。
+///
+/// ## 为什么需要
+///
+/// 2026-09-24 在 C6 上反复实测:模型写完文件就回"已创建并保存 note.txt",**从不上传**;
+/// 三次、跨两个 runtime 同一形状。追下去是两件事:
+///
+/// 1. 光让工具"可见"不够 —— openclaw 的 `toolSearch.mode: "directory"` 实测**不会**把
+///    MCP 工具放进可见目录(直接问模型"看得见带 upload 的工具吗",答"没有");而
+///    claude_code 那边工具本来就在列表里,没触发 office 技能时同样不上传。
+/// 2. 真正缺的是**义务**:模型认为"存到磁盘"就等于交付完了。而交付铁律此前只写在
+///    myclaw-office 技能里,不触发该技能的产物(txt / csv / 图片 / 代码产物)全停在容器里。
+///
+/// 义务不能写进用户的指令文件(SOUL.md / CLAUDE.md 是用户自己的内容,平台不改),技能又
+/// 依赖触发 —— `instructions` 是剩下唯一正统的位置。
+///
+/// 只写**跨 runtime 都成立**的事实:用户拿不到路径;工具名照工具表原样用(实测模型会自己
+/// 拼 `mcp:` 前缀、也会抄历史里的旧名)。**不写具体工具名** —— 各 runtime 的前缀不同。
+pub const COMPANION_INSTRUCTIONS: &str = "\
+This server is the platform's own channel, injected into every session — not a user integration.
+
+DELIVERY IS NOT OPTIONAL. The person you are talking to cannot open files on this machine: a \
+filesystem path, a `MEDIA:` marker or an attachment delivers nothing. Whenever you produce \
+something for them — a document, spreadsheet, deck, image, dataset, screenshot, export, archive \
+— finish by calling this server's `upload_file` tool with the file's path and put the returned \
+link in your reply. \"Saved to /path\" is not a delivered result: a turn that ends that way has \
+failed, however good the file is.
+
+Call the tool by the exact name your tool list shows for it (the prefix differs per runtime). Do \
+not prepend `mcp:` or `mcp__` yourself, and do not reuse a name you remember from earlier in the \
+conversation — look it up. The path may be absolute or relative; `~` is expanded for you.
+
+If the upload fails, say why in one sentence and stop. Never fall back to curl, to a shell \
+command, or to handing over a path.";
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -397,6 +433,8 @@ pub async fn dispatch_line(
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": { "tools": {} },
+                // 服务器自述,客户端并进系统提示 —— 见 COMPANION_INSTRUCTIONS 的注释。
+                "instructions": COMPANION_INSTRUCTIONS,
             }),
         )),
         "tools/list" => {
