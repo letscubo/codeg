@@ -30,6 +30,8 @@ pub fn build_router(
         .allow_headers(Any);
 
     let token_for_ws = token.clone();
+    // `/myclaw/file` 在公共组里自己认凭证(Bearer 或下载票),需要同一条 token。
+    let token_for_file = token.clone();
 
     let api = Router::new()
         .route("/health", post(health_check))
@@ -1774,6 +1776,17 @@ pub fn build_router(
         .route(
             "/get_system_language_settings",
             post(handlers::system_settings::get_system_language_settings),
+        )
+        // MyClaw fork ext: 会话产物下载 —— 真流式 + Range,照 cube envd 的 /files 做。
+        // 放公共组是因为浏览器给不了 Authorization 头(`<a download>` / `<video src>`),
+        // 凭证只能进 URL。**handler 自己认**:Bearer(平台服务端)或 `?t=<下载票>`
+        // (票绑死单个文件 + 短时效,见 handlers/myclaw/file_ticket.rs)。
+        // ⚠️ 票的校验绝不能上提到 require_token —— 那样一张下载票就能调 /myclaw/exec。
+        .route(
+            "/myclaw/file",
+            get(handlers::myclaw::download::download).layer(Extension(
+                handlers::myclaw::download::ServerToken(token_for_file),
+            )),
         )
         .route(
             "/workspace_download/{ticket}",

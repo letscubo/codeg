@@ -115,7 +115,7 @@ fn guess_mime(path: &Path) -> &'static str {
 ///
 /// 只认开头那个 `~`(`~user` 形式不认 —— 容器里只有一个用户,而把它当成字面目录名反而
 /// 更安全:真有这种目录时不会被悄悄改写)。
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     let Some(rest) = path.strip_prefix('~') else {
         return PathBuf::from(path);
     };

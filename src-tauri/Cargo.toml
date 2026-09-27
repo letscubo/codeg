@@ -140,6 +140,9 @@ qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg", "gif"] }
 include_dir = "0.7"
 sha2 = "0.10"
+# fork(letscubo): 下载票的 HMAC-SHA256 自验(web/handlers/myclaw/download.rs)。
+# 0.12 已在 lock 里被间接依赖拉进来,提为直接依赖不新增编译单元。
+hmac = "0.12"
 aes-gcm = { version = "0.10", features = ["stream"] }
 argon2 = "0.5"
 tempfile = "3"

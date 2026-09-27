@@ -15,6 +15,14 @@
 //!   compressed: a custom `compress_when` REPLACES tower-http's default
 //!   predicate — which is what normally excludes SSE — so the exclusion has
 //!   to be restated here explicitly or the encoder would buffer events.
+//! - Responses that NAME a file for the client (`Content-Disposition`) are raw
+//!   file delivery and stay byte-exact: `/api/myclaw/file` serves session
+//!   artifacts with `Content-Length` + `Accept-Ranges`, and a `.md`/`.csv`/
+//!   `.txt` artifact would otherwise land in the `text/*` allowlist, lose its
+//!   `Content-Length`, and arrive at a proxy that must then re-derive the
+//!   length it was about to forward. (206 responses are already safe —
+//!   tower-http refuses to compress anything carrying `Content-Range` before
+//!   the predicate is even consulted — so this covers the full-body case.)
 
 use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
@@ -45,6 +53,13 @@ impl Predicate for CompressibleContentType {
             .trim()
             .to_ascii_lowercase();
         if mime == "text/event-stream" {
+            return false;
+        }
+        // Named file delivery (download / inline preview) — see module docs.
+        if response
+            .headers()
+            .contains_key(http::header::CONTENT_DISPOSITION)
+        {
             return false;
         }
         mime == "application/json"
@@ -89,6 +104,28 @@ mod tests {
         ] {
             assert!(p.should_compress(&response_with_content_type(ct)), "{ct}");
         }
+    }
+
+    #[test]
+    fn named_file_delivery_is_never_compressed() {
+        let p = CompressibleContentType;
+        // Same content types the allowlist otherwise compresses.
+        for ct in ["text/markdown", "text/csv", "text/html", "application/json"] {
+            let mut res = response_with_content_type(ct);
+            res.headers_mut().insert(
+                http::header::CONTENT_DISPOSITION,
+                http::HeaderValue::from_static("attachment; filename=\"a.md\""),
+            );
+            assert!(!p.should_compress(&res), "{ct}");
+            // inline (preview) is the same deal.
+            res.headers_mut().insert(
+                http::header::CONTENT_DISPOSITION,
+                http::HeaderValue::from_static("inline; filename=\"a.md\""),
+            );
+            assert!(!p.should_compress(&res), "{ct}");
+        }
+        // Static assets carry no Content-Disposition and keep compressing.
+        assert!(p.should_compress(&response_with_content_type("text/css")));
     }
 
     #[test]
