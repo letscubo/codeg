@@ -1748,6 +1748,9 @@ pub fn build_router(
         .route("/myclaw/exec", post(handlers::myclaw::exec::exec))
         // 实例自己的 CPU/内存/磁盘(面板负荷环,经 WS invoke 取;见 handlers/myclaw/metrics.rs)
         .route("/myclaw/metrics", post(handlers::myclaw::metrics::metrics))
+        // 「现在有没有人在用这台实例」——平台判忙/闲用(定时全量扫)。只读一个原子量,
+        // 不采 CPU、不读磁盘,与 metrics 分开正是为了别为一个计数做那些系统调用。
+        .route("/myclaw/activity", get(handlers::myclaw::activity::activity))
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
         .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
         // 伴生工具的 HTTP 传输 —— 给拿不到 stdio 伴生的 runtime(openclaw / pi)用。

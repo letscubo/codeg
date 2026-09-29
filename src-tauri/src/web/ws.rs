@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -50,6 +51,52 @@ fn apply_cleanup_signal(
 // Phase 4 will retire this channel.
 const WS_READY_CHANNEL: &str = "__ready__";
 
+/// MyClaw fork ext (letscubo) —— `/ws/events` 上当前活着的客户端数。
+///
+/// ## 为什么要它
+///
+/// 平台要判断一台实例「现在忙不忙」(空闲就停、有人用就别停)。已有的判据都不够:
+/// 消息与工具调用是**整轮结束后批量落库**的,一轮跑两小时,库里这两小时一片空白;
+/// 定时任务同理。而浏览器打开页面就连上 `/ws/events` 旁听整个实例的事件流
+/// (attach_all),这条连接在整轮期间一直开着 —— 它同时回答了「有人在看吗」和
+/// 「现在是不是正在跑一轮」。
+///
+/// ## 为什么是进程内 static 而不是 AppState 字段
+///
+/// 一个容器一个 codeg 进程,计数天然是进程内的;放 AppState 要动它全部构造点。
+/// `handlers/myclaw/metrics.rs` 的 `LAST_CPU` 已是同款做法(那里的注释也说明
+/// 进程内共享是**故意**的)。
+///
+/// ## 数的是什么
+///
+/// 一条 WS 连接算一个,与它内部开了几个 attach 订阅无关。**不要**改用
+/// `event_broadcaster.receiver_count()`:那数的是 broadcast 订阅者,一条连接除了
+/// 全局 firehose 还会为每个 attach 起一个 forwarder,读出来会偏大。
+static WS_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// 当前活着的 `/ws/events` 连接数。给 `myclaw/activity` 读。
+pub fn ws_client_count() -> usize {
+    WS_CLIENTS.load(Ordering::Relaxed)
+}
+
+/// 进出各记一次。用 RAII 而不是手写 +1/-1:`handle_ws_connection` 有多条
+/// 提前 return 的路径(握手期 shutdown、读取出错 break),漏减一次这个数就
+/// 永久偏高,而它正是用来判「该不该停实例」的 —— 偏高 = 永远不停。
+struct WsClientGuard;
+
+impl WsClientGuard {
+    fn enter() -> Self {
+        WS_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for WsClientGuard {
+    fn drop(&mut self) {
+        WS_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
@@ -72,6 +119,10 @@ async fn handle_ws_connection(
         let _ = socket.send(Message::Close(None)).await;
         return;
     }
+
+    // 计入活跃连接(离开本函数时自动减,见 WsClientGuard)。放在握手期 shutdown
+    // 之后:那条路径根本没成为一个客户端。
+    let _client_guard = WsClientGuard::enter();
 
     // Legacy global firehose subscriber. Removed in Phase 4 once all
     // transports use the attach protocol.
@@ -440,5 +491,24 @@ mod tests {
         apply_cleanup_signal(&mut subs, "missing", 1);
 
         assert!(subs.contains_key("other"));
+    }
+
+    /// 平台拿这个数判「该不该停这台实例」——只多不少都会出错:偏高永远不停,
+    /// 偏低会把正在用的实例停掉。所以进出必须严格配对,且离开作用域即减。
+    #[test]
+    fn ws_client_guard_counts_in_and_out() {
+        let base = ws_client_count();
+
+        let a = WsClientGuard::enter();
+        assert_eq!(ws_client_count(), base + 1);
+
+        {
+            let _b = WsClientGuard::enter();
+            assert_eq!(ws_client_count(), base + 2);
+        } // _b 出作用域
+        assert_eq!(ws_client_count(), base + 1, "离开作用域必须减回去");
+
+        drop(a);
+        assert_eq!(ws_client_count(), base, "全部断开后回到基线");
     }
 }

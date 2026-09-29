@@ -6,6 +6,7 @@
 //!
 //! 路由前缀统一 `/api/myclaw/*`,与上游的扁平命令名(如 `/api/acp_prompt`)区隔。
 
+pub mod activity;
 pub mod download;
 pub mod exec;
 pub mod file_ticket;
