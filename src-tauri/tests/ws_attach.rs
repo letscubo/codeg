@@ -72,6 +72,28 @@ async fn next_json(ws: &mut axum_test::TestWebSocket) -> Value {
     serde_json::from_str(&text).expect("frame is valid json")
 }
 
+/// Receive the next **attach-protocol** frame, skipping the legacy-shaped
+/// global frames (`{type:"channel", channel, payload}`) the server pushes on
+/// its own schedule.
+///
+/// Why this exists: the MyClaw fork pushes an instance snapshot on
+/// `myclaw://snapshot` as soon as a socket opens (`ws_snapshot::push_snapshot`,
+/// spawned — so its position in the stream is not deterministic), on top of the
+/// `__ready__` handshake frame. Attach replies therefore no longer sit at a
+/// fixed frame offset. Attach-protocol frames are the `ServerMsg` variants with
+/// a payload of their own (`snapshot` / `replay` / `event` / `detached` / ...);
+/// the global ones are all tagged `channel`, which is what we skip here.
+async fn next_attach_json(ws: &mut axum_test::TestWebSocket) -> Value {
+    for _ in 0..8 {
+        let frame = next_json(ws).await;
+        if frame["type"] == "channel" {
+            continue;
+        }
+        return frame;
+    }
+    panic!("no attach-protocol frame after skipping 8 channel frames");
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 1. Unauthenticated upgrade is rejected.
 // ───────────────────────────────────────────────────────────────────────────
@@ -133,7 +155,7 @@ async fn ws_attach_unknown_connection_detaches() {
     }))
     .await;
 
-    let resp = next_json(&mut ws).await;
+    let resp = next_attach_json(&mut ws).await;
     assert_eq!(resp["type"], "detached");
     assert_eq!(resp["subscription_id"], "sub-1");
     assert_eq!(resp["reason"], "connection_gone");
@@ -173,7 +195,7 @@ async fn ws_cold_attach_receives_snapshot_then_live_events() {
     }))
     .await;
 
-    let snapshot = next_json(&mut ws).await;
+    let snapshot = next_attach_json(&mut ws).await;
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(snapshot["subscription_id"], "sub-cold");
     assert_eq!(snapshot["connection_id"], conn_id);
@@ -198,7 +220,7 @@ async fn ws_cold_attach_receives_snapshot_then_live_events() {
     )
     .await;
 
-    let live = next_json(&mut ws).await;
+    let live = next_attach_json(&mut ws).await;
     assert_eq!(live["type"], "event");
     assert_eq!(live["subscription_id"], "sub-cold");
     let envelope = &live["envelope"];
@@ -259,7 +281,7 @@ async fn ws_hot_attach_with_cursor_receives_replay() {
     }))
     .await;
 
-    let frame = next_json(&mut ws).await;
+    let frame = next_attach_json(&mut ws).await;
     assert_eq!(frame["type"], "replay");
     assert_eq!(frame["subscription_id"], "sub-replay");
     assert_eq!(frame["connection_id"], conn_id);
