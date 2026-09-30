@@ -32,6 +32,9 @@ pub fn build_router(
     let token_for_ws = token.clone();
     // `/myclaw/file` 在公共组里自己认凭证(Bearer 或下载票),需要同一条 token。
     let token_for_file = token.clone();
+    // `/myclaw/mcp/*`:rpc 在公共组里自己认 agent 派生凭证,entry 用它签派生凭证。
+    let token_for_mcp = token.clone();
+    let token_for_mcp_entry = token.clone();
 
     let api = Router::new()
         .route("/health", post(health_check))
@@ -1754,9 +1757,14 @@ pub fn build_router(
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
         .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
         // 伴生工具的 HTTP 传输 —— 给拿不到 stdio 伴生的 runtime(openclaw / pi)用。
-        // 按 agent 一条条目:身份只能放 URL 里(见 handlers/myclaw/mcp.rs 模块头)。
-        .route("/myclaw/mcp/{agent}", post(handlers::myclaw::mcp::rpc))
-        .route("/myclaw/mcp-entry/{agent}", get(handlers::myclaw::mcp::entry))
+        // 平台取条目走这里(主 token);条目里签的是 agent 派生凭证,不是主 token。
+        // 端点本身(`/myclaw/mcp/{agent}`)在下面的公共组,见 handlers/myclaw/mcp.rs「凭证」。
+        .route(
+            "/myclaw/mcp-entry/{agent}",
+            get(handlers::myclaw::mcp::entry).layer(Extension(
+                handlers::myclaw::download::ServerToken(token_for_mcp_entry),
+            )),
+        )
         // Catch-all
         .fallback(api_not_found);
 
@@ -1789,6 +1797,16 @@ pub fn build_router(
             "/myclaw/file",
             get(handlers::myclaw::download::download).layer(Extension(
                 handlers::myclaw::download::ServerToken(token_for_file),
+            )),
+        )
+        // MyClaw fork ext: 伴生工具的 HTTP 端点(openclaw / pi)。放公共组是因为条目里
+        // 只有 agent 派生凭证,require_token 不认它 —— **也绝不能让它认**(否则一把写在
+        // openclaw.json 里的凭证就能调 /myclaw/exec)。handler 自己认:这个 agent 的派生
+        // 凭证,或过渡期的主 token。
+        .route(
+            "/myclaw/mcp/{agent}",
+            post(handlers::myclaw::mcp::rpc).layer(Extension(
+                handlers::myclaw::download::ServerToken(token_for_mcp),
             )),
         )
         .route(

@@ -38,6 +38,25 @@
 //! 代价是工具前缀随 agent 变(openclaw 的工具名是 `<条目名>__<工具名>`)。可以接受:
 //! openclaw 侧的模型本来就是先 `tool_search` 再调用,不依赖写死的名字。
 //!
+//! ## 凭证:每个 agent 一把,只能调本端点
+//!
+//! 条目会被平台写进 runtime 自己的配置文件(openclaw 的 `openclaw.json`、pi 的
+//! `mcp.json`),而这些文件与 agent 同一个系统用户、模型随手就能读到。早先条目里放的
+//! 是 codeg 的**主 token** —— 读到它就能调 codeg 的全部接口,也能拿别的 agent 的
+//! URL 冒充它(2026-09-30 在 C6 上核对:条目里那把的哈希与主 token 相同)。
+//!
+//! 现在条目里是 [`agent_token`]:`cmcp_` + HMAC-SHA256(主 token,
+//! `codeg-mcp-http/v1:<agent>`)。确定性、不落库,重复投影得到同一把,配置不会来回抖;
+//! 只对自己那条 `/myclaw/mcp/<agent>` 有效,换个 agent 段或换个接口都不认。
+//!
+//! 因此本端点不在 `require_token` 组里,由 [`rpc`] 自己认凭证。**不要**反过来把派生
+//! 凭证加进 `require_token` —— 那样它就能调 `/myclaw/exec`。过渡期仍接受主 token:
+//! 存量实例配置里写的还是它,升级后到下一次投影之间不能让上传断掉;主 token 本来就
+//! 什么都能调,多认它一处不增加任何能力。
+//!
+//! ⚠️ 这是收窄暴露面,不是容器内的安全边界:codeg 与 agent 目前同属 `ubuntu`,
+//! 能开 shell 的 agent 仍能从 codeg 自己的文件里读到主 token。
+//!
 //! ## v1 只开 uploads
 //!
 //! `upload_file` 是实例级的(listener 的 `process_upload` 只用 `path`),不需要解析到
@@ -58,8 +77,11 @@ use axum::extract::{Extension, Path};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Sha256;
 
 use crate::acp::delegation::companion::{
     render_upload_result, CompanionFeatures, COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME,
@@ -67,6 +89,7 @@ use crate::acp::delegation::companion::{
 };
 use crate::app_state::AppState;
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
+use crate::web::handlers::myclaw::download::ServerToken;
 
 /// 这条传输暴露的工具组 —— 见模块头「v1 只开 uploads」。
 const HTTP_FEATURES: &str = "uploads";
@@ -93,6 +116,55 @@ fn valid_agent_segment(s: &str) -> bool {
         && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// 派生凭证的前缀 —— 一眼能认出它不是主 token,日志里也好分辨。
+const AGENT_TOKEN_PREFIX: &str = "cmcp_";
+/// HMAC 的域分隔。同一把主 token 以后若再派生别的凭证,换这一段即互不相通。
+const AGENT_TOKEN_DOMAIN: &str = "codeg-mcp-http/v1:";
+
+fn agent_mac(secret: &str, agent: &str) -> Option<Hmac<Sha256>> {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(AGENT_TOKEN_DOMAIN.as_bytes());
+    mac.update(agent.as_bytes());
+    Some(mac)
+}
+
+/// 一个 agent 专用、只能调 `/myclaw/mcp/<agent>` 的凭证(见模块头「凭证」)。
+pub(crate) fn agent_token(secret: &str, agent: &str) -> Option<String> {
+    let mac = agent_mac(secret, agent)?;
+    Some(format!(
+        "{AGENT_TOKEN_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    ))
+}
+
+/// 本端点认两种 Bearer:这个 agent 的派生凭证,或(过渡期)主 token。
+///
+/// 主 token 为空时一律拒 —— 与 auth.rs 同一条 fail-closed,否则 `Bearer ` 会误中。
+fn authorized(headers: &HeaderMap, secret: &str, agent: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    match presented.strip_prefix(AGENT_TOKEN_PREFIX) {
+        Some(sig) => {
+            let (Ok(sig), Some(mac)) = (URL_SAFE_NO_PAD.decode(sig), agent_mac(secret, agent))
+            else {
+                return false;
+            };
+            // verify_slice 内部是恒定时间比较,别换成 `==`。
+            mac.verify_slice(&sig).is_ok()
+        }
+        // 与 auth.rs 的主 token 比对同一写法。
+        None => presented == secret,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,13 +282,20 @@ impl ArtifactUploadAccess for StateUpload<'_> {
 }
 
 /// `POST /api/myclaw/mcp/{agent}` —— MCP over streamable-http。
+///
+/// 挂在公共路由组,凭证由这里认(见模块头「凭证」)。
 pub async fn rpc(
     Path(agent): Path<String>,
     Extension(state): Extension<Arc<AppState>>,
+    Extension(ServerToken(secret)): Extension<ServerToken>,
+    headers: HeaderMap,
     Json(req): Json<RpcRequest>,
 ) -> Response {
     if !valid_agent_segment(&agent) {
         return (StatusCode::BAD_REQUEST, "invalid agent segment").into_response();
+    }
+    if !authorized(&headers, &secret, &agent) {
+        return (StatusCode::UNAUTHORIZED, "Invalid or missing token").into_response();
     }
     // 通知(没有 id)不产生响应体 —— MCP 客户端只看状态码。
     let Some(id) = req.id else {
@@ -242,8 +321,8 @@ pub async fn rpc(
 /// 「伴生跟随 codeg」的落点:名字、传输、URL、开了哪些工具全由这里说了算,平台只
 /// 搬运。以后加工具 / 改名 / 换端口,平台一行都不用动。
 ///
-/// `Authorization` 原样回显调用方刚用过的那把凭证 —— 它就是 codeg 的 token,平台本来
-/// 就拿着(不然调不到这个接口)。这样 codeg 不必为了拼条目去读 WebServerState。
+/// `Authorization` 是这个 agent 的派生凭证([`agent_token`]),**不是**平台调本接口时用的
+/// 主 token —— 条目会原样落进 agent 读得到的配置文件。
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpEntry {
@@ -275,7 +354,10 @@ fn short_agent(agent: &str) -> String {
 }
 
 /// `GET /api/myclaw/mcp-entry/{agent}`
-pub async fn entry(Path(agent): Path<String>, headers: HeaderMap) -> Response {
+pub async fn entry(
+    Path(agent): Path<String>,
+    Extension(ServerToken(secret)): Extension<ServerToken>,
+) -> Response {
     if !valid_agent_segment(&agent) {
         return (StatusCode::BAD_REQUEST, "invalid agent segment").into_response();
     }
@@ -291,13 +373,20 @@ pub async fn entry(Path(agent): Path<String>, headers: HeaderMap) -> Response {
             .unwrap_or_default(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // 本接口在 require_token 组里,主 token 为空时根本进不来;这里再挡一次,
+    // 免得哪天路由挪了位置后签出一把用空密钥算的凭证。
+    let Some(token) = (!secret.is_empty())
+        .then(|| agent_token(&secret, &agent))
+        .flatten()
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server token unavailable",
+        )
+            .into_response();
+    };
     let mut hdrs = std::collections::BTreeMap::new();
-    if let Some(auth) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        hdrs.insert("Authorization".to_string(), auth.to_string());
-    }
+    hdrs.insert("Authorization".to_string(), format!("Bearer {token}"));
     Json(McpEntry {
         name: format!("{COMPANION_SERVER_NAME}-{}", short_agent(&agent)),
         transport: "streamable-http",
@@ -438,6 +527,82 @@ mod tests {
             format!("{COMPANION_SERVER_NAME}-{}", short_agent("va-c4a9f7cd-c3b1-4ee4-baac-24ae8c8c465f")),
             "myclaw-va-c4a9f7cd"
         );
+    }
+
+    const SECRET: &str = "codeg-master-token-for-tests";
+    const AGENT: &str = "va-c4a9f7cd-c3b1-4ee4-baac-24ae8c8c465f";
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    /// 派生凭证:确定性(重复投影不抖)、按 agent 各不相同、不等于也不含主 token。
+    #[test]
+    fn agent_token_is_deterministic_per_agent_and_hides_the_master() {
+        let a = agent_token(SECRET, AGENT).unwrap();
+        assert_eq!(a, agent_token(SECRET, AGENT).unwrap());
+        assert!(a.starts_with(AGENT_TOKEN_PREFIX));
+        assert!(!a.contains(SECRET));
+        assert_ne!(
+            a,
+            agent_token(SECRET, "va-11111111-2222-3333-4444-555555555555").unwrap()
+        );
+        // 主 token 轮换后旧凭证作废
+        assert_ne!(a, agent_token("rotated-master", AGENT).unwrap());
+    }
+
+    /// 本端点只认:自己 agent 的派生凭证,或主 token(过渡期)。
+    #[test]
+    fn rpc_accepts_own_agent_token_and_master_only() {
+        let own = agent_token(SECRET, AGENT).unwrap();
+        assert!(authorized(&bearer(&own), SECRET, AGENT));
+        assert!(authorized(&bearer(SECRET), SECRET, AGENT));
+
+        // 拿 A 的凭证去调 B 的 URL —— 冒充别的 agent,必须拒
+        let other = "va-11111111-2222-3333-4444-555555555555";
+        assert!(!authorized(&bearer(&own), SECRET, other));
+        // 用别的主 token 算出来的(另一台实例的)凭证 —— 拒
+        assert!(!authorized(
+            &bearer(&agent_token("other-instance", AGENT).unwrap()),
+            SECRET,
+            AGENT
+        ));
+        // 改一个字符 / 截断 / 非法 base64 / 空 / 缺头 —— 全拒。
+        // 改签名中段的字符:末字符的低位是 base64 填充位,改它不一定改到签名。
+        let mut chars: Vec<char> = own.chars().collect();
+        let mid = AGENT_TOKEN_PREFIX.len() + 10;
+        chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
+        let tampered: String = chars.into_iter().collect();
+        for bad in [
+            tampered.as_str(),
+            &own[..own.len() - 4],
+            "cmcp_***",
+            "cmcp_",
+            "",
+            "nope",
+        ] {
+            assert!(
+                !authorized(&bearer(bad), SECRET, AGENT),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(!authorized(&HeaderMap::new(), SECRET, AGENT));
+    }
+
+    /// 主 token 为空(配置缺失)时一律拒,包括空 Bearer 与用空密钥算出的派生凭证。
+    #[test]
+    fn empty_master_token_fails_closed() {
+        assert!(!authorized(&bearer(""), "", AGENT));
+        assert!(!authorized(
+            &bearer(&agent_token("", AGENT).unwrap()),
+            "",
+            AGENT
+        ));
     }
 
     /// 末段会同时进 URL 和配置文件里的条目名 —— 两处都不能被污染。
