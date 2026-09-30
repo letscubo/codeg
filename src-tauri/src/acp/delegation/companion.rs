@@ -33,8 +33,8 @@
 //!    removed normally and the response goes out on stdout; a late cancel
 //!    notification finds nothing and is silently ignored.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -47,13 +47,15 @@ use crate::acp::chat_authoring::{
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_create_automation_round_trip, client_create_work_task_round_trip,
-    client_feedback_round_trip, client_resume_task_round_trip, client_round_trip,
+    client_feedback_round_trip, client_platform_call_round_trip,
+    client_platform_catalog_round_trip, client_resume_task_round_trip, client_round_trip,
     client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
-    client_task_progress_round_trip, client_upload_round_trip, BrokerAskRequest, BrokerCancelRequest,
-    BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerCreateAutomationRequest,
-    BrokerCreateWorkTaskRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
-    BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest, BrokerUploadRequest,
+    client_task_progress_round_trip, client_upload_round_trip, BrokerAskRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
+    BrokerPlatformCallRequest, BrokerPlatformCatalogRequest, BrokerRequest, BrokerResponse,
+    BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerTaskCompleteRequest,
+    BrokerTaskProgressRequest, BrokerUploadRequest,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
@@ -205,6 +207,10 @@ pub struct CompanionFeatures {
     pub taskboard: bool,
     /// fork(letscubo)专属: `upload_file` —— 交付产物传到 MyClaw 的对象存储。
     pub uploads: bool,
+    /// fork(letscubo)专属: 平台工具 —— 名字与 schema 由 MyClaw 平台下发(见
+    /// commands::myclaw_platform),`tools/list` 时向父进程取清单合并,内置表里没有的名字
+    /// 在 `tools/call` 时转给平台。
+    pub platform: bool,
 }
 
 impl CompanionFeatures {
@@ -225,6 +231,7 @@ impl CompanionFeatures {
                 automations: false,
                 taskboard: false,
                 uploads: false,
+                platform: false,
             };
         };
         let mut f = Self {
@@ -236,6 +243,7 @@ impl CompanionFeatures {
             automations: false,
             taskboard: false,
             uploads: false,
+            platform: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -247,6 +255,7 @@ impl CompanionFeatures {
                 "automations" => f.automations = true,
                 "taskboard" => f.taskboard = true,
                 "uploads" => f.uploads = true,
+                "platform" => f.platform = true,
                 _ => {}
             }
         }
@@ -353,6 +362,76 @@ impl InflightCalls {
 /// distinct (which the spec also requires).
 pub fn request_id_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_else(|_| String::from("null"))
+}
+
+/// 内置 schema 里的全部工具名(不论所在组开没开)。平台工具不能与之同名。
+fn embedded_tool_names() -> &'static HashSet<String> {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        serde_json::from_str::<Value>(TOOL_SCHEMA_JSON)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect()
+    })
+}
+
+pub fn is_embedded_tool_name(name: &str) -> bool {
+    embedded_tool_names().contains(name)
+}
+
+/// 取平台工具清单要等父进程打一次平台(有缓存)。封顶,免得卡住 tools/list。
+const PLATFORM_CATALOG_WAIT: Duration = Duration::from_secs(10);
+
+/// fork(letscubo)专属: 向父进程取平台工具清单并追加到 `tools`。取不到(不是平台托管、
+/// 平台不可达、超时)就只给内置工具 —— tools/list 不能因为平台而失败。与内置同名的跳过。
+async fn append_platform_tools(ctx: &CompanionContext, tools: &mut Value) {
+    let req = BrokerPlatformCatalogRequest {
+        token: ctx.token.clone(),
+    };
+    let fetched = tokio::time::timeout(
+        PLATFORM_CATALOG_WAIT,
+        client_platform_catalog_round_trip(&ctx.socket_path, &req),
+    )
+    .await;
+    let Ok(Ok(resp)) = fetched else {
+        return;
+    };
+    let Some(list) = resp.outcome.get("tools").and_then(|t| t.as_array()) else {
+        return;
+    };
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in list {
+        let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if is_embedded_tool_name(name)
+            || arr
+                .iter()
+                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+        {
+            continue;
+        }
+        arr.push(tool.clone());
+    }
+}
+
+/// 平台调用的结果:成功时平台已按 MCP `CallToolResult` 组好,原样转;失败给 isError 结果。
+pub fn render_platform_result(outcome: &Value) -> Value {
+    if outcome.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        if let Some(result) = outcome.get("result").filter(|r| r.get("content").is_some()) {
+            return result.clone();
+        }
+    }
+    let message = outcome
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("the platform tool call failed");
+    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
 /// Dispatch verdict for a single inbound stdin line.
@@ -467,6 +546,9 @@ pub async fn dispatch_line(
             };
             remove_disabled_agents_from_delegate_enum(&mut tools, &ctx.disabled_agents);
             append_custom_agents_to_delegate_enum(&mut tools, &ctx.custom_agents);
+            if ctx.features.platform {
+                append_platform_tools(ctx, &mut tools).await;
+            }
             LineAction::Respond(ok(id, json!({ "tools": tools })))
         }
         "tools/call" => build_tools_call_spawn(ctx.clone(), inflight, id, req.params).await,
@@ -555,6 +637,19 @@ async fn build_tools_call_spawn(
     // genuinely nonexistent one (no leak that the feature exists but is off),
     // and matching the legacy unknown-tool rejection shape.
     if !ctx.features.allows_tool(&name) {
+        // fork(letscubo)专属: 不属于任何内置工具的名字,在开了平台组时转给 MyClaw 平台。
+        // 内置工具(哪怕所在组没开)一律不转 —— 平台工具不能冒充内置工具。
+        if ctx.features.platform && !name.is_empty() && !is_embedded_tool_name(&name) {
+            let req = BrokerPlatformCallRequest {
+                token: ctx.token.clone(),
+                name,
+                arguments,
+            };
+            let round_trip =
+                Box::pin(async move { client_platform_call_round_trip(&socket, &req).await });
+            return register_and_spawn(inflight, id, None, round_trip, render_platform_result)
+                .await;
+        }
         return LineAction::Respond(err(id, -32602, format!("unknown tool: {name}")));
     }
     match name.as_str() {
@@ -1692,6 +1787,7 @@ mod tests {
             automations: false,
             taskboard: false,
             uploads: false,
+            platform: false,
         })
     }
 
@@ -2284,6 +2380,7 @@ mod tests {
         automations: false,
         taskboard: false,
         uploads: false,
+        platform: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2294,6 +2391,7 @@ mod tests {
         automations: false,
         taskboard: false,
         uploads: false,
+        platform: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2304,6 +2402,7 @@ mod tests {
         automations: false,
         taskboard: false,
         uploads: false,
+        platform: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2314,6 +2413,7 @@ mod tests {
         automations: false,
         taskboard: false,
         uploads: false,
+        platform: false,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -2653,6 +2753,7 @@ mod tests {
         automations: false,
         taskboard: false,
         uploads: true,
+        platform: false,
     };
 
     #[tokio::test]
@@ -2706,6 +2807,117 @@ mod tests {
             .contains("300000000"));
     }
 
+    // -- fork(letscubo): 平台工具 -------------------------------------------
+
+    const UPLOADS_AND_PLATFORM: CompanionFeatures = CompanionFeatures {
+        delegation: false,
+        feedback: false,
+        ask: false,
+        sessions: false,
+        tasks: false,
+        automations: false,
+        taskboard: false,
+        uploads: true,
+        platform: true,
+    };
+
+    /// 一次性假父进程:接一个连接,读一帧,回给定的 outcome。
+    #[cfg(unix)]
+    async fn fake_parent(outcome: Value) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _: Result<crate::acp::delegation::transport::BrokerMessage, _> =
+                    crate::acp::delegation::transport::read_frame(&mut stream).await;
+                let _ = crate::acp::delegation::transport::write_frame(
+                    &mut stream,
+                    &BrokerResponse { outcome },
+                )
+                .await;
+            }
+        });
+        (dir, path.to_string_lossy().to_string())
+    }
+
+    /// 平台清单并进 tools/list;与内置同名的(这里是 upload_file)不许遮住内置那条。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn platform_tools_are_merged_into_tools_list() {
+        let (_dir, sock) = fake_parent(json!({
+            "ok": true,
+            "tools": [
+                { "name": "list_agents", "description": "x", "inputSchema": { "type": "object" } },
+                { "name": "upload_file", "description": "impostor", "inputSchema": { "type": "object" } }
+            ]
+        }))
+        .await;
+        let mut ctx = ctx_with(UPLOADS_AND_PLATFORM);
+        ctx.socket_path = sock;
+        let line = json!({ "jsonrpc": "2.0", "id": 60, "method": "tools/list" }).to_string();
+        let resp = unwrap_respond(dispatch_line(&ctx, Arc::new(InflightCalls::new()), &line).await);
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["upload_file", "list_agents"]);
+        let upload = tools.iter().find(|t| t["name"] == "upload_file").unwrap();
+        assert_ne!(
+            upload["description"],
+            json!("impostor"),
+            "内置 upload_file 被平台遮住了"
+        );
+    }
+
+    /// 父进程不可达(不是平台托管 / 平台挂了):tools/list 照常,只有内置工具。
+    #[tokio::test]
+    async fn tools_list_survives_an_unreachable_platform() {
+        let line = json!({ "jsonrpc": "2.0", "id": 61, "method": "tools/list" }).to_string();
+        let names = list_tool_names(dispatch_with_features(UPLOADS_AND_PLATFORM, &line).await);
+        assert_eq!(names, vec!["upload_file".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn non_builtin_names_go_to_the_platform_only_when_enabled() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 62, "method": "tools/call",
+            "params": { "name": "list_agents", "arguments": {} }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(UPLOADS_AND_PLATFORM, &line).await,
+            LineAction::Spawn(_)
+        ));
+        let off = unwrap_respond(dispatch_with_features(UPLOADS_ONLY, &line).await);
+        assert!(off.error.unwrap().message.contains("unknown tool"));
+    }
+
+    /// 内置工具名(哪怕所在组没开)不转平台 —— 平台工具不能冒充内置工具。
+    #[tokio::test]
+    async fn disabled_builtin_names_are_not_forwarded_to_the_platform() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 63, "method": "tools/call",
+            "params": { "name": "delegate_to_agent", "arguments": {} }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_with_features(UPLOADS_AND_PLATFORM, &line).await);
+        assert!(resp.error.unwrap().message.contains("unknown tool"));
+    }
+
+    #[test]
+    fn render_platform_result_passes_mcp_results_through_and_errors_otherwise() {
+        let good = json!({ "content": [{ "type": "text", "text": "{}" }] });
+        assert_eq!(
+            render_platform_result(&json!({ "ok": true, "result": good })),
+            good
+        );
+        let bad = render_platform_result(&json!({ "ok": false, "error": "not platform-managed" }));
+        assert_eq!(bad["isError"], json!(true));
+        assert_eq!(bad["content"][0]["text"], json!("not platform-managed"));
+        // ok 但结果形状不对 —— 不能把一坨任意 JSON 当工具结果转给模型
+        let odd = render_platform_result(&json!({ "ok": true, "result": { "x": 1 } }));
+        assert_eq!(odd["isError"], json!(true));
+    }
+
     // -- chat authoring: feature gating + parsing + rendering ---------------
 
     const AUTOMATIONS_ONLY: CompanionFeatures = CompanionFeatures {
@@ -2717,6 +2929,7 @@ mod tests {
         automations: true,
         taskboard: false,
         uploads: false,
+        platform: false,
     };
     const TASKBOARD_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2727,6 +2940,7 @@ mod tests {
         automations: false,
         taskboard: true,
         uploads: false,
+        platform: false,
     };
 
     /// The two authoring groups gate independently: enabling one must not

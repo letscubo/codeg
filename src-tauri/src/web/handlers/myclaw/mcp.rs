@@ -57,13 +57,17 @@
 //! ⚠️ 这是收窄暴露面,不是容器内的安全边界:codeg 与 agent 目前同属 `ubuntu`,
 //! 能开 shell 的 agent 仍能从 codeg 自己的文件里读到主 token。
 //!
-//! ## v1 只开 uploads
+//! ## 只开 uploads + platform
 //!
 //! `upload_file` 是实例级的(listener 的 `process_upload` 只用 `path`),不需要解析到
 //! 某条连接。会话级工具(delegate / ask / feedback / taskboard)全都要
 //! `parent_connection_id`,得先把 `va-<id>` → 活跃连接的映射做出来;在那之前它们既
 //! 不出现在 `tools/list`,被按名硬调也一律回 "unknown tool"(与 stdio 同一句,不泄露
 //! "功能存在但关着")。
+//!
+//! 平台工具(`platform`,清单与实现都在 MyClaw 平台,见 `commands::myclaw_platform`)
+//! 只要 agent 级身份:调用时把 URL 末段作 `{ agentKey }` 交给平台。内置工具名(哪怕所在
+//! 组没开)一律不转平台 —— 平台工具不能冒充内置工具。
 //!
 //! ## 无状态
 //!
@@ -84,15 +88,17 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use crate::acp::delegation::companion::{
-    render_upload_result, CompanionFeatures, COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME,
-    TOOL_SCHEMA_JSON,
+    is_embedded_tool_name, render_platform_result, render_upload_result, CompanionFeatures,
+    COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME, TOOL_SCHEMA_JSON,
 };
 use crate::app_state::AppState;
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
 use crate::web::handlers::myclaw::download::ServerToken;
 
-/// 这条传输暴露的工具组 —— 见模块头「v1 只开 uploads」。
-const HTTP_FEATURES: &str = "uploads";
+/// 这条传输暴露的工具组 —— 见模块头「只开 uploads + platform」。
+/// fork: `platform` = 平台工具(名字与 schema 由 MyClaw 平台下发,见 commands::myclaw_platform)。
+/// 它们只需要 agent 级身份(URL 末段),不需要会话级的 parent_connection_id,所以这条传输也能开。
+const HTTP_FEATURES: &str = "uploads,platform";
 
 /// 与 companion 自报的一致(companion.rs 的 `initialize`)。两处必须同版本,否则同一个
 /// 伴生在两条传输上自称不同协议版本。
@@ -236,10 +242,27 @@ async fn call_tool(
         .unwrap_or_default()
         .to_string();
     // 未开启与不存在给同一句 —— 与 companion.rs 的拒绝形状逐字一致。
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     if !features.allows_tool(&name) {
+        // 不属于任何内置工具的名字 → 平台工具;调用方身份就是 URL 末段(已由凭证认过)。
+        // 内置工具(哪怕所在组没开)一律不转 —— 与 companion.rs 同一条规则。
+        if features.platform && !name.is_empty() && !is_embedded_tool_name(&name) {
+            let identity = json!({ "agentKey": agent });
+            // 渲染与 stdio 共用 render_platform_result:形状不对的结果同样变 isError,不原样转给模型
+            let outcome = match uploads.platform_call(&name, arguments, identity).await {
+                Ok(result) => json!({ "ok": true, "result": result }),
+                Err(e) => {
+                    tracing::warn!("[MyclawMcp] platform tool {name} failed for {agent}: {e}");
+                    json!({ "ok": false, "error": e })
+                }
+            };
+            return envelope_ok(id, render_platform_result(&outcome));
+        }
         return envelope_err(id, -32602, format!("unknown tool: {name}"));
     }
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     match name.as_str() {
         "upload_file" => {
             let path = arguments
@@ -279,6 +302,53 @@ impl ArtifactUploadAccess for StateUpload<'_> {
     async fn upload(&self, path: &str) -> Result<String, String> {
         crate::commands::myclaw_upload::upload_file(self.0, path).await
     }
+
+    async fn platform_catalog(&self) -> Result<Vec<Value>, String> {
+        crate::commands::myclaw_platform::catalog(self.0).await
+    }
+
+    async fn platform_call(
+        &self,
+        name: &str,
+        arguments: Value,
+        identity: Value,
+    ) -> Result<Value, String> {
+        crate::commands::myclaw_platform::call(self.0, name, arguments, identity).await
+    }
+}
+
+/// 内置工具表 + (开了平台组时)平台工具清单。平台取不到就只给内置 —— tools/list 不能因平台失败。
+async fn tools_list_with_platform(
+    uploads: &dyn ArtifactUploadAccess,
+    features: CompanionFeatures,
+) -> Result<Value, String> {
+    let mut result = tools_list_result(features)?;
+    if !features.platform {
+        return Ok(result);
+    }
+    let Ok(extra) = uploads.platform_catalog().await else {
+        return Ok(result);
+    };
+    if let Some(arr) = result["tools"].as_array_mut() {
+        for tool in extra {
+            let Some(name) = tool
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if is_embedded_tool_name(&name)
+                || arr
+                    .iter()
+                    .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+            {
+                continue;
+            }
+            arr.push(tool);
+        }
+    }
+    Ok(result)
 }
 
 /// `POST /api/myclaw/mcp/{agent}` —— MCP over streamable-http。
@@ -304,7 +374,7 @@ pub async fn rpc(
     let features = CompanionFeatures::parse(Some(HTTP_FEATURES));
     let body = match req.method.as_str() {
         "initialize" => envelope_ok(id, initialize_result()),
-        "tools/list" => match tools_list_result(features) {
+        "tools/list" => match tools_list_with_platform(&StateUpload(&state.db), features).await {
             Ok(result) => envelope_ok(id, result),
             Err(e) => envelope_err(id, -32603, e),
         },
@@ -425,7 +495,7 @@ mod tests {
             .collect()
     }
 
-    /// v1 的契约:这条传输只端上 `upload_file`。会话级工具要 parent_connection_id,
+    /// 内置部分只端上 `upload_file`(平台工具另由 tools_list_with_platform 追加)。会话级工具要 parent_connection_id,
     /// 在映射做出来之前露面就是骗人(pi 那个教训)。
     #[test]
     fn tools_list_exposes_only_upload_file() {
@@ -500,6 +570,127 @@ mod tests {
             .await;
             assert_eq!(out["error"]["code"], -32602);
         }
+    }
+
+    /// 平台桩:固定清单;调用时把 (name, identity) 记下来并回一个文本结果。
+    struct PlatformStub {
+        catalog: Vec<Value>,
+        calls: std::sync::Mutex<Vec<(String, Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactUploadAccess for PlatformStub {
+        async fn upload(&self, _path: &str) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn platform_catalog(&self) -> Result<Vec<Value>, String> {
+            Ok(self.catalog.clone())
+        }
+        async fn platform_call(
+            &self,
+            name: &str,
+            _arguments: Value,
+            identity: Value,
+        ) -> Result<Value, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), identity));
+            if name == "odd_shape" {
+                return Ok(json!({ "x": 1 }));
+            }
+            Ok(json!({ "content": [{ "type": "text", "text": format!("ran {name}") }] }))
+        }
+    }
+
+    fn platform_stub() -> PlatformStub {
+        PlatformStub {
+            catalog: vec![
+                json!({ "name": "list_agents", "description": "d", "inputSchema": { "type": "object" } }),
+                json!({ "name": "upload_file", "description": "impostor", "inputSchema": { "type": "object" } }),
+                json!({ "name": "list_agents", "description": "dup", "inputSchema": { "type": "object" } }),
+            ],
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 平台清单并在内置之后;与内置同名、清单内重复的都丢掉。
+    #[tokio::test]
+    async fn tools_list_appends_the_platform_catalog() {
+        let result = tools_list_with_platform(&platform_stub(), features())
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_names(&result),
+            vec!["upload_file".to_string(), "list_agents".to_string()]
+        );
+        assert_ne!(result["tools"][0]["description"], "impostor");
+    }
+
+    /// 平台不可用(默认实现回 Err):tools/list 照常只给内置。
+    #[tokio::test]
+    async fn tools_list_survives_an_unavailable_platform() {
+        let result = tools_list_with_platform(&StubUpload(Ok(String::new())), features())
+            .await
+            .unwrap();
+        assert_eq!(tool_names(&result), vec!["upload_file".to_string()]);
+    }
+
+    /// 非内置名字转平台,身份是 URL 里的 agent 段。
+    #[tokio::test]
+    async fn non_builtin_calls_are_forwarded_with_the_agent_key() {
+        let stub = platform_stub();
+        let out = call_tool(
+            &stub,
+            AGENT,
+            json!(3),
+            features(),
+            Some(json!({ "name": "list_agents", "arguments": {} })),
+        )
+        .await;
+        assert_eq!(out["result"]["content"][0]["text"], "ran list_agents");
+        let calls = stub.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, json!({ "agentKey": AGENT }));
+    }
+
+    #[tokio::test]
+    async fn platform_failures_and_odd_results_become_is_error() {
+        let out = call_tool(
+            &StubUpload(Ok(String::new())),
+            AGENT,
+            json!(4),
+            features(),
+            Some(json!({ "name": "list_agents", "arguments": {} })),
+        )
+        .await;
+        assert!(out.get("error").is_none());
+        assert_eq!(out["result"]["isError"], true);
+        let odd = call_tool(
+            &platform_stub(),
+            AGENT,
+            json!(5),
+            features(),
+            Some(json!({ "name": "odd_shape", "arguments": {} })),
+        )
+        .await;
+        assert_eq!(odd["result"]["isError"], true);
+    }
+
+    /// 关掉平台组时,未知名字仍是协议错误,不转发。
+    #[tokio::test]
+    async fn without_the_platform_feature_unknown_names_stay_unknown() {
+        let stub = platform_stub();
+        let out = call_tool(
+            &stub,
+            AGENT,
+            json!(6),
+            CompanionFeatures::parse(Some("uploads")),
+            Some(json!({ "name": "list_agents", "arguments": {} })),
+        )
+        .await;
+        assert_eq!(out["error"]["message"], "unknown tool: list_agents");
+        assert!(stub.calls.lock().unwrap().is_empty());
     }
 
     #[test]

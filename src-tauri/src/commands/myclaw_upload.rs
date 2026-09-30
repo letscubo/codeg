@@ -263,10 +263,31 @@ async fn put(upload_url: &str, mime: &str, body: Vec<u8>) -> Result<(), String> 
 }
 
 /// 让 delegation listener 通过 trait 调到本模块 —— listener 不直接依赖 commands。
+///
+/// 名字沿用最早的上传用途,实际上它是「用本实例凭证访问 MyClaw 平台」的那个口子:平台工具
+/// (`platform_catalog` / `platform_call`,见 commands/myclaw_platform.rs)也挂在这里,
+/// 免得为同一份凭证再往 DelegationListener 的构造函数里加一个参数。两者都有默认实现
+/// (= 不可用),测试里的桩不用改。
 #[async_trait::async_trait]
 pub trait ArtifactUploadAccess: Send + Sync {
     /// 传一个本地文件, 成功回公开链接, 失败回一句给模型看的原因。
     async fn upload(&self, path: &str) -> Result<String, String>;
+
+    /// 平台工具清单(MCP Tool 形状)。
+    async fn platform_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
+        Err("platform tools are unavailable".to_string())
+    }
+
+    /// 调一个平台工具,成功回 MCP `CallToolResult`。`identity` 是调用方线索
+    /// (`{ conversationId }` 或 `{ agentKey }`)。
+    async fn platform_call(
+        &self,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _identity: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("platform tools are unavailable".to_string())
+    }
 }
 
 /// 生产实现: 认证与端点都从 codeg 自己的 webhook 配置派生。
@@ -284,6 +305,19 @@ impl DbArtifactUpload {
 impl ArtifactUploadAccess for DbArtifactUpload {
     async fn upload(&self, path: &str) -> Result<String, String> {
         upload_file(&self.db, path).await
+    }
+
+    async fn platform_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
+        crate::commands::myclaw_platform::catalog(&self.db).await
+    }
+
+    async fn platform_call(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        identity: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        crate::commands::myclaw_platform::call(&self.db, name, arguments, identity).await
     }
 }
 

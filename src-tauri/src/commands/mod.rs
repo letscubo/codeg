@@ -28,6 +28,8 @@ pub mod model_provider;
 pub mod office_tools;
 // fork(letscubo)专属: 交付产物直传 MyClaw 对象存储(MCP 工具 upload_file 用)
 pub mod myclaw_upload;
+// fork(letscubo)专属: 伴生「平台工具」—— tools/list、tools/call 转给 MyClaw 平台(签名请求)。
+pub mod myclaw_platform;
 pub mod open_in;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;

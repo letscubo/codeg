@@ -252,6 +252,22 @@ pub struct BrokerUploadRequest {
     pub path: String,
 }
 
+/// fork(letscubo)专属: 取平台工具清单(companion 的 `tools/list` 合并用)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerPlatformCatalogRequest {
+    pub token: String,
+}
+
+/// fork(letscubo)专属: 调一个平台工具。调用方线索(会话)由父进程按 token 反查补上,
+/// companion 不自报 —— 与其它会话级工具同一条规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerPlatformCallRequest {
+    pub token: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
@@ -273,6 +289,9 @@ pub enum BrokerMessage {
     CreateWorkTask(BrokerCreateWorkTaskRequest),
     /// fork(letscubo)专属: 交付产物上传。
     UploadFile(BrokerUploadRequest),
+    /// fork(letscubo)专属: 平台工具清单 / 调用(commands::myclaw_platform)。
+    PlatformCatalog(BrokerPlatformCatalogRequest),
+    PlatformCall(BrokerPlatformCallRequest),
     /// Liveness probe. Unlike every other variant this one is NOT sent by a
     /// companion — it comes from codeg's own service-status check
     /// (`acp::delegation::service`), which is why it carries no `token`: a
@@ -446,6 +465,22 @@ pub async fn client_upload_round_trip(
     req: &BrokerUploadRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::UploadFile(req.clone())).await
+}
+
+/// fork(letscubo)专属: 取平台工具清单。outcome = `{ ok, tools | error }`。
+pub async fn client_platform_catalog_round_trip(
+    socket_path: &str,
+    req: &BrokerPlatformCatalogRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::PlatformCatalog(req.clone())).await
+}
+
+/// fork(letscubo)专属: 调一个平台工具。outcome = `{ ok, result | error }`。
+pub async fn client_platform_call_round_trip(
+    socket_path: &str,
+    req: &BrokerPlatformCallRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::PlatformCall(req.clone())).await
 }
 
 /// Dispatch a `task_progress` report and read back the `{ recorded }` ack.

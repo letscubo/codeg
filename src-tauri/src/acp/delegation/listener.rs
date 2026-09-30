@@ -556,6 +556,14 @@ impl DelegationListener {
                 // 与 SessionInfo 同类, 直接在这里等完再回。
                 upload_response(self.process_upload(req).await)?
             }
+            BrokerMessage::PlatformCatalog(req) => {
+                // 有缓存的一次小往返(commands::myclaw_platform::catalog)
+                platform_catalog_response(self.process_platform_catalog(req).await)?
+            }
+            BrokerMessage::PlatformCall(req) => {
+                // 一次有界的平台请求;高风险工具在平台侧只建待确认记录,不在这里阻塞等人
+                platform_call_response(self.process_platform_call(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -836,6 +844,36 @@ impl DelegationListener {
         self.authoring.create_automation(ctx, req.spec).await
     }
 
+    /// fork(letscubo)专属: 平台工具清单。只做 token 校验 —— 清单与会话无关。
+    async fn process_platform_catalog(
+        &self,
+        req: crate::acp::delegation::transport::BrokerPlatformCatalogRequest,
+    ) -> Result<Vec<Value>, String> {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return Err("invalid token".to_string());
+        }
+        self.uploads.platform_catalog().await
+    }
+
+    /// fork(letscubo)专属: 调一个平台工具。调用方线索由 token 反查(→ 父连接 → 当前
+    /// 会话),**不信 companion 自报** —— 与 authoring_context 同一条规则。
+    async fn process_platform_call(
+        &self,
+        req: crate::acp::delegation::transport::BrokerPlatformCallRequest,
+    ) -> Result<Value, String> {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return Err("invalid token".to_string());
+        };
+        let conversation_id = self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await;
+        let identity = serde_json::json!({ "conversationId": conversation_id });
+        self.uploads
+            .platform_call(&req.name, req.arguments, identity)
+            .await
+    }
+
     /// 校验 token 后把上传交给实现。失败原因原样回给模型 —— 它要据此决定重试还是收手。
     async fn process_upload(&self, req: BrokerUploadRequest) -> Result<String, String> {
         if self.tokens.lookup(&req.token).await.is_none() {
@@ -994,6 +1032,24 @@ fn task_ack_response(ack: TaskReportAck) -> std::io::Result<BrokerResponse> {
 }
 
 /// fork(letscubo)专属: 把上传结果编成 `{ ok, url }` / `{ ok: false, error }`。
+fn platform_catalog_response(
+    result: Result<Vec<Value>, String>,
+) -> std::io::Result<BrokerResponse> {
+    let outcome = match result {
+        Ok(tools) => serde_json::json!({ "ok": true, "tools": tools }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    };
+    Ok(BrokerResponse { outcome })
+}
+
+fn platform_call_response(result: Result<Value, String>) -> std::io::Result<BrokerResponse> {
+    let outcome = match result {
+        Ok(result) => serde_json::json!({ "ok": true, "result": result }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    };
+    Ok(BrokerResponse { outcome })
+}
+
 fn upload_response(result: Result<String, String>) -> std::io::Result<BrokerResponse> {
     let outcome = match result {
         Ok(url) => serde_json::json!({ "ok": true, "url": url }),

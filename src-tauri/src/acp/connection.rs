@@ -5098,6 +5098,9 @@ struct CompanionFeatureFlags {
     /// 有意义,而那个判定(有没有指向平台的出站 webhook)只有调用那一刻才看得到,
     /// 就放在工具里做:非托管实例调一次会拿到一句明确的原因,而不是一个消失的工具。
     uploads: bool,
+    /// fork(letscubo)专属: 平台工具(commands::myclaw_platform)。实例不是平台托管时
+    /// 清单为空,等于没有 —— 所以与 uploads 一样常开。
+    platform: bool,
 }
 
 /// The `--features` value for a companion launch, or `None` when no group is
@@ -5130,6 +5133,9 @@ fn companion_features_arg(flags: CompanionFeatureFlags) -> Option<String> {
     }
     if flags.uploads {
         features.push("uploads");
+    }
+    if flags.platform {
+        features.push("platform");
     }
     if features.is_empty() {
         return None;
@@ -5277,6 +5283,7 @@ where
         automations: authoring.automations_enabled,
         taskboard: authoring.work_tasks_enabled,
         uploads: true,
+        platform: true,
     };
     // `None` (no feature enabled) short-circuits BEFORE the binary lookup, the
     // token registration and the server append: there is no companion to launch,
@@ -23935,11 +23942,15 @@ mod tests {
                 automations: true,
                 taskboard: true,
                 uploads: true,
+                platform: true,
             }),
             Some(
-                "delegation,feedback,ask,sessions,tasks,automations,taskboard,uploads".to_string()
+                "delegation,feedback,ask,sessions,tasks,automations,taskboard,uploads,platform"
+                    .to_string()
             )
         );
+        // fork: 平台工具组单开也注入伴生
+        assert_eq!(only(|f| f.platform = true), Some("platform".to_string()));
     }
 
     // ── Boolean config options (cline 3.0.50 `auto_approve`) ──
