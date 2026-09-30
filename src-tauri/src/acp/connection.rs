@@ -2420,6 +2420,18 @@ pub async fn spawn_agent_connection(
     // `None` (isolation off, or the directory could not be created) means the
     // child inherits the ambient temp dir exactly as it did before.
     let scratch = crate::acp::scratch_dir::create();
+    // fork(letscubo)专属: Hermes 不读 MCP 服务器的 `instructions`,伴生的交付义务到不了模型;
+    // 它原生读进程 cwd 里的 `.hermes.md`,所以在拉起进程**之前**写进 launch_cwd。只在本连接
+    // 会注入伴生时写(与下面 inject_codeg_mcp 的前提一致)。见 acp/hermes_context.rs。
+    if agent_type == AgentType::Hermes && delegation_injection.is_some() {
+        match crate::acp::hermes_context::ensure_companion_context(&launch_cwd) {
+            crate::acp::hermes_context::Outcome::Written => {}
+            other => tracing::info!(
+                "[companion] .hermes.md not written for {}: {other:?}",
+                launch_cwd.display()
+            ),
+        }
+    }
     let agent = match build_agent(
         agent_type,
         &runtime_env,

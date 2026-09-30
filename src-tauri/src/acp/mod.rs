@@ -17,6 +17,8 @@ pub mod event_stream;
 pub mod feedback;
 pub mod file_system_runtime;
 pub mod fork;
+// fork(letscubo)专属: 伴生交付义务经 `.hermes.md` 送进 Hermes 系统提示。
+pub mod hermes_context;
 pub mod host_tools_policy;
 #[cfg(test)]
 mod image_pins_tests;
