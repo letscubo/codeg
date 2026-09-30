@@ -792,9 +792,18 @@ fn upsert_tool_call(
         }
     }
 
-    // A result block appears only once the call produced output (or failed);
-    // a pending call with no content yet renders as a running tool card.
-    if output.is_none() && images.is_empty() && !is_error {
+    // A result block appears once the call produced output, failed, or
+    // completed; a pending call with no content yet renders as a running tool
+    // card.
+    //
+    // `completed` counts even with nothing to show: pi's `write` finishes with a
+    // `diff`-only update (no text, no rawOutput), and the diff is folded into
+    // the synthesized edit INPUT above, so `output` is None. Live, that same
+    // update marks the card done; without a result block here the reloaded
+    // history kept the call open forever and MyClaw drew it as unanswered
+    // (measured 2026-09-30 on C8, pi-acp transcript line 8).
+    let completed = status == Some("completed");
+    if output.is_none() && images.is_empty() && !is_error && !completed {
         return;
     }
     match pending.tool_result_index.get(id).copied() {
@@ -1106,6 +1115,87 @@ mod tests {
             }
             other => panic!("expected tool result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_completed_call_with_only_a_diff_still_gets_a_result() {
+        // pi's `write`, as recorded on C8 (2026-09-30): the call carries
+        // rawInput, the completion carries nothing but a diff. The diff feeds
+        // the edit input, so there is no output text — the call must still
+        // close, or the reloaded history shows it as never answered.
+        let entries = vec![
+            prompt(1, "write it"),
+            update(
+                2,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "w1",
+                    "title": "write",
+                    "kind": "edit",
+                    "rawInput": { "path": "/s/a.txt", "content": "hi\n" }
+                }),
+            ),
+            update(
+                3,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "w1",
+                    "status": "in_progress"
+                }),
+            ),
+            update(
+                4,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "w1",
+                    "status": "completed",
+                    "content": [
+                        { "type": "diff", "path": "/s/a.txt", "oldText": null, "newText": "hi\n" }
+                    ]
+                }),
+            ),
+        ];
+        let turns = project_turns(&entries);
+        let blocks = &turns[1].blocks;
+        assert_eq!(blocks.len(), 2, "one ToolUse + one ToolResult: {blocks:?}");
+        match &blocks[1] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id.as_deref(), Some("w1"));
+                assert!(!is_error);
+            }
+            other => panic!("expected a result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_in_progress_call_with_no_output_stays_open() {
+        // The other side of the rule above: only a terminal status closes a
+        // call that has nothing to show — `in_progress` must not.
+        let entries = vec![
+            prompt(1, "run it"),
+            update(
+                2,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "r1",
+                    "title": "bash",
+                    "kind": "execute",
+                    "status": "in_progress"
+                }),
+            ),
+        ];
+        let turns = project_turns(&entries);
+        assert!(
+            !turns[1]
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+            "a running call has no result yet"
+        );
     }
 
     #[test]
