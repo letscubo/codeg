@@ -88,8 +88,9 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use crate::acp::delegation::companion::{
-    is_embedded_tool_name, render_platform_result, render_upload_result, CompanionFeatures,
-    COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME, TOOL_SCHEMA_JSON,
+    instructions_with_overview, is_embedded_tool_name, render_platform_result,
+    render_upload_result, CompanionFeatures, COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME,
+    TOOL_SCHEMA_JSON,
 };
 use crate::app_state::AppState;
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
@@ -195,14 +196,26 @@ fn envelope_err(id: Value, code: i32, message: impl Into<String>) -> Value {
     })
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(overview: Option<&str>) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "serverInfo": { "name": COMPANION_SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
         "capabilities": { "tools": {} },
-        // 与 stdio 那条同一段文字 —— 交付义务只写一处,见 COMPANION_INSTRUCTIONS。
-        "instructions": COMPANION_INSTRUCTIONS,
+        // 与 stdio 那条同一段文字 —— 交付义务只写一处,见 COMPANION_INSTRUCTIONS;
+        // 后面接平台下发的工具总览(见 instructions_with_overview)。
+        "instructions": instructions_with_overview(overview),
     })
+}
+
+/// 平台工具总览;封顶等待,取不到就不带(initialize 不能因平台而慢 / 失败)。
+async fn platform_overview_for_init(uploads: &dyn ArtifactUploadAccess) -> Option<String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        uploads.platform_overview(),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 /// 嵌入的 schema 是**全部**伴生工具的数组;按本传输开启的组过滤,关掉的组一律不
@@ -307,6 +320,13 @@ impl ArtifactUploadAccess for StateUpload<'_> {
         crate::commands::myclaw_platform::catalog(self.0).await
     }
 
+    async fn platform_overview(&self) -> Option<String> {
+        crate::commands::myclaw_platform::overview(self.0)
+            .await
+            .ok()
+            .flatten()
+    }
+
     async fn platform_call(
         &self,
         name: &str,
@@ -373,7 +393,10 @@ pub async fn rpc(
     };
     let features = CompanionFeatures::parse(Some(HTTP_FEATURES));
     let body = match req.method.as_str() {
-        "initialize" => envelope_ok(id, initialize_result()),
+        "initialize" => {
+            let overview = platform_overview_for_init(&StateUpload(&state.db)).await;
+            envelope_ok(id, initialize_result(overview.as_deref()))
+        }
         "tools/list" => match tools_list_with_platform(&StateUpload(&state.db), features).await {
             Ok(result) => envelope_ok(id, result),
             Err(e) => envelope_err(id, -32603, e),
@@ -695,7 +718,7 @@ mod tests {
 
     #[test]
     fn initialize_matches_the_stdio_companion() {
-        let r = initialize_result();
+        let r = initialize_result(None);
         assert_eq!(r["protocolVersion"], "2024-11-05");
         assert_eq!(r["serverInfo"]["name"], COMPANION_SERVER_NAME);
         // 交付义务只写一处:两条传输自报同一段 instructions
@@ -705,6 +728,19 @@ mod tests {
         assert!(text.contains("upload_file"));
         // 不写具体工具名前缀 —— 各 runtime 不同,写死会把模型带错
         assert!(!text.contains("mcp__myclaw__upload_file"));
+    }
+
+    /// 平台给了工具总览就接在交付说明后面;没给就原样。
+    #[test]
+    fn initialize_appends_the_platform_overview() {
+        let r = initialize_result(Some("MyClaw platform tools …\n- apps: …"));
+        let text = r["instructions"].as_str().unwrap();
+        assert!(text.starts_with(COMPANION_INSTRUCTIONS));
+        assert!(text.ends_with("- apps: …"));
+        assert_eq!(
+            initialize_result(Some("   "))["instructions"],
+            COMPANION_INSTRUCTIONS
+        );
     }
 
     /// 条目名取短标识:openclaw 会截断过长的工具名(见 short_agent 的注释)。

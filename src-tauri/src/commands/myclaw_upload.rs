@@ -278,6 +278,11 @@ pub trait ArtifactUploadAccess: Send + Sync {
         Err("platform tools are unavailable".to_string())
     }
 
+    /// 平台工具总览(拼进伴生的 MCP `instructions`)。不可用时 None —— 伴生照旧只给自己的说明。
+    async fn platform_overview(&self) -> Option<String> {
+        None
+    }
+
     /// 调一个平台工具,成功回 MCP `CallToolResult`。`identity` 是调用方线索
     /// (`{ conversationId }` 或 `{ agentKey }`)。
     async fn platform_call(
@@ -309,6 +314,13 @@ impl ArtifactUploadAccess for DbArtifactUpload {
 
     async fn platform_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
         crate::commands::myclaw_platform::catalog(&self.db).await
+    }
+
+    async fn platform_overview(&self) -> Option<String> {
+        crate::commands::myclaw_platform::overview(&self.db)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn platform_call(

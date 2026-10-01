@@ -420,6 +420,34 @@ async fn append_platform_tools(ctx: &CompanionContext, tools: &mut Value) {
     }
 }
 
+/// fork(letscubo)专属: 伴生的 MCP `instructions` —— 自己的交付说明,后面接平台下发的工具总览。
+/// 按需加载工具的 runtime(claude_code、hermes)起初只看得到工具名,靠这段才知道平台工具能做什么。
+/// 没有总览(不是平台托管 / 平台不可达 / 老平台)时就是原来那段。stdio 与 HTTP 两条传输共用。
+pub fn instructions_with_overview(overview: Option<&str>) -> String {
+    match overview.map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) => format!("{COMPANION_INSTRUCTIONS}\n\n{o}"),
+        None => COMPANION_INSTRUCTIONS.to_string(),
+    }
+}
+
+/// 向父进程取平台工具总览(与 tools/list 同一个封顶;父进程有缓存)。
+async fn fetch_platform_overview(ctx: &CompanionContext) -> Option<String> {
+    let req = BrokerPlatformCatalogRequest {
+        token: ctx.token.clone(),
+    };
+    let resp = tokio::time::timeout(
+        PLATFORM_CATALOG_WAIT,
+        client_platform_catalog_round_trip(&ctx.socket_path, &req),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    resp.outcome
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// 平台调用的结果:成功时平台已按 MCP `CallToolResult` 组好,原样转;失败给 isError 结果。
 pub fn render_platform_result(outcome: &Value) -> Value {
     if outcome.get("ok").and_then(|v| v.as_bool()) == Some(true) {
@@ -503,19 +531,27 @@ pub async fn dispatch_line(
 
     let id = req.id.expect("checked is_none");
     match req.method.as_str() {
-        "initialize" => LineAction::Respond(ok(
-            id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {
-                    "name": COMPANION_SERVER_NAME,
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": { "tools": {} },
-                // 服务器自述,客户端并进系统提示 —— 见 COMPANION_INSTRUCTIONS 的注释。
-                "instructions": COMPANION_INSTRUCTIONS,
-            }),
-        )),
+        "initialize" => {
+            // fork(letscubo)专属: 开了平台组时接上平台工具总览(取不到就是原来那段)
+            let overview = if ctx.features.platform {
+                fetch_platform_overview(ctx).await
+            } else {
+                None
+            };
+            LineAction::Respond(ok(
+                id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {
+                        "name": COMPANION_SERVER_NAME,
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": { "tools": {} },
+                    // 服务器自述,客户端并进系统提示 —— 见 COMPANION_INSTRUCTIONS 的注释。
+                    "instructions": instructions_with_overview(overview.as_deref()),
+                }),
+            ))
+        }
         "tools/list" => {
             // The embedded schema is a JSON array of every tool the companion
             // can carry; filter to the groups enabled for this launch so a
@@ -2865,6 +2901,45 @@ mod tests {
             upload["description"],
             json!("impostor"),
             "内置 upload_file 被平台遮住了"
+        );
+    }
+
+    /// initialize 时接上平台下发的工具总览(按需加载的 runtime 靠它知道有哪些平台工具)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initialize_appends_the_platform_overview() {
+        let (_dir, sock) = fake_parent(json!({
+            "ok": true,
+            "tools": [],
+            "instructions": "MyClaw platform tools …\n- apps: marketplace. Actions: catalog."
+        }))
+        .await;
+        let mut ctx = ctx_with(UPLOADS_AND_PLATFORM);
+        ctx.socket_path = sock;
+        let line = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }).to_string();
+        let resp = unwrap_respond(dispatch_line(&ctx, Arc::new(InflightCalls::new()), &line).await);
+        let text = resp.result.unwrap()["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.starts_with(COMPANION_INSTRUCTIONS));
+        assert!(text.ends_with("- apps: marketplace. Actions: catalog."));
+    }
+
+    /// 平台不可达 / 没开平台组:initialize 照常,instructions 就是原来那段。
+    #[tokio::test]
+    async fn initialize_without_platform_keeps_the_plain_instructions() {
+        let line = json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize" }).to_string();
+        for features in [UPLOADS_AND_PLATFORM, UPLOADS_ONLY] {
+            let resp = unwrap_respond(dispatch_with_features(features, &line).await);
+            assert_eq!(
+                resp.result.unwrap()["instructions"],
+                json!(COMPANION_INSTRUCTIONS)
+            );
+        }
+        assert_eq!(
+            instructions_with_overview(Some("  ")),
+            COMPANION_INSTRUCTIONS
         );
     }
 

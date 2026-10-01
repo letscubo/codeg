@@ -77,6 +77,12 @@ impl DelegationService {
         &self.socket_path
     }
 
+    /// fork(letscubo)专属: 平台工具总览(给拉起 Hermes 前写 `.hermes.md` 用 —— 那里没有 db,
+    /// 只能借这个全局句柄背后的上传实现)。取不到就 None。
+    pub async fn platform_overview(&self) -> Option<String> {
+        self.listener.uploads.platform_overview().await
+    }
+
     /// Bind the socket and spawn its accept loop, replacing whatever was
     /// running before. The bind happens inline so its error reaches the
     /// caller — that error is the whole reason the status indicator can say

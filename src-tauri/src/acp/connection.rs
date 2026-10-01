@@ -2424,7 +2424,18 @@ pub async fn spawn_agent_connection(
     // 它原生读进程 cwd 里的 `.hermes.md`,所以在拉起进程**之前**写进 launch_cwd。只在本连接
     // 会注入伴生时写(与下面 inject_codeg_mcp 的前提一致)。见 acp/hermes_context.rs。
     if agent_type == AgentType::Hermes && delegation_injection.is_some() {
-        match crate::acp::hermes_context::ensure_companion_context(&launch_cwd) {
+        // 平台工具总览一并写进去(Hermes 不读 MCP instructions);封顶等待,取不到就不带
+        let overview = match crate::acp::delegation::service::current() {
+            Some(svc) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), svc.platform_overview())
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            None => None,
+        };
+        match crate::acp::hermes_context::ensure_companion_context(&launch_cwd, overview.as_deref())
+        {
             crate::acp::hermes_context::Outcome::Written => {}
             other => tracing::info!(
                 "[companion] .hermes.md not written for {}: {other:?}",

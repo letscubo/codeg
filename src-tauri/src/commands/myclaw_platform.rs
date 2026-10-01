@@ -187,15 +187,16 @@ async fn endpoint(db: &AppDatabase) -> Result<PlatformEndpoint, String> {
         .ok_or_else(|| "this instance is not platform-managed (no webhook configured)".to_string())
 }
 
-type CatalogCache = Mutex<Option<(Instant, Result<Vec<Value>, String>)>>;
+/// 缓存的是清单接口的整个 data(`{ tools, instructions }`):工具与总览同一次请求、同一个 TTL。
+type CatalogCache = Mutex<Option<(Instant, Result<Value, String>)>>;
 
 fn catalog_cache() -> &'static CatalogCache {
     static CACHE: OnceLock<CatalogCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// 平台工具清单(MCP Tool 形状的数组)。有缓存;失败也缓存一小会儿。
-pub async fn catalog(db: &AppDatabase) -> Result<Vec<Value>, String> {
+/// 清单接口的 data。有缓存;失败也缓存一小会儿。
+async fn catalog_data(db: &AppDatabase) -> Result<Value, String> {
     let mut guard = catalog_cache().lock().await;
     if let Some((at, cached)) = guard.as_ref() {
         let ttl = if cached.is_ok() {
@@ -209,19 +210,14 @@ pub async fn catalog(db: &AppDatabase) -> Result<Vec<Value>, String> {
     }
     let fetched = async {
         let ep = endpoint(db).await?;
-        let data = signed_request(
+        signed_request(
             &ep,
             reqwest::Method::GET,
             CATALOG_PATH,
             None,
             CATALOG_TIMEOUT,
         )
-        .await?;
-        Ok(data
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default())
+        .await
     }
     .await;
     if let Err(e) = &fetched {
@@ -229,6 +225,31 @@ pub async fn catalog(db: &AppDatabase) -> Result<Vec<Value>, String> {
     }
     *guard = Some((Instant::now(), fetched.clone()));
     fetched
+}
+
+/// 平台工具清单(MCP Tool 形状的数组)。
+pub async fn catalog(db: &AppDatabase) -> Result<Vec<Value>, String> {
+    Ok(tools_of(&catalog_data(db).await?))
+}
+
+/// 平台工具总览(一段给模型看的文字,拼进伴生的 MCP `instructions`)。平台没给就是 None。
+pub async fn overview(db: &AppDatabase) -> Result<Option<String>, String> {
+    Ok(overview_of(&catalog_data(db).await?))
+}
+
+fn tools_of(data: &Value) -> Vec<Value> {
+    data.get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn overview_of(data: &Value) -> Option<String> {
+    data.get("instructions")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// 调一个平台工具。成功回 MCP `CallToolResult`(平台已按 MCP 形状组好,原样转给模型)。
@@ -265,6 +286,20 @@ pub fn error_result(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_data_splits_into_tools_and_overview() {
+        let data = serde_json::json!({ "tools": [{ "name": "agents" }], "instructions": "  - agents: …  " });
+        assert_eq!(tools_of(&data).len(), 1);
+        assert_eq!(overview_of(&data).as_deref(), Some("- agents: …"));
+        // 老平台没有 instructions / 空串 → None,伴生照旧只给自己的说明
+        assert_eq!(overview_of(&serde_json::json!({ "tools": [] })), None);
+        assert_eq!(
+            overview_of(&serde_json::json!({ "instructions": "  " })),
+            None
+        );
+        assert!(tools_of(&serde_json::json!({})).is_empty());
+    }
 
     /// 与平台 `platform-tools.behavior.test.ts` 同一组向量 —— 两边任何一边改了拼法都会先红。
     #[test]

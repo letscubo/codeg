@@ -848,11 +848,13 @@ impl DelegationListener {
     async fn process_platform_catalog(
         &self,
         req: crate::acp::delegation::transport::BrokerPlatformCatalogRequest,
-    ) -> Result<Vec<Value>, String> {
+    ) -> Result<(Vec<Value>, Option<String>), String> {
         if self.tokens.lookup(&req.token).await.is_none() {
             return Err("invalid token".to_string());
         }
-        self.uploads.platform_catalog().await
+        let tools = self.uploads.platform_catalog().await?;
+        // 总览与清单同一次请求、同一份缓存,这里不会多打平台
+        Ok((tools, self.uploads.platform_overview().await))
     }
 
     /// fork(letscubo)专属: 调一个平台工具。调用方线索由 token 反查(→ 父连接 → 当前
@@ -1033,10 +1035,12 @@ fn task_ack_response(ack: TaskReportAck) -> std::io::Result<BrokerResponse> {
 
 /// fork(letscubo)专属: 把上传结果编成 `{ ok, url }` / `{ ok: false, error }`。
 fn platform_catalog_response(
-    result: Result<Vec<Value>, String>,
+    result: Result<(Vec<Value>, Option<String>), String>,
 ) -> std::io::Result<BrokerResponse> {
     let outcome = match result {
-        Ok(tools) => serde_json::json!({ "ok": true, "tools": tools }),
+        Ok((tools, instructions)) => {
+            serde_json::json!({ "ok": true, "tools": tools, "instructions": instructions })
+        }
         Err(error) => serde_json::json!({ "ok": false, "error": error }),
     };
     Ok(BrokerResponse { outcome })

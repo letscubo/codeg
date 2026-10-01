@@ -71,8 +71,11 @@ pub enum Outcome {
 
 /// 渲染文件内容。伴生说明原样引用(单一事实源在 `COMPANION_INSTRUCTIONS`),后面补
 /// Hermes 专有的一段:它的 MCP 工具是按需加载的。
-pub fn render() -> String {
-    format!(
+///
+/// `overview` 是平台下发的工具总览(与 MCP `instructions` 里接的那段同一份);有就接在后面,
+/// 并说明这些工具同样按需加载。
+pub fn render(overview: Option<&str>) -> String {
+    let mut out = format!(
         "---\n{MARKER}\nnote: written by codeg for this session; not user content\n---\n\
 ## Platform channel (myclaw)\n\n\
 An MCP server named `myclaw` is attached to this session. It describes itself as follows:\n\n\
@@ -81,7 +84,15 @@ In this runtime MCP tools are loaded on demand, so `upload_file` is not in your 
 list. Find it with `tool_search` (query: \"upload_file\") and invoke it with `tool_call`; its full \
 name is `mcp__myclaw__upload_file`. Do this for every file you deliver, and never conclude that \
 you cannot upload without searching first.\n"
-    )
+    );
+    if let Some(o) = overview.map(str::trim).filter(|o| !o.is_empty()) {
+        out.push_str(&format!(
+            "\n{o}\n\nThese tools are on the same `myclaw` server and also load on demand: find one with \
+`tool_search` (query: its name, e.g. \"apps\") and call it with `tool_call` (full name \
+`mcp__myclaw__<name>`), passing `action`.\n"
+        ));
+    }
+    out
 }
 
 /// 从 `dir` 往上找 `.git`(目录或 worktree 的文件)。在 git 工作树里写 `.hermes.md`
@@ -98,7 +109,7 @@ fn is_ours(path: &Path) -> bool {
 
 /// 需要写(或刷新)时写一份;任何不安全的情况都跳过。失败不影响拉起 —— 最坏情况只是
 /// 这一轮模型不知道要上传,与写入前相同。
-pub fn ensure_companion_context(dir: &Path) -> Outcome {
+pub fn ensure_companion_context(dir: &Path, overview: Option<&str>) -> Outcome {
     if !dir.is_dir() {
         return Outcome::SkippedNoDir;
     }
@@ -123,7 +134,8 @@ pub fn ensure_companion_context(dir: &Path) -> Outcome {
     }
     // 先写临时文件再改名:Hermes 与本进程可能同时看这个目录,不能让它读到半截。
     let tmp = dir.join(format!("{CONTEXT_FILE}.codeg-tmp"));
-    let result = std::fs::write(&tmp, render()).and_then(|_| std::fs::rename(&tmp, &target));
+    let result =
+        std::fs::write(&tmp, render(overview)).and_then(|_| std::fs::rename(&tmp, &target));
     match result {
         Ok(()) => Outcome::Written,
         Err(e) => {
@@ -144,7 +156,7 @@ mod tests {
     #[test]
     fn writes_into_an_empty_session_dir() {
         let d = dir();
-        assert_eq!(ensure_companion_context(d.path()), Outcome::Written);
+        assert_eq!(ensure_companion_context(d.path(), None), Outcome::Written);
         let body = std::fs::read_to_string(d.path().join(CONTEXT_FILE)).unwrap();
         assert!(body.contains(COMPANION_INSTRUCTIONS), "伴生说明要原样带上");
         assert!(body.contains("mcp__myclaw__upload_file"));
@@ -163,7 +175,7 @@ mod tests {
         let d = dir();
         let target = d.path().join(CONTEXT_FILE);
         std::fs::write(&target, format!("---\n{MARKER}\n---\nold text\n")).unwrap();
-        assert_eq!(ensure_companion_context(d.path()), Outcome::Written);
+        assert_eq!(ensure_companion_context(d.path(), None), Outcome::Written);
         assert!(std::fs::read_to_string(&target)
             .unwrap()
             .contains(COMPANION_INSTRUCTIONS));
@@ -176,7 +188,7 @@ mod tests {
         let target = d.path().join(CONTEXT_FILE);
         std::fs::write(&target, "my own project notes\n").unwrap();
         assert_eq!(
-            ensure_companion_context(d.path()),
+            ensure_companion_context(d.path(), None),
             Outcome::SkippedUserContext(CONTEXT_FILE.into())
         );
         assert_eq!(
@@ -195,7 +207,7 @@ mod tests {
             // (macOS 默认不敏感:写 agents.md 时 AGENTS.md 也算存在)。
             assert!(
                 matches!(
-                    ensure_companion_context(d.path()),
+                    ensure_companion_context(d.path(), None),
                     Outcome::SkippedUserContext(_)
                 ),
                 "{name}"
@@ -205,7 +217,7 @@ mod tests {
         let d = dir();
         std::fs::create_dir_all(d.path().join(".cursor/rules")).unwrap();
         assert_eq!(
-            ensure_companion_context(d.path()),
+            ensure_companion_context(d.path(), None),
             Outcome::SkippedUserContext(".cursor/rules".into())
         );
     }
@@ -217,15 +229,36 @@ mod tests {
         std::fs::create_dir_all(d.path().join(".git")).unwrap();
         let sub = d.path().join("pkg/app");
         std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(ensure_companion_context(&sub), Outcome::SkippedInGitRepo);
+        assert_eq!(
+            ensure_companion_context(&sub, None),
+            Outcome::SkippedInGitRepo
+        );
         assert!(!sub.join(CONTEXT_FILE).exists());
+    }
+
+    #[test]
+    fn platform_overview_is_appended_when_given() {
+        let d = dir();
+        assert_eq!(
+            ensure_companion_context(
+                d.path(),
+                Some("- apps: marketplace … Actions: catalog, install.")
+            ),
+            Outcome::Written
+        );
+        let body = std::fs::read_to_string(d.path().join(CONTEXT_FILE)).unwrap();
+        assert!(body.contains(COMPANION_INSTRUCTIONS));
+        assert!(body.contains("- apps: marketplace … Actions: catalog, install."));
+        assert!(body.contains("mcp__myclaw__<name>"));
+        // 没有总览就不带那段说明
+        assert!(!render(None).contains("mcp__myclaw__<name>"));
     }
 
     #[test]
     fn missing_dir_is_skipped_not_created() {
         let d = dir();
         let gone = d.path().join("not-there");
-        assert_eq!(ensure_companion_context(&gone), Outcome::SkippedNoDir);
+        assert_eq!(ensure_companion_context(&gone, None), Outcome::SkippedNoDir);
         assert!(!gone.exists());
     }
 }
