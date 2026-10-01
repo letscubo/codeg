@@ -352,6 +352,12 @@ pub struct SessionState {
     /// non-Grok agents and when the response carried no `models` (flat fallback).
     /// Backend-internal — not serialized.
     pub grok_model_specs: Option<std::collections::HashMap<String, GrokModelSpec>>,
+    /// Hermes only: the model `hermes_preapply_model` already switched this
+    /// session to before it was attached. The post-attach preference step takes
+    /// it and skips its own `session/set_model` when it matches — a second
+    /// switch would rebuild the agent and drop the session's MCP servers again.
+    /// Backend-internal — not serialized.
+    pub hermes_model_preapplied: Option<String>,
 
     /// pi only: the session prelude pi-acp reports as `_meta.piAcp.startupInfo`
     /// on `session/new`, held until the matching `agent_message_chunk` arrives
@@ -711,6 +717,7 @@ impl SessionState {
             current_mode: None,
             config_options: None,
             grok_model_specs: None,
+            hermes_model_preapplied: None,
             pi_startup_banner: None,
             asserted_config_values: BTreeMap::new(),
             env_pinned_config_option_ids: Vec::new(),

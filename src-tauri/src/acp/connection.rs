@@ -3829,6 +3829,72 @@ fn split_hermes_model_preference(
     (model, rest)
 }
 
+/// Hermes only: apply the model preference BEFORE the session is attached, then
+/// hand the connection's MCP servers back.
+///
+/// Hermes switches a model by rebuilding the session's agent (`_switch_model` →
+/// `_make_agent`), and the rebuilt agent's toolsets come from `config.yaml`
+/// alone: the MCP servers codeg passed on `session/new|load|resume` — the
+/// `codeg-mcp` companion among them — are no longer enabled, so all of their
+/// tools vanish from the session (hermes 0.21.3, measured: `tool_search` saw 3
+/// tools instead of the companion's 15 plus those 3). `session/resume` with the
+/// same servers re-runs hermes' MCP attach on the rebuilt agent without
+/// rebuilding it again; already-connected servers are not respawned.
+///
+/// Must run before `attach_session`: hermes replays the whole history on
+/// `session/resume`, and only for an unattached session does [`ReplayGuard`]
+/// see all of it. Once the session handler is registered, sacp offers each
+/// notification to the dynamic handlers in hash-map order, so part of the
+/// replay would reach the live stream as the next turn's output.
+///
+/// Records the applied model so the post-attach preference step does not switch
+/// a second time. A no-op for every other agent and without a model preference.
+async fn hermes_preapply_model(
+    cx: &ConnectionTo<Agent>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    sid: &str,
+    cwd: &Path,
+    supports_resume: bool,
+    mcp_servers: &[McpServer],
+    preferred_config_values: &BTreeMap<String, String>,
+) {
+    if agent_type != AgentType::Hermes {
+        return;
+    }
+    let Some(model) = split_hermes_model_preference(preferred_config_values).0 else {
+        return;
+    };
+    let session_id = SessionId::new(sid.to_string());
+    if let Err(e) = send_set_session_model(cx, &session_id, &model, None).await {
+        // Leave the post-attach step to retry the switch.
+        tracing::error!("[ACP] failed to apply preferred hermes model '{model}' before attach: {e}");
+        return;
+    }
+    state.write().await.hermes_model_preapplied = Some(model);
+    if mcp_servers.is_empty() || !supports_resume {
+        return;
+    }
+    let gate = ReplayGuard::arm(cx, sid, "session/resume");
+    let req = build_resume_session_request(agent_type, session_id, cwd, mcp_servers.to_vec());
+    match send_resume_session(cx, req).await {
+        Ok(_) => {
+            let replayed = gate.map(ReplayGuard::finish).unwrap_or_default();
+            let drained =
+                consume_history_replay(replayed, state, emitter, agent_type, sid, false).await;
+            tracing::info!(
+                "[ACP] hermes MCP servers re-attached after the model switch \
+                 ({drained} replayed notifications consumed)"
+            );
+        }
+        Err(e) => tracing::warn!(
+            "[ACP] hermes MCP re-attach after the model switch failed ({e}); \
+             its MCP tools are unavailable in this session"
+        ),
+    }
+}
+
 /// Build the `session/set_model` params. A reasoning-effort override rides in
 /// `_meta.reasoningEffort` (the exact key grok's sampling layer reads — verified
 /// against 0.2.99); `None` omits `_meta` for a pure model switch.
@@ -4297,10 +4363,16 @@ async fn apply_and_emit_session_config_options(
     // Hermes' side (it rebuilds the agent in-process — ~0.1s measured). This is
     // the establishment path for new, loaded and resumed sessions alike, so a
     // conversation always runs on the model the client asked for at connect.
+    //
+    // Normally `hermes_preapply_model` has already switched the session before
+    // it was attached (and put its MCP servers back); switching again here would
+    // drop those servers for good, so a model it recorded is not re-sent. This
+    // send remains the fallback for an establishment path that did not preapply.
     let hermes_remaining_values;
     let preferred_config_values = if agent_type == AgentType::Hermes {
         let (model, rest) = split_hermes_model_preference(preferred_config_values);
-        if let Some(model) = model {
+        let preapplied = state.write().await.hermes_model_preapplied.take();
+        if let Some(model) = model.filter(|m| preapplied.as_deref() != Some(m.as_str())) {
             let session_id = session.session_id().clone();
             if let Err(e) = send_set_session_model(cx, &session_id, &model, None).await {
                 tracing::error!(
@@ -6182,6 +6254,18 @@ async fn run_connection(
                             // on resume; absent ⇒ empty specs ⇒ flat fallback.
                             let grok_model_specs = (agent_type == AgentType::Grok)
                                 .then(|| parse_grok_model_specs(grok_models_raw.as_ref()));
+                            hermes_preapply_model(
+                                &cx,
+                                &state,
+                                &emitter_clone,
+                                agent_type,
+                                &sid,
+                                &cwd,
+                                supports_resume,
+                                &mcp_servers,
+                                &preferred_config_values,
+                            )
+                            .await;
                             let mut session = cx.attach_session(new_resp, Default::default())?;
 
                             // Any replay was captured and consumed above; state
@@ -6324,6 +6408,18 @@ async fn run_connection(
                         } else {
                             None
                         };
+                        hermes_preapply_model(
+                            &cx,
+                            &state,
+                            &emitter_clone,
+                            agent_type,
+                            &sid,
+                            &cwd,
+                            supports_resume,
+                            &mcp_servers,
+                            &preferred_config_values,
+                        )
+                        .await;
                         let mut session = cx.attach_session(new_resp, Default::default())?;
 
                         // Drain historical replay notifications from session/load,
@@ -6541,6 +6637,18 @@ async fn run_connection(
                         // Read BEFORE `attach_session` consumes the response.
                         state.write().await.pi_startup_banner =
                             pi_startup_banner(agent_type, new_resp.meta.as_ref());
+                        hermes_preapply_model(
+                            &cx,
+                            &state,
+                            &emitter_clone,
+                            agent_type,
+                            &fallback_sid,
+                            &cwd,
+                            supports_resume,
+                            &mcp_servers,
+                            &preferred_config_values,
+                        )
+                        .await;
                         let mut session = cx.attach_session(new_resp, Default::default())?;
                         // Same conversation, new agent session: link the fresh
                         // transcript to the one the failed load was for, so the
@@ -6641,6 +6749,18 @@ async fn run_connection(
                 // Read BEFORE `attach_session` consumes the response.
                 state.write().await.pi_startup_banner =
                     pi_startup_banner(agent_type, new_resp.meta.as_ref());
+                hermes_preapply_model(
+                    &cx,
+                    &state,
+                    &emitter_clone,
+                    agent_type,
+                    &sid,
+                    &cwd,
+                    supports_resume,
+                    &mcp_servers,
+                    &preferred_config_values,
+                )
+                .await;
                 let mut session = cx.attach_session(new_resp, Default::default())?;
                 record_transcript_header(agent_type, &sid, &cwd.to_string_lossy());
                 emit_with_state(
@@ -8949,6 +9069,18 @@ async fn handle_fork_or_exit(
     // the fork was re-established above, a resume) response.
     let grok_model_specs =
         (agent_type == AgentType::Grok).then(|| parse_grok_model_specs(models_raw.as_ref()));
+    hermes_preapply_model(
+        &cx,
+        state,
+        emitter,
+        agent_type,
+        &new_sid,
+        cwd,
+        supports_resume,
+        mcp_servers,
+        &inherited_config_values,
+    )
+    .await;
     let mut session = cx.attach_session(new_resp, Default::default())?;
 
     // A fork is a new session id, hence a new transcript file. Its history
@@ -20073,6 +20205,154 @@ mod tests {
         let (model, rest) = split_hermes_model_preference(&other);
         assert!(model.is_none());
         assert_eq!(rest, other);
+    }
+
+    /// Over sacp's in-memory transport, a fake hermes: the preapply must send
+    /// `session/set_model` and then `session/resume` carrying the same MCP
+    /// servers (hermes' model switch rebuilds the agent without them), keep the
+    /// resume's history replay out of the session, and record the model so the
+    /// post-attach step does not switch (and drop the servers) again.
+    #[tokio::test]
+    async fn hermes_preapply_switches_model_then_reattaches_mcp_before_attach() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use sacp::{Client, SessionMessage};
+
+        let (client_end, mut agent_end) = sacp::Channel::duplex();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Vec<serde_json::Value>>();
+        let agent = tokio::spawn(async move {
+            let send = |v: serde_json::Value| Ok(serde_json::from_value(v).unwrap());
+            let mut tx = agent_end.tx.clone();
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let req = serde_json::to_value(agent_end.rx.next().await.unwrap().unwrap()).unwrap();
+                if req["method"] == "session/resume" {
+                    tx.send(send(serde_json::json!({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": { "sessionId": "s1", "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": "old answer" } } }
+                    })))
+                    .await
+                    .unwrap();
+                }
+                tx.send(send(serde_json::json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} })))
+                    .await
+                    .unwrap();
+                requests.push(req);
+            }
+            tx.send(send(serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": { "sessionId": "s1", "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "live answer" } } }
+            })))
+            .await
+            .unwrap();
+            let _ = seen_tx.send(requests);
+            let _ = agent_end.rx.next().await;
+        });
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".to_string(),
+            AgentType::Hermes,
+            None,
+            "win".to_string(),
+            None,
+        )));
+        let mut prefs = BTreeMap::new();
+        prefs.insert("model".to_string(), "claude-opus-5".to_string());
+        let servers = vec![stdio_server("myclaw")];
+
+        let state_in = state.clone();
+        Client
+            .builder()
+            .connect_with(client_end, async move |cx| -> Result<(), sacp::Error> {
+                hermes_preapply_model(
+                    &cx,
+                    &state_in,
+                    &EventEmitter::Noop,
+                    AgentType::Hermes,
+                    "s1",
+                    Path::new("/home/ubuntu"),
+                    true,
+                    &servers,
+                    &prefs,
+                )
+                .await;
+                let mut session = cx.attach_session(
+                    NewSessionResponse::new(SessionId::new("s1")),
+                    Default::default(),
+                )?;
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(2), session.read_update())
+                    .await
+                    .expect("live update arrives")?;
+                let SessionMessage::SessionMessage(d) = msg else {
+                    panic!("expected a session update");
+                };
+                let text = d.message().unwrap().params()["update"]["content"]["text"].clone();
+                assert_eq!(text, "live answer", "the resume replay must not reach the session");
+                Ok(())
+            })
+            .await
+            .expect("client run");
+
+        let requests = seen_rx.await.expect("agent saw both requests");
+        agent.abort();
+        assert_eq!(requests[0]["method"], "session/set_model");
+        assert_eq!(requests[0]["params"]["modelId"], "claude-opus-5");
+        assert_eq!(requests[1]["method"], "session/resume", "MCP re-attached AFTER the switch");
+        assert_eq!(requests[1]["params"]["mcpServers"][0]["name"], "myclaw");
+        assert_eq!(
+            state.read().await.hermes_model_preapplied.as_deref(),
+            Some("claude-opus-5"),
+            "the post-attach step must see the model as already applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_preapply_is_a_no_op_for_other_agents_and_without_a_model() {
+        let (client_end, _agent_end) = sacp::Channel::duplex();
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".to_string(),
+            AgentType::Hermes,
+            None,
+            "win".to_string(),
+            None,
+        )));
+        let mut with_model = BTreeMap::new();
+        with_model.insert("model".to_string(), "claude-opus-5".to_string());
+        let state_in = state.clone();
+        sacp::Client
+            .builder()
+            .connect_with(client_end, async move |cx| -> Result<(), sacp::Error> {
+                // Nothing is sent (the fake end never answers, so a send would
+                // hang past the timeout).
+                for (agent_type, prefs) in [
+                    (AgentType::ClaudeCode, with_model.clone()),
+                    (AgentType::Hermes, BTreeMap::new()),
+                ] {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        hermes_preapply_model(
+                            &cx,
+                            &state_in,
+                            &EventEmitter::Noop,
+                            agent_type,
+                            "s1",
+                            Path::new("/"),
+                            true,
+                            &[stdio_server("myclaw")],
+                            &prefs,
+                        ),
+                    )
+                    .await
+                    .expect("no request is sent");
+                }
+                Ok(())
+            })
+            .await
+            .expect("client run");
+        assert!(state.read().await.hermes_model_preapplied.is_none());
     }
 
     #[test]

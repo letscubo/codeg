@@ -89,8 +89,7 @@ use sha2::Sha256;
 
 use crate::acp::delegation::companion::{
     instructions_with_overview, is_embedded_tool_name, render_platform_result,
-    render_upload_result, CompanionFeatures, COMPANION_INSTRUCTIONS, COMPANION_SERVER_NAME,
-    TOOL_SCHEMA_JSON,
+    render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME, TOOL_SCHEMA_JSON,
 };
 use crate::app_state::AppState;
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
@@ -495,6 +494,7 @@ pub async fn entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::delegation::companion::COMPANION_INSTRUCTIONS;
 
     struct StubUpload(Result<String, String>);
 
