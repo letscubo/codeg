@@ -39,7 +39,7 @@ use serde::Deserialize as _;
 
 use crate::acp::connection::{
     extract_tool_call_images, json_value_to_text, serialize_tool_call_content,
-    synthesize_edit_input_from_diffs,
+    split_raw_output_images, synthesize_edit_input_from_diffs,
 };
 use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
@@ -746,11 +746,19 @@ fn upsert_tool_call(
         None
     };
     let input_preview = synthesized_edit.clone().or(own_input);
+    // Images riding in an MCP `rawOutput` envelope (pi-acp puts the whole tool
+    // result there and leaves `content` empty) belong in `images`, not stringified
+    // into the text field below — see `split_raw_output_images`.
+    let (raw_images, raw_rest) = match raw_output {
+        Some(v) => split_raw_output_images(v),
+        None => (Vec::new(), None),
+    };
     let output = serialize_tool_call_content(content, synthesized_edit.is_none())
-        .or_else(|| json_value_to_text(&raw_output.cloned()));
+        .or_else(|| json_value_to_text(&raw_rest));
     let images: Vec<ImageData> = extract_tool_call_images(content)
         .unwrap_or_default()
         .into_iter()
+        .chain(raw_images)
         .collect();
     let is_error = status == Some("failed");
 
@@ -1366,6 +1374,106 @@ mod tests {
         let stats = session_stats(&turns).expect("stats");
         assert_eq!(stats.total_tokens, Some(15));
         assert_eq!(stats.total_duration_ms, 42);
+    }
+
+    /// Build the `tool_call` + `tool_call_update` pair pi-acp emits for an MCP
+    /// tool: `content` carries only what `toolResultToText` could flatten, and
+    /// the untouched MCP result rides in `rawOutput`.
+    fn pi_mcp_call(raw_output: serde_json::Value) -> Vec<TranscriptEntry> {
+        vec![
+            prompt(1, "look at the page"),
+            update(
+                2,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "browser_screenshot",
+                    "kind": "other",
+                    "status": "pending"
+                }),
+            ),
+            update(
+                3,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "completed",
+                    "rawOutput": raw_output
+                }),
+            ),
+        ]
+    }
+
+    fn tool_result_of(turn: &MessageTurn) -> (&Option<String>, &Vec<ImageData>) {
+        match turn.blocks.last() {
+            Some(ContentBlock::ToolResult {
+                output_preview,
+                images,
+                ..
+            }) => (output_preview, images),
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    /// An image-only MCP result must leave the TEXT field empty.
+    ///
+    /// pi-acp attaches the whole MCP result as `rawOutput` and, with no text to
+    /// flatten, sends no `content` at all — so the envelope used to reach
+    /// `json_value_to_text` and a base64 screenshot became `output_preview`.
+    /// That field is the message body MyClaw stores verbatim: measured
+    /// 2026-10-02 on a kind=all instance, one 780×493 PNG was 59,836 of the
+    /// turn's 63,912 recorded bytes. The bytes belong in `images`, which the
+    /// renderer draws as a card.
+    #[test]
+    fn an_image_only_mcp_result_lands_in_images_and_not_in_the_text_field() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+        let turns = project_turns(&pi_mcp_call(serde_json::json!({
+            "content": [{ "type": "image", "data": data, "mimeType": "image/png" }]
+        })));
+        let (output_preview, images) = tool_result_of(&turns[1]);
+        assert_eq!(
+            output_preview.as_deref(),
+            None,
+            "an image-only result has no text — and must never carry base64 here"
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, data);
+        assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    /// A result carrying both keeps its text and still lifts the image out, so
+    /// the text channel never grows by the size of the picture.
+    #[test]
+    fn a_mixed_mcp_result_keeps_its_text_and_still_lifts_the_image() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+        let turns = project_turns(&pi_mcp_call(serde_json::json!({
+            "content": [
+                { "type": "text", "text": "captured 1 page" },
+                { "type": "image", "data": data, "mimeType": "image/png" }
+            ]
+        })));
+        let (output_preview, images) = tool_result_of(&turns[1]);
+        let text = output_preview.as_deref().expect("the text survives");
+        assert!(text.contains("captured 1 page"), "got {text}");
+        assert!(
+            !text.contains("iVBORw0KGgo"),
+            "the image must not be stringified into the text field: {text}"
+        );
+        assert_eq!(images.len(), 1);
+    }
+
+    /// Every other agent's `rawOutput` is untouched — this fix must not change
+    /// how a plain result is projected.
+    #[test]
+    fn a_raw_output_without_images_is_projected_unchanged() {
+        let turns = project_turns(&pi_mcp_call(serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "details": { "stdout": "hello" }
+        })));
+        let (output_preview, images) = tool_result_of(&turns[1]);
+        let text = output_preview.as_deref().expect("text");
+        assert!(text.contains("hello"), "got {text}");
+        assert!(images.is_empty());
     }
 
     /// A recorded prompt keeps the user's attachments in order: images as

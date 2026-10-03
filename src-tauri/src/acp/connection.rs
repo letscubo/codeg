@@ -11173,6 +11173,103 @@ pub(crate) fn extract_tool_call_images(content: &[ToolCallContent]) -> Option<Ve
     }
 }
 
+/// Split an MCP-shaped `rawOutput` envelope into its images and whatever is left.
+///
+/// [`extract_tool_call_images`] reads the spec'd `content[]` channel. pi-acp does
+/// not put MCP results there: `tool_execution_end` fills `content` from
+/// `toolResultToText` — text only, so an image-only result leaves it empty — and
+/// attaches the ENTIRE MCP result as `rawOutput`
+/// (`pi-acp/src/acp/session.ts`). That envelope then reaches
+/// [`json_value_to_text`], which stringifies it wholesale, and a base64
+/// screenshot lands in `output_preview` — a *text* field, which MyClaw stores
+/// verbatim as the message body.
+///
+/// Measured 2026-10-02 on a kind=all instance: one 780×493 PNG returned by a
+/// browser MCP was 59,836 of that turn's 63,912 recorded bytes (94%). The same
+/// screenshot through the claude_code CLI driver cost 0 — it never reached a
+/// text field.
+///
+/// So lift the images into `images`, the field whose whole purpose is rendering
+/// them as cards, and hand back the envelope without them so the caller can still
+/// serialize whatever text the result carried. `None` for the remainder means
+/// "nothing left worth showing": an image-only result strips down to
+/// `{"content": []}`, which is pi's empty-announcement noise
+/// (see [`pi_result_is_empty_announcement`]).
+///
+/// An envelope holding no images comes back untouched, so every other agent's
+/// path stays bit-identical.
+pub(crate) fn split_raw_output_images(
+    raw: &serde_json::Value,
+) -> (Vec<ToolCallImageInfo>, Option<serde_json::Value>) {
+    let Some(items) = raw.get("content").and_then(serde_json::Value::as_array) else {
+        return (Vec::new(), Some(raw.clone()));
+    };
+    let mut imgs: Vec<ToolCallImageInfo> = Vec::new();
+    let mut rest: Vec<serde_json::Value> = Vec::new();
+    for item in items {
+        let data = item
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| item.get("type").and_then(serde_json::Value::as_str) == Some("image"));
+        match data {
+            Some(data) => imgs.push(ToolCallImageInfo {
+                data: data.to_string(),
+                mime_type: item
+                    .get("mimeType")
+                    .or_else(|| item.get("mime_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string(),
+                uri: item
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            }),
+            None => rest.push(item.clone()),
+        }
+    }
+    if imgs.is_empty() {
+        return (imgs, Some(raw.clone()));
+    }
+    // `content` carried only images and the envelope holds nothing else → there
+    // is no text left to serialize.
+    let only_content = raw
+        .as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.contains_key("content"));
+    if rest.is_empty() && only_content {
+        return (imgs, None);
+    }
+    let mut stripped = raw.clone();
+    if let Some(obj) = stripped.as_object_mut() {
+        obj.insert("content".to_string(), serde_json::Value::Array(rest));
+    }
+    (imgs, Some(stripped))
+}
+
+/// Merge images from the `content[]` channel with any riding in an MCP
+/// `rawOutput` envelope (see [`split_raw_output_images`]).
+///
+/// Keeps the "`None` leaves the previously emitted list alone" contract the live
+/// reducer depends on (`AcpSessionState`'s replace-on-update for `images`).
+pub(crate) fn merge_raw_output_images(
+    from_content: Option<Vec<ToolCallImageInfo>>,
+    raw_output: Option<&serde_json::Value>,
+) -> Option<Vec<ToolCallImageInfo>> {
+    let from_raw = raw_output
+        .map(|v| split_raw_output_images(v).0)
+        .unwrap_or_default();
+    if from_raw.is_empty() {
+        return from_content;
+    }
+    match from_content {
+        Some(mut merged) => {
+            merged.extend(from_raw);
+            Some(merged)
+        }
+        None => Some(from_raw),
+    }
+}
+
 /// If the output looks like numbered lines (`   115→content`), strip them
 /// and return `{"start_line":N,"content":"..."}` — same as the historical path.
 fn structurize_live_output(text: &str) -> String {
@@ -11351,15 +11448,23 @@ fn pi_live_tool_output(
     raw_output: &Option<serde_json::Value>,
 ) -> Option<String> {
     let raw = raw_output.as_ref()?;
-    if pi_result_is_empty_announcement(raw) {
+    // Lift any MCP image payload out before a stringify can reach it: a
+    // screenshot result otherwise ships ~60 KB of base64 as the card's TEXT
+    // (see `split_raw_output_images`). An image-only result strips down to the
+    // empty announcement, which the next guard already drops.
+    let stripped = split_raw_output_images(raw).1?;
+    if pi_result_is_empty_announcement(&stripped) {
         return None;
     }
     if content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
         return None;
     }
-    raw.get("content")
+    let stripped = Some(stripped);
+    stripped
+        .as_ref()
+        .and_then(|raw| raw.get("content"))
         .and_then(crate::parsers::pi::tool_result_content_text)
-        .or_else(|| json_value_to_text(raw_output))
+        .or_else(|| json_value_to_text(&stripped))
         .map(|text| structurize_live_output(&text))
 }
 
@@ -14445,7 +14550,12 @@ async fn emit_conversation_update(
                     // pi announces a command with an empty result, which pi-acp
                     // renders as JSON source (see fn doc).
                     .filter(|_| !pi_result_content_is_stringify_noise(agent_type, &tc.raw_output));
-            let images = extract_tool_call_images(content_blocks);
+            // pi carries MCP images in `rawOutput`, not `content[]` — pick them up
+            // so the live card draws the same image the reloaded history shows.
+            let images = merge_raw_output_images(
+                extract_tool_call_images(content_blocks),
+                tc.raw_output.as_ref(),
+            );
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
                 .or(synthesized_edit)
@@ -14707,7 +14817,11 @@ async fn emit_conversation_update(
                 .filter(|_| {
                     !pi_result_content_is_stringify_noise(agent_type, &tcu.fields.raw_output)
                 });
-            let images = content_blocks.and_then(extract_tool_call_images);
+            // Symmetric with the ToolCall arm: pi's MCP images ride in `rawOutput`.
+            let images = merge_raw_output_images(
+                content_blocks.and_then(extract_tool_call_images),
+                tcu.fields.raw_output.as_ref(),
+            );
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
                 .or(synthesized_edit)
@@ -24687,5 +24801,69 @@ mod tests {
         let mut untyped = serde_json::json!({"configOptions": [{"id": "weird"}]});
         strip_unknown_config_options(&mut untyped, "session/new");
         assert_eq!(untyped["configOptions"].as_array().unwrap().len(), 1);
+    }
+
+    /// The LIVE half of the same contract the history parser is tested on
+    /// (`parsers::acp_native::tests::an_image_only_mcp_result_…`): a screenshot
+    /// returned by an MCP tool must reach the card as an image, never as ~60 KB
+    /// of base64 in the text channel. Both sides have to agree — kind=all
+    /// renders history and the live stream through the same components.
+    #[test]
+    fn an_mcp_screenshot_never_reaches_the_live_text_channel() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+        let raw = serde_json::json!({
+            "content": [{ "type": "image", "data": data, "mimeType": "image/png" }]
+        });
+
+        let (imgs, rest) = split_raw_output_images(&raw);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].data, data);
+        assert_eq!(imgs[0].mime_type, "image/png");
+        assert!(
+            rest.is_none(),
+            "an image-only envelope has no text left to serialize"
+        );
+
+        assert_eq!(
+            pi_live_tool_output(&None, &Some(raw.clone())),
+            None,
+            "the live text channel must stay empty rather than carry base64"
+        );
+
+        // `None` from the content channel still means "keep the prior list", so
+        // the merge must only ever ADD what rawOutput carried.
+        let merged = merge_raw_output_images(None, Some(&raw)).expect("images surface live");
+        assert_eq!(merged.len(), 1);
+        assert!(merge_raw_output_images(None, None).is_none());
+    }
+
+    /// Text riding alongside the image still reaches the card, and a result with
+    /// no images is passed through byte-for-byte — every other agent keeps its
+    /// existing behaviour.
+    #[test]
+    fn splitting_leaves_text_and_image_free_results_alone() {
+        let data = "iVBORw0KGgo".repeat(32);
+        let mixed = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "captured 1 page" },
+                { "type": "image", "data": data, "mimeType": "image/png" }
+            ]
+        });
+        let (imgs, rest) = split_raw_output_images(&mixed);
+        assert_eq!(imgs.len(), 1);
+        let rest = rest.expect("the text survives");
+        let serialized = rest.to_string();
+        assert!(serialized.contains("captured 1 page"), "got {serialized}");
+        assert!(!serialized.contains("iVBORw0KGgo"), "got {serialized}");
+
+        let plain = serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] });
+        let (imgs, rest) = split_raw_output_images(&plain);
+        assert!(imgs.is_empty());
+        assert_eq!(rest.as_ref(), Some(&plain), "untouched when there is no image");
+
+        let not_mcp = serde_json::json!({ "stdout": "hello" });
+        let (imgs, rest) = split_raw_output_images(&not_mcp);
+        assert!(imgs.is_empty());
+        assert_eq!(rest.as_ref(), Some(&not_mcp));
     }
 }
