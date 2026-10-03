@@ -38,8 +38,8 @@ use sacp::schema::{SessionUpdate, ToolCallContent};
 use serde::Deserialize as _;
 
 use crate::acp::connection::{
-    extract_tool_call_images, json_value_to_text, serialize_tool_call_content,
-    split_raw_output_images, synthesize_edit_input_from_diffs,
+    content_duplicates_raw_output_images, extract_tool_call_images, json_value_to_text,
+    serialize_tool_call_content, split_raw_output_images, synthesize_edit_input_from_diffs,
 };
 use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
@@ -746,15 +746,22 @@ fn upsert_tool_call(
         None
     };
     let input_preview = synthesized_edit.clone().or(own_input);
-    // Images riding in an MCP `rawOutput` envelope (pi-acp puts the whole tool
-    // result there and leaves `content` empty) belong in `images`, not stringified
-    // into the text field below — see `split_raw_output_images`.
+    // Images riding in an MCP `rawOutput` envelope belong in `images`, not
+    // stringified into the text field below — see `split_raw_output_images`.
     let (raw_images, raw_rest) = match raw_output {
         Some(v) => split_raw_output_images(v),
         None => (Vec::new(), None),
     };
-    let output = serialize_tool_call_content(content, synthesized_edit.is_none())
-        .or_else(|| json_value_to_text(&raw_rest));
+    let content_text = serialize_tool_call_content(content, synthesized_edit.is_none());
+    // pi-acp publishes the SAME envelope on both channels, flattening it into a
+    // `content` text block as well, so the base64 would arrive a second time
+    // through the ordinary text path (see `content_duplicates_raw_output_images`).
+    let output = match &content_text {
+        Some(text) if content_duplicates_raw_output_images(text, raw_output) => {
+            json_value_to_text(&raw_rest)
+        }
+        _ => content_text.or_else(|| json_value_to_text(&raw_rest)),
+    };
     let images: Vec<ImageData> = extract_tool_call_images(content)
         .unwrap_or_default()
         .into_iter()
@@ -1460,6 +1467,62 @@ mod tests {
             "the image must not be stringified into the text field: {text}"
         );
         assert_eq!(images.len(), 1);
+    }
+
+    /// The shape pi-acp actually sends — and the one the first cut of this fix
+    /// missed.
+    ///
+    /// It publishes an MCP result on BOTH channels: the structured envelope as
+    /// `rawOutput`, and `JSON.stringify(result, null, 2)` as a `content` TEXT
+    /// block. Handling only `rawOutput` lifted the image correctly but left the
+    /// stringified copy to become `output_preview`, so the base64 was recorded
+    /// TWICE. Captured from a kind=all transcript on 2026-10-03: `content`
+    /// 69,868 chars + `rawOutput` 69,545 chars = 98% of that turn.
+    #[test]
+    fn the_stringified_copy_pi_also_sends_in_content_is_dropped() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+        let envelope = serde_json::json!({
+            "content": [{ "type": "image", "data": data, "mimeType": "image/png" }]
+        });
+        let entries = vec![
+            prompt(1, "look at the page"),
+            update(
+                2,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "browser_screenshot",
+                    "kind": "other",
+                    "status": "pending"
+                }),
+            ),
+            update(
+                3,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "completed",
+                    // pi-acp's own JSON.stringify of the envelope below
+                    "content": [{
+                        "type": "content",
+                        "content": {
+                            "type": "text",
+                            "text": serde_json::to_string_pretty(&envelope).unwrap()
+                        }
+                    }],
+                    "rawOutput": envelope
+                }),
+            ),
+        ];
+        let turns = project_turns(&entries);
+        let (output_preview, images) = tool_result_of(&turns[1]);
+        assert_eq!(
+            output_preview.as_deref(),
+            None,
+            "the stringified duplicate must not become the text field"
+        );
+        assert_eq!(images.len(), 1, "the image is kept — once");
+        assert_eq!(images[0].data, data);
     }
 
     /// Every other agent's `rawOutput` is untouched — this fix must not change

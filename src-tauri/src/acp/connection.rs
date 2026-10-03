@@ -11246,6 +11246,34 @@ pub(crate) fn split_raw_output_images(
     (imgs, Some(stripped))
 }
 
+/// Is this serialized `content` text merely pi-acp's `JSON.stringify` of the very
+/// `rawOutput` envelope we just lifted images out of?
+///
+/// pi-acp publishes an MCP result on BOTH channels: the structured envelope as
+/// `rawOutput`, and — when `toolResultToText` finds no text, diff, stdout or
+/// stderr to flatten — `JSON.stringify(result, null, 2)` as a `content` TEXT
+/// block. For a screenshot that means the same base64 arrives twice, and the
+/// `content` copy is the one that becomes `output_preview`.
+///
+/// Measured 2026-10-03 on a kind=all instance, one screenshot turn:
+/// `content` 69,868 chars + `rawOutput` 69,545 chars = 98% of the recorded turn.
+///
+/// Gated on actually having found images, so a result without them keeps its
+/// existing text byte-for-byte — including pi's pretty-printed spacing, which a
+/// re-serialization would not preserve.
+pub(crate) fn content_duplicates_raw_output_images(
+    content_text: &str,
+    raw_output: Option<&serde_json::Value>,
+) -> bool {
+    let Some(raw) = raw_output else {
+        return false;
+    };
+    if split_raw_output_images(raw).0.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(content_text).is_ok_and(|parsed| &parsed == raw)
+}
+
 /// Merge images from the `content[]` channel with any riding in an MCP
 /// `rawOutput` envelope (see [`split_raw_output_images`]).
 ///
@@ -14549,7 +14577,11 @@ async fn emit_conversation_update(
                     .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
                     // pi announces a command with an empty result, which pi-acp
                     // renders as JSON source (see fn doc).
-                    .filter(|_| !pi_result_content_is_stringify_noise(agent_type, &tc.raw_output));
+                    .filter(|_| !pi_result_content_is_stringify_noise(agent_type, &tc.raw_output))
+                    // …and it flattens an image-carrying MCP envelope into this
+                    // same channel, which would ship the base64 we just lifted
+                    // into `images` as the card's text.
+                    .filter(|c| !content_duplicates_raw_output_images(c, tc.raw_output.as_ref()));
             // pi carries MCP images in `rawOutput`, not `content[]` — pick them up
             // so the live card draws the same image the reloaded history shows.
             let images = merge_raw_output_images(
@@ -14816,6 +14848,10 @@ async fn emit_conversation_update(
                 // pi's empty opening frame is a `tool_call_update`.
                 .filter(|_| {
                     !pi_result_content_is_stringify_noise(agent_type, &tcu.fields.raw_output)
+                })
+                // Symmetric again: the screenshot result lands on this arm.
+                .filter(|c| {
+                    !content_duplicates_raw_output_images(c, tcu.fields.raw_output.as_ref())
                 });
             // Symmetric with the ToolCall arm: pi's MCP images ride in `rawOutput`.
             let images = merge_raw_output_images(

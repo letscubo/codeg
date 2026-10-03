@@ -117,6 +117,14 @@ impl codeg_lib::acp::work_task_tools::WorkTaskToolAccess for NoTaskTools {
 
 /// Chat-authoring stub: the e2e delegation tests never exercise the authoring
 /// arms.
+struct NoUploads;
+#[async_trait::async_trait]
+impl codeg_lib::commands::myclaw_upload::ArtifactUploadAccess for NoUploads {
+    async fn upload(&self, _path: &str) -> Result<String, String> {
+        Err("uploads are unavailable in this test".to_string())
+    }
+}
+
 struct NoAuthoring;
 #[async_trait::async_trait]
 impl codeg_lib::acp::chat_authoring::ChatAuthoringAccess for NoAuthoring {
@@ -225,6 +233,8 @@ async fn end_to_end_uds_happy_path() {
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
         Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(NoUploads)
+            as Arc<dyn codeg_lib::commands::myclaw_upload::ArtifactUploadAccess>,
     );
 
     // Freshly-named directory per test — no clashes across test bins.
@@ -342,6 +352,8 @@ async fn end_to_end_uds_batch_status() {
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
         Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(NoUploads)
+            as Arc<dyn codeg_lib::commands::myclaw_upload::ArtifactUploadAccess>,
     );
 
     let dir = socket_dir();
@@ -430,6 +442,8 @@ async fn end_to_end_uds_invalid_token_rejected() {
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
         Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(NoUploads)
+            as Arc<dyn codeg_lib::commands::myclaw_upload::ArtifactUploadAccess>,
     );
 
     let dir = socket_dir();
@@ -497,6 +511,8 @@ async fn end_to_end_uds_ask_question_round_trip() {
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
         Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(NoUploads)
+            as Arc<dyn codeg_lib::commands::myclaw_upload::ArtifactUploadAccess>,
     );
 
     let dir = socket_dir();
@@ -638,6 +654,8 @@ async fn end_to_end_uds_ask_revoked_after_register_declines() {
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
         Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(NoUploads)
+            as Arc<dyn codeg_lib::commands::myclaw_upload::ArtifactUploadAccess>,
     );
 
     let dir = socket_dir();
