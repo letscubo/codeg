@@ -1858,6 +1858,8 @@ pub fn build_router(
     // WebSocket route (auth via Sec-WebSocket-Protocol)
     let ws_route = Router::new()
         .route("/ws/events", get(ws::ws_handler))
+        // MyClaw fork ext: agent 浏览器的实时画面与接管(见 ws_browser.rs),同一把 token
+        .route("/ws/browser", get(super::ws_browser::ws_browser_handler))
         .layer(middleware::from_fn(move |req, next| {
             auth::require_token(req, next, token_for_ws.clone())
         }))
