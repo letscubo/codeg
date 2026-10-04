@@ -14,6 +14,7 @@ const LOGS_DIR_NAME: &str = "logs";
 const TURN_TIMINGS_DIR_NAME: &str = "turn-timings";
 const ACP_TRANSCRIPTS_DIR_NAME: &str = "acp-transcripts";
 const BACKGROUNDS_DIR_NAME: &str = "backgrounds";
+const TOOL_MEDIA_DIR_NAME: &str = "tool-media";
 
 /// `$CODEG_HOME` if set (and non-empty), else `~/.codeg/`.
 ///
@@ -167,6 +168,32 @@ pub fn codeg_acp_transcripts_root() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(CODEG_DIR_NAME).join(ACP_TRANSCRIPTS_DIR_NAME))
         .unwrap_or_else(|| PathBuf::from(CODEG_DIR_NAME).join(ACP_TRANSCRIPTS_DIR_NAME))
+}
+
+/// Where a tool result's images are kept so history can point at a file instead
+/// of carrying the bytes.
+///
+/// An MCP tool that returns a picture (a browser screenshot, a read of a PNG)
+/// hands back base64. Keeping that in the recorded turn costs ~70 KB per shot —
+/// measured 2026-10-03 on a kind=all instance, one screenshot was 97% of the
+/// turn — and it travels again on every history fetch. The bytes land here once,
+/// named by their own digest, and the projection reports the path; MyClaw serves
+/// it through `/api/vms/<id>/file`, which checks ownership on every request and
+/// redirects so the bytes never transit the platform.
+///
+/// Content-addressed on purpose: the same screenshot taken twice, or the same
+/// turn re-projected, resolves to one file. Nothing here is ever rewritten, so a
+/// reader racing a writer either sees the finished file or no file at all.
+pub fn codeg_tool_media_root() -> PathBuf {
+    if let Some(custom) = std::env::var_os("CODEG_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(custom).join(TOOL_MEDIA_DIR_NAME);
+    }
+    if let Some(data) = std::env::var_os("CODEG_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(data).join(TOOL_MEDIA_DIR_NAME);
+    }
+    dirs::home_dir()
+        .map(|h| h.join(CODEG_DIR_NAME).join(TOOL_MEDIA_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(CODEG_DIR_NAME).join(TOOL_MEDIA_DIR_NAME))
 }
 
 /// Single source of truth for "where does the database live, and where

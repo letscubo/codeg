@@ -40,6 +40,7 @@ use serde::Deserialize as _;
 use crate::acp::connection::{
     content_duplicates_raw_output_images, extract_tool_call_images, json_value_to_text,
     serialize_tool_call_content, split_raw_output_images, synthesize_edit_input_from_diffs,
+    tool_image_path,
 };
 use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
@@ -762,10 +763,28 @@ fn upsert_tool_call(
         }
         _ => content_text.or_else(|| json_value_to_text(&raw_rest)),
     };
+    /*
+     * 历史里的图**只报路径,不带字节**。
+     *
+     * 实时那一侧收到工具结果时已经把它落了盘(`persist_tool_images`),文件名就是这段
+     * base64 的摘要,所以这里不碰磁盘也能算出同一个位置(`tool_image_path`)。重放一轮
+     * 历史因此从 ~70 KB 降到一个路径,而 MyClaw 拿这个路径走 `/api/vms/<id>/file`
+     * ——每次请求都校验归属,再 302 给容器,字节不过平台。
+     *
+     * 实时流仍然带字节(卡片要立刻显示),两侧看到的是同一张图。
+     */
     let images: Vec<ImageData> = extract_tool_call_images(content)
         .unwrap_or_default()
         .into_iter()
         .chain(raw_images)
+        .map(|img| match tool_image_path(&img) {
+            Some(path) => ImageData {
+                data: String::new(),
+                mime_type: img.mime_type,
+                uri: Some(format!("file://{}", path.display())),
+            },
+            None => img,
+        })
         .collect();
     let is_error = status == Some("failed");
 
@@ -1444,8 +1463,11 @@ mod tests {
             "an image-only result has no text — and must never carry base64 here"
         );
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].data, data);
         assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, "", "历史只报路径,字节留在盘上");
+        let uri = images[0].uri.as_deref().expect("有落盘位置");
+        assert!(uri.starts_with("file://"), "got {uri}");
+        assert!(uri.ends_with(".png"), "got {uri}");
     }
 
     /// A result carrying both keeps its text and still lifts the image out, so
@@ -1522,7 +1544,8 @@ mod tests {
             "the stringified duplicate must not become the text field"
         );
         assert_eq!(images.len(), 1, "the image is kept — once");
-        assert_eq!(images[0].data, data);
+        assert_eq!(images[0].data, "", "历史只报路径");
+        assert!(images[0].uri.as_deref().is_some_and(|u| u.starts_with("file://")));
     }
 
     /// Every other agent's `rawOutput` is untouched — this fix must not change

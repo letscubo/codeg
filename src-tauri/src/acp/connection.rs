@@ -11274,6 +11274,62 @@ pub(crate) fn content_duplicates_raw_output_images(
     serde_json::from_str::<serde_json::Value>(content_text).is_ok_and(|parsed| &parsed == raw)
 }
 
+/// Where this image's bytes live on disk — derived from the bytes themselves.
+///
+/// Both halves of the system need the same answer without talking to each other:
+/// the live path WRITES the file as the tool result arrives, and the history
+/// projection (a pure, synchronous parser that must not touch the disk) REPORTS
+/// the path when the transcript is replayed, possibly on another day. A digest of
+/// the payload is the only thing both of them already hold.
+///
+/// `None` for anything that is not base64 image data, so a malformed block can
+/// never steer a write somewhere unexpected.
+pub(crate) fn tool_image_path(img: &ToolCallImageInfo) -> Option<std::path::PathBuf> {
+    if img.data.is_empty() {
+        return None;
+    }
+    let ext = match img.mime_type.as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    };
+    use sha2::{Digest as _, Sha256};
+    let digest = format!("{:x}", Sha256::digest(img.data.as_bytes()));
+    Some(crate::paths::codeg_tool_media_root().join(format!("{}.{ext}", &digest[..32])))
+}
+
+/// Put a tool result's images on disk, once, next to every other one.
+///
+/// Best effort by contract: a failed write only means the history card has no
+/// picture, and a turn must never fail over that. Skips a file that already
+/// exists — the same screenshot in two turns is one file.
+pub(crate) fn persist_tool_images(images: &[ToolCallImageInfo]) {
+    for img in images {
+        let Some(path) = tool_image_path(img) else { continue };
+        if path.exists() {
+            continue;
+        }
+        use base64::Engine as _;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(img.data.as_bytes())
+        else {
+            continue;
+        };
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::debug!("tool image dir failed: {e}");
+                continue;
+            }
+        }
+        // Write-then-rename: a reader must never see a half-written PNG under a
+        // name that says "this is the whole picture".
+        let tmp = path.with_extension("part");
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 /// Merge images from the `content[]` channel with any riding in an MCP
 /// `rawOutput` envelope (see [`split_raw_output_images`]).
 ///
@@ -14588,6 +14644,10 @@ async fn emit_conversation_update(
                 extract_tool_call_images(content_blocks),
                 tc.raw_output.as_ref(),
             );
+            // 落盘一次,历史重放时只报路径(见 tool_image_path)
+            if let Some(imgs) = images.as_deref() {
+                persist_tool_images(imgs);
+            }
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
                 .or(synthesized_edit)
@@ -14858,6 +14918,9 @@ async fn emit_conversation_update(
                 content_blocks.and_then(extract_tool_call_images),
                 tcu.fields.raw_output.as_ref(),
             );
+            if let Some(imgs) = images.as_deref() {
+                persist_tool_images(imgs);
+            }
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
                 .or(synthesized_edit)
@@ -24871,6 +24934,32 @@ mod tests {
         let merged = merge_raw_output_images(None, Some(&raw)).expect("images surface live");
         assert_eq!(merged.len(), 1);
         assert!(merge_raw_output_images(None, None).is_none());
+    }
+
+    /// 整个设计立在这一条上:**写文件的实时侧和报路径的历史侧必须算出同一个位置**。
+    /// 两者永不通信 —— 实时在工具结果到达时写,历史可能隔几天重放一遍 transcript ——
+    /// 唯一共同持有的东西就是那段 base64 本身,所以路径只能由它派生。
+    #[test]
+    fn the_live_writer_and_the_history_reader_agree_on_one_path() {
+        let img = |data: &str, mime: &str| ToolCallImageInfo {
+            data: data.to_string(),
+            mime_type: mime.to_string(),
+            uri: None,
+        };
+        let a = tool_image_path(&img("iVBORw0KGgo=", "image/png")).expect("有路径");
+        let b = tool_image_path(&img("iVBORw0KGgo=", "image/png")).expect("有路径");
+        assert_eq!(a, b, "同样的字节必须落同一个文件");
+
+        let other = tool_image_path(&img("R0lGODlhAQ==", "image/png")).expect("有路径");
+        assert_ne!(a, other, "不同的图不能互相覆盖");
+
+        // 扩展名跟着 mime 走,`/file?path=` 那头据它决定 Content-Type
+        let jpg = tool_image_path(&img("iVBORw0KGgo=", "image/jpeg")).expect("有路径");
+        assert_eq!(jpg.extension().and_then(|e| e.to_str()), Some("jpg"));
+        assert_eq!(a.extension().and_then(|e| e.to_str()), Some("png"));
+
+        // 不是图片数据就绝不给出写入位置
+        assert!(tool_image_path(&img("", "image/png")).is_none());
     }
 
     /// Text riding alongside the image still reaches the card, and a result with
