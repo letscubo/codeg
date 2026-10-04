@@ -38,9 +38,9 @@ use sacp::schema::{SessionUpdate, ToolCallContent};
 use serde::Deserialize as _;
 
 use crate::acp::connection::{
-    content_duplicates_raw_output_images, extract_tool_call_images, json_value_to_text,
-    serialize_tool_call_content, split_raw_output_images, synthesize_edit_input_from_diffs,
-    tool_image_path,
+    content_duplicates_raw_output_images, dedupe_tool_images, extract_tool_call_images,
+    json_value_to_text, serialize_tool_call_content, split_raw_output_images,
+    synthesize_edit_input_from_diffs, tool_image_path,
 };
 use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
@@ -773,10 +773,11 @@ fn upsert_tool_call(
      *
      * 实时流仍然带字节(卡片要立刻显示),两侧看到的是同一张图。
      */
-    let images: Vec<ImageData> = extract_tool_call_images(content)
-        .unwrap_or_default()
+    let mut all_images = extract_tool_call_images(content).unwrap_or_default();
+    all_images.extend(raw_images);
+    // pi 的代理工具把同一张图从 ACP 图片块和 details.mcpResult 各送一份
+    let images: Vec<ImageData> = dedupe_tool_images(all_images)
         .into_iter()
-        .chain(raw_images)
         .map(|img| match tool_image_path(&img) {
             Some(path) => ImageData {
                 data: String::new(),
@@ -1544,6 +1545,63 @@ mod tests {
             "the stringified duplicate must not become the text field"
         );
         assert_eq!(images.len(), 1, "the image is kept — once");
+        assert_eq!(images[0].data, "", "历史只报路径");
+        assert!(images[0].uri.as_deref().is_some_and(|u| u.starts_with("file://")));
+    }
+
+    /// pi-mcp-adapter 的代理工具(`mcp({server, tool, args})`):同一张截图一份走 ACP
+    /// 图片块,一份嵌在 `rawOutput.details.mcpResult.content` 里。2026-10-04 浏览器
+    /// 应用实测,嵌着的那份原样进了 `output_preview` —— 只剥外层 `content` 不够。
+    #[test]
+    fn the_proxy_tool_envelope_neither_leaks_base64_nor_draws_the_image_twice() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+        let entries = vec![
+            prompt(1, "screenshot please"),
+            update(
+                2,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "mcp",
+                    "kind": "other",
+                    "status": "pending"
+                }),
+            ),
+            update(
+                3,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": { "type": "image", "data": data, "mimeType": "image/png" }
+                    }],
+                    "rawOutput": {
+                        "content": [],
+                        "details": {
+                            "mcpResult": {
+                                "content": [{ "type": "image", "data": data, "mimeType": "image/png" }],
+                                "isError": false
+                            },
+                            "mode": "call",
+                            "server": "app-myclaw-browser",
+                            "tool": "browser_screenshot"
+                        }
+                    }
+                }),
+            ),
+        ];
+        let turns = project_turns(&entries);
+        let (output_preview, images) = tool_result_of(&turns[1]);
+        assert!(
+            !output_preview
+                .as_deref()
+                .unwrap_or("")
+                .contains("iVBORw0KGgo"),
+            "base64 must not reach the text field: {output_preview:?}"
+        );
+        assert_eq!(images.len(), 1, "the same picture is drawn once, not twice");
         assert_eq!(images[0].data, "", "历史只报路径");
         assert!(images[0].uri.as_deref().is_some_and(|u| u.starts_with("file://")));
     }

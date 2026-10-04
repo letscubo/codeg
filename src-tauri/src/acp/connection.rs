@@ -11198,13 +11198,70 @@ pub(crate) fn extract_tool_call_images(content: &[ToolCallContent]) -> Option<Ve
 ///
 /// An envelope holding no images comes back untouched, so every other agent's
 /// path stays bit-identical.
+///
+/// ## The proxy envelope
+///
+/// pi-mcp-adapter can also expose a server through ONE proxy tool
+/// (`mcp({server, tool, args})`). Its result nests the MCP result one level
+/// down — `{"content": [], "details": {"mcpResult": {"content": [...]}, "mode",
+/// "server", "tool"}}` — while the picture itself reaches us separately as an
+/// ACP image block. Looking only at the top-level `content` missed it, and the
+/// whole envelope, base64 included, was stringified into `output_preview`.
+/// Measured 2026-10-04 on a kind=all instance through the browser app. The
+/// nested array is lifted the same way; once both arrays are image-free, what is
+/// left is routing metadata the card already shows, so that also counts as
+/// "nothing left worth showing". The ACP block and the nested copy are the SAME
+/// image — callers dedupe with [`dedupe_tool_images`].
 pub(crate) fn split_raw_output_images(
     raw: &serde_json::Value,
 ) -> (Vec<ToolCallImageInfo>, Option<serde_json::Value>) {
-    let Some(items) = raw.get("content").and_then(serde_json::Value::as_array) else {
+    const NESTED: &str = "/details/mcpResult/content";
+    let top = raw.get("content").and_then(serde_json::Value::as_array);
+    let nested = raw.pointer(NESTED).and_then(serde_json::Value::as_array);
+    if top.is_none() && nested.is_none() {
         return (Vec::new(), Some(raw.clone()));
-    };
+    }
     let mut imgs: Vec<ToolCallImageInfo> = Vec::new();
+    let top_rest = top.map(|items| lift_image_items(items, &mut imgs));
+    let nested_rest = nested.map(|items| lift_image_items(items, &mut imgs));
+    if imgs.is_empty() {
+        return (imgs, Some(raw.clone()));
+    }
+    let top_empty = top_rest.as_ref().is_none_or(Vec::is_empty);
+    match &nested_rest {
+        // `content` carried only images and the envelope holds nothing else →
+        // there is no text left to serialize.
+        None => {
+            let only_content = raw
+                .as_object()
+                .is_some_and(|obj| obj.len() == 1 && obj.contains_key("content"));
+            if top_empty && only_content {
+                return (imgs, None);
+            }
+        }
+        // Proxy envelope whose only payload was the picture.
+        Some(rest) if top_empty && rest.is_empty() => return (imgs, None),
+        Some(_) => {}
+    }
+    let mut stripped = raw.clone();
+    if let Some(rest) = top_rest {
+        if let Some(obj) = stripped.as_object_mut() {
+            obj.insert("content".to_string(), serde_json::Value::Array(rest));
+        }
+    }
+    if let Some(rest) = nested_rest {
+        if let Some(slot) = stripped.pointer_mut(NESTED) {
+            *slot = serde_json::Value::Array(rest);
+        }
+    }
+    (imgs, Some(stripped))
+}
+
+/// Move every MCP image item of `items` into `imgs`; return the rest in order.
+fn lift_image_items(
+    items: &[serde_json::Value],
+    imgs: &mut Vec<ToolCallImageInfo>,
+) -> Vec<serde_json::Value> {
     let mut rest: Vec<serde_json::Value> = Vec::new();
     for item in items {
         let data = item
@@ -11228,22 +11285,28 @@ pub(crate) fn split_raw_output_images(
             None => rest.push(item.clone()),
         }
     }
-    if imgs.is_empty() {
-        return (imgs, Some(raw.clone()));
-    }
-    // `content` carried only images and the envelope holds nothing else → there
-    // is no text left to serialize.
-    let only_content = raw
-        .as_object()
-        .is_some_and(|obj| obj.len() == 1 && obj.contains_key("content"));
-    if rest.is_empty() && only_content {
-        return (imgs, None);
-    }
-    let mut stripped = raw.clone();
-    if let Some(obj) = stripped.as_object_mut() {
-        obj.insert("content".to_string(), serde_json::Value::Array(rest));
-    }
-    (imgs, Some(stripped))
+    rest
+}
+
+/// Drop repeats of the same picture, keeping the first.
+///
+/// The proxy envelope (see [`split_raw_output_images`]) delivers one screenshot
+/// twice — as an ACP image block and inside `details.mcpResult` — and without
+/// this the card would draw it twice. Identity is the payload (or, for a
+/// byte-less entry, its uri); two different pictures are never merged.
+pub(crate) fn dedupe_tool_images(images: Vec<ToolCallImageInfo>) -> Vec<ToolCallImageInfo> {
+    let mut seen = std::collections::HashSet::new();
+    images
+        .into_iter()
+        .filter(|img| {
+            let key = if img.data.is_empty() {
+                img.uri.clone().unwrap_or_default()
+            } else {
+                img.data.clone()
+            };
+            key.is_empty() || seen.insert(key)
+        })
+        .collect()
 }
 
 /// Is this serialized `content` text merely pi-acp's `JSON.stringify` of the very
@@ -11348,9 +11411,9 @@ pub(crate) fn merge_raw_output_images(
     match from_content {
         Some(mut merged) => {
             merged.extend(from_raw);
-            Some(merged)
+            Some(dedupe_tool_images(merged))
         }
-        None => Some(from_raw),
+        None => Some(dedupe_tool_images(from_raw)),
     }
 }
 
@@ -24990,5 +25053,54 @@ mod tests {
         let (imgs, rest) = split_raw_output_images(&not_mcp);
         assert!(imgs.is_empty());
         assert_eq!(rest.as_ref(), Some(&not_mcp));
+    }
+
+    /// pi-mcp-adapter 的代理工具把 MCP 结果嵌在 `details.mcpResult` 里(2026-10-04
+    /// 浏览器应用实测)。图要剥出来;只剩路由信息时等同「没东西可显示」;嵌着的文字
+    /// 照常保留;同一张图从 ACP 图片块再来一份时只画一次。
+    #[test]
+    fn the_proxy_envelope_is_split_like_the_plain_one() {
+        let data = "iVBORw0KGgo".repeat(32);
+        let image = serde_json::json!({ "type": "image", "data": data, "mimeType": "image/png" });
+        let proxy = |inner: serde_json::Value| {
+            serde_json::json!({
+                "content": [],
+                "details": {
+                    "mcpResult": { "content": inner, "isError": false },
+                    "mode": "call", "server": "app-myclaw-browser", "tool": "browser_screenshot"
+                }
+            })
+        };
+
+        let only_image = proxy(serde_json::json!([image.clone()]));
+        let (imgs, rest) = split_raw_output_images(&only_image);
+        assert_eq!(imgs.len(), 1);
+        assert!(rest.is_none(), "只剩路由信息,不该再序列化成文字");
+        assert_eq!(pi_live_tool_output(&None, &Some(only_image.clone())), None);
+
+        let with_text =
+            proxy(serde_json::json!([{ "type": "text", "text": "780x437" }, image.clone()]));
+        let (imgs, rest) = split_raw_output_images(&with_text);
+        assert_eq!(imgs.len(), 1);
+        let rest = rest.expect("嵌着的文字要留下").to_string();
+        assert!(rest.contains("780x437"), "got {rest}");
+        assert!(!rest.contains("iVBORw0KGgo"), "got {rest}");
+
+        let from_acp = vec![ToolCallImageInfo {
+            data: data.clone(),
+            mime_type: "image/png".into(),
+            uri: None,
+        }];
+        let merged = merge_raw_output_images(Some(from_acp), Some(&only_image)).expect("有图");
+        assert_eq!(merged.len(), 1, "同一张图两条通道各来一份,只画一次");
+
+        // 不同的图不能被去重吞掉
+        let other = ToolCallImageInfo {
+            data: "R0lGODlh".into(),
+            mime_type: "image/gif".into(),
+            uri: None,
+        };
+        let merged = merge_raw_output_images(Some(vec![other]), Some(&only_image)).expect("有图");
+        assert_eq!(merged.len(), 2);
     }
 }
