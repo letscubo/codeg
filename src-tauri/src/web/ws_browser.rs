@@ -10,6 +10,10 @@
 //!   ← frame / tabs / status                          ← Page.screencastFrame
 //!   → mouse / wheel / key / text / select / navigate  → Input.dispatch* / Target.* / Page.navigate
 //!   → resize / close_tab / close_browser               → Browser.setWindowBounds / Target.closeTarget / Browser.close
+//!
+//! 浏览器不在(从没用过 / 被关掉)时页面在地址栏输网址:用浏览器应用的启动脚本
+//! `browser-mcp.sh --launch` 把这个 agent 的浏览器起起来,再在新标签页里打开;
+//! 浏览器在但一个标签页都没有时同样开新标签页。
 //! ```
 //!
 //! 画面用 `Page.startScreencast`:页面不动就不出帧,出一帧回一个 ack(不回就停推)。
@@ -53,6 +57,8 @@ const SCREENCAST: &str =
 const WAIT_BROWSER: Duration = Duration::from_secs(2);
 /// 刚连上时逐个问标签页的等待上限 —— 卡死的页面不回话,不能让面板一直等它。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 启动脚本起浏览器的等待上限:脚本自己最多等 25 秒,再给排队拿锁留点余量。
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 /// 网页可视区的上下限(CSS 像素)。上限与截图费用挂钩,下限再小网页就没法用了。
 const VIEW_MIN: (f64, f64) = (320.0, 200.0);
 const VIEW_MAX: (f64, f64) = (1280.0, 800.0);
@@ -91,6 +97,56 @@ fn agent_file(agent: &str, name: &str) -> Option<PathBuf> {
 
 fn port_file(agent: &str) -> Option<PathBuf> {
     agent_file(agent, "port")
+}
+
+/// 浏览器还没起来时页面发来的消息:只认地址栏的 `navigate`(http/https),返回网址。
+pub(crate) fn navigate_url(text: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("navigate") {
+        return None;
+    }
+    v.get("url")
+        .and_then(Value::as_str)
+        .filter(|u| allowed_url(u))
+        .map(str::to_string)
+}
+
+/// 用浏览器应用的启动脚本把这个 agent 的浏览器起起来(同一份资料、同一个端口、记住的
+/// 窗口大小)。脚本随应用下发;没装应用就没有它。
+async fn launch_browser(agent: &str) -> Result<(), String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    let script = PathBuf::from(&home).join(".myclaw/skills/app-myclaw-browser/bin/browser-mcp.sh");
+    if !script.is_file() {
+        return Err("browser app is not installed on this instance".into());
+    }
+    let run = tokio::process::Command::new("bash")
+        .arg(&script)
+        .arg("--launch")
+        .env("MYCLAW_AGENT_ID", agent)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(LAUNCH_TIMEOUT, run)
+        .await
+        .map_err(|_| "starting the browser timed out".to_string())?
+        .map_err(|e| format!("cannot run the browser start script: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let line = err
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    Err(if line.is_empty() {
+        format!(
+            "the browser did not start (exit {})",
+            out.status.code().unwrap_or(-1)
+        )
+    } else {
+        line.trim().to_string()
+    })
 }
 
 /// `view-size` 文件("宽,高")→ 可视区。
@@ -160,8 +216,11 @@ async fn run(mut socket: WebSocket, agent: String) {
         .await;
         return;
     }
-    // 等浏览器出现:agent 第一次用浏览器之前端口文件不存在。页面开着面板等就行。
+    // 等浏览器出现:agent 第一次用浏览器之前端口文件不存在;用户在面板里关掉浏览器后端口
+    // 文件还在、浏览器不在。页面开着面板等就行 —— 或者直接在地址栏输网址:这里用浏览器应用
+    // 的启动脚本(`--launch`)把这个 agent 的浏览器起起来,连上后在新标签页里打开它。
     let mut announced = false;
+    let mut pending_url: Option<String> = None;
     let ws_url = loop {
         let port = match port_file(&agent) {
             Some(path) => tokio::fs::read_to_string(path)
@@ -176,9 +235,11 @@ async fn run(mut socket: WebSocket, agent: String) {
             }
         }
         if !announced {
+            // 有端口文件 = 开过、后来没了(被关掉 / 崩了 / 实例重启);没有 = 从没用过
+            let reason = if port.is_some() { "closed" } else { "never" };
             if !send_json(
                 &mut socket,
-                json!({"type": "status", "state": "no_browser"}),
+                json!({"type": "status", "state": "no_browser", "reason": reason}),
             )
             .await
             {
@@ -186,12 +247,28 @@ async fn run(mut socket: WebSocket, agent: String) {
             }
             announced = true;
         }
-        tokio::select! {
-            _ = tokio::time::sleep(WAIT_BROWSER) => {}
+        let url = tokio::select! {
+            _ = tokio::time::sleep(WAIT_BROWSER) => None,
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => {}
+                Some(Ok(Message::Text(text))) => navigate_url(&text),
+                _ => None,
             },
+        };
+        if let Some(url) = url {
+            let _ = send_json(&mut socket, json!({"type": "status", "state": "launching"})).await;
+            match launch_browser(&agent).await {
+                Ok(()) => pending_url = Some(url),
+                Err(message) => {
+                    let _ = send_json(
+                        &mut socket,
+                        json!({"type": "status", "state": "error", "message": message}),
+                    )
+                    .await;
+                }
+            }
+            // 起来了下一圈就连上;没起来让页面重新看到「没有浏览器」
+            announced = false;
         }
     };
 
@@ -214,6 +291,12 @@ async fn run(mut socket: WebSocket, agent: String) {
         .call("Target.setDiscoverTargets", json!({"discover": true}), None)
         .await;
     let _ = send_json(&mut socket, json!({"type": "status", "state": "connected"})).await;
+    if let Some(url) = pending_url {
+        // 新标签页打开;它一出现就被当成「新开的页面」跟过去
+        bridge
+            .call("Target.createTarget", json!({"url": url}), None)
+            .await;
+    }
 
     loop {
         tokio::select! {
@@ -719,6 +802,17 @@ impl Bridge {
             return;
         }
         let Some(session) = self.session() else {
+            // 一个标签页都没有(最后一个被关掉了):在地址栏输网址就开一个新的
+            if kind == "navigate" {
+                if let Some(url) = v
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|u| allowed_url(u))
+                {
+                    self.call("Target.createTarget", json!({"url": url}), None)
+                        .await;
+                }
+            }
             return;
         };
         let num = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
@@ -910,6 +1004,20 @@ mod tests {
             (800, 500),
             "没有多出来的就原样"
         );
+    }
+
+    #[test]
+    fn only_address_bar_navigation_starts_a_closed_browser() {
+        assert_eq!(
+            navigate_url(r#"{"type":"navigate","url":"https://example.com"}"#),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            navigate_url(r#"{"type":"navigate","url":"file:///etc/passwd"}"#),
+            None
+        );
+        assert_eq!(navigate_url(r#"{"type":"reload"}"#), None);
+        assert_eq!(navigate_url("not json"), None);
     }
 
     #[test]
