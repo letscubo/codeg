@@ -43,6 +43,8 @@ const SCREENCAST: &str =
     r#"{"format":"jpeg","quality":60,"maxWidth":1280,"maxHeight":800,"everyNthFrame":1}"#;
 /// 浏览器还没起来(agent 没用过浏览器)时多久再看一眼。
 const WAIT_BROWSER: Duration = Duration::from_secs(2);
+/// 刚连上时逐个问标签页的等待上限 —— 卡死的页面不回话,不能让面板一直等它。
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Deserialize)]
 pub struct BrowserQuery {
@@ -158,6 +160,9 @@ async fn run(mut socket: WebSocket, agent: String) {
         }
     };
     let mut bridge = Bridge::new(cdp);
+    // 先挑 agent 正在用的那页,再开始盯新标签页 —— 顺序反过来的话,已有的每个标签页都会
+    // 被当成「新开的」挨个跟一遍,最后停在哪页全看上报顺序
+    bridge.pick_initial().await;
     bridge
         .call("Target.setDiscoverTargets", json!({"discover": true}), None)
         .await;
@@ -240,6 +245,99 @@ impl Bridge {
             pinned: false,
             pending: HashMap::new(),
             viewport: (0.0, 0.0),
+        }
+    }
+
+    /// 发一个请求并等它的回包(只在开始盯事件之前用:这期间来的事件直接丢掉)。
+    async fn rpc(&mut self, method: &str, params: Value, session: Option<&str>) -> Option<Value> {
+        let id = self.call(method, params, session).await;
+        self.pending.remove(&id);
+        let wait = async {
+            while let Some(Ok(msg)) = self.cdp.next().await {
+                let CdpMessage::Text(text) = msg else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if v.get("id").and_then(Value::as_u64) == Some(id) {
+                    return v.get("result").cloned();
+                }
+            }
+            None
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, wait)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// 刚连上时挑哪页:**最近一次跳转**最晚的那页,就是 agent 正在用的。
+    ///
+    /// 「最后上报的标签页」「有没有别人连着」都靠不住(2026-10-05 预览站实测:面板停在上一轮
+    /// 留下、已经卡死的 BBC 页;残留的 harness 进程也会连着别的页)。页面的
+    /// `performance.timeOrigin` 就是它最近一次导航的时刻;卡死的页面不回话,超时跳过。
+    async fn pick_initial(&mut self) {
+        let Some(targets) = self.rpc("Target.getTargets", json!({}), None).await else {
+            return;
+        };
+        let mut best: Option<(f64, String)> = None;
+        for info in targets
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            if info.get("type").and_then(Value::as_str) != Some("page") {
+                continue;
+            }
+            let tab = tab_of(&info);
+            if tab.id.is_empty() {
+                continue;
+            }
+            self.tabs.push(tab.clone());
+            let Some(att) = self
+                .rpc(
+                    "Target.attachToTarget",
+                    json!({"targetId": tab.id, "flatten": true}),
+                    None,
+                )
+                .await
+            else {
+                continue;
+            };
+            let Some(session) = att
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let origin = self
+                .rpc(
+                    "Runtime.evaluate",
+                    json!({"expression": "performance.timeOrigin", "returnByValue": true}),
+                    Some(&session),
+                )
+                .await
+                .and_then(|r| r.pointer("/result/value").and_then(Value::as_f64));
+            self.call(
+                "Target.detachFromTarget",
+                json!({"sessionId": session}),
+                None,
+            )
+            .await;
+            if let Some(origin) = origin {
+                if best.as_ref().is_none_or(|(b, _)| origin > *b) {
+                    best = Some((origin, tab.id.clone()));
+                }
+            }
+        }
+        let pick = best
+            .map(|(_, id)| id)
+            .or_else(|| self.tabs.last().map(|t| t.id.clone()));
+        if let Some(id) = pick {
+            self.follow(&id).await;
         }
     }
 
@@ -387,23 +485,7 @@ impl Bridge {
                 if info.get("type").and_then(Value::as_str) != Some("page") {
                     return out;
                 }
-                let tab = Tab {
-                    id: info
-                        .get("targetId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    url: info
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    title: info
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                };
+                let tab = tab_of(&info);
                 if tab.id.is_empty() {
                     return out;
                 }
@@ -424,6 +506,7 @@ impl Bridge {
                 if !self.pinned && should_follow(old_url.as_deref(), &tab.url) {
                     self.follow(&tab.id).await;
                 } else if self.current.is_none() && self.want.is_none() {
+                    // 刚连上时一个都没挑出来(全都不回话):先随便看一个
                     self.follow(&tab.id).await;
                 }
                 out.push(self.tabs_msg());
@@ -557,6 +640,20 @@ impl Bridge {
             }
             _ => {}
         }
+    }
+}
+
+fn tab_of(info: &Value) -> Tab {
+    let field = |k: &str| {
+        info.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    Tab {
+        id: field("targetId"),
+        url: field("url"),
+        title: field("title"),
     }
 }
 
