@@ -24,7 +24,9 @@
 //! CSS 像素),这里把 agent 浏览器的**窗口**改成对应大小(`Browser.setWindowBounds`),网页随之
 //! 重新排版 —— 和真浏览器一样,而不是把一张固定大小的画面放大缩小。上限 1280×800(截图更大
 //! 会让模型费用变高)。所有标签页在同一个窗口里,新开的页面也是这个大小;agent 看到的就是这个
-//! 大小。改完记进 `~/.myclaw-browser/<agent>/window-size`,浏览器重启时启动脚本按它开窗口。
+//! 大小。改完记进 `~/.myclaw-browser/<agent>/window-size`(窗口外框,浏览器重启时启动脚本按它
+//! 开窗口)和 `view-size`(想要的可视区)。窗口比可视区多出来的那圈不是定值(`--no-sandbox` 的
+//! 警告条就占 56px,C9 实测),所以面板每次连上、出第一帧时对一次 `view-size`,差了就再改一次。
 //! 坐标仍由页面按帧里带的 `w`/`h`(CSS 像素)换算。
 //!
 //! 鉴权与 `/ws/events` 完全一致(挂同一个 `require_token`)。能连上这里的人本来就能让 agent
@@ -89,6 +91,12 @@ fn agent_file(agent: &str, name: &str) -> Option<PathBuf> {
 
 fn port_file(agent: &str) -> Option<PathBuf> {
     agent_file(agent, "port")
+}
+
+/// `view-size` 文件("宽,高")→ 可视区。
+pub(crate) fn parse_view(text: &str) -> Option<(f64, f64)> {
+    let (w, h) = text.trim().split_once(',')?;
+    clamp_view(w.trim().parse().ok()?, h.trim().parse().ok()?)
 }
 
 /// 想要的网页可视区 → 夹到上下限内、取整。
@@ -253,6 +261,9 @@ struct Tab {
 struct Bridge {
     cdp: CdpStream,
     agent: String,
+    /// 用户在面板上定的可视区(`view-size`);连上后第一帧对一次,不对就改回来
+    desired_view: Option<(f64, f64)>,
+    healed: bool,
     next_id: u64,
     /// 打开的页面,按出现先后
     tabs: Vec<Tab>,
@@ -278,9 +289,14 @@ enum Pending {
 
 impl Bridge {
     fn new(cdp: CdpStream, agent: String) -> Self {
+        let desired_view = agent_file(&agent, "view-size")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| parse_view(&t));
         Self {
             cdp,
             agent,
+            desired_view,
+            healed: false,
             next_id: 0,
             tabs: Vec::new(),
             current: None,
@@ -527,6 +543,10 @@ impl Bridge {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
                 self.viewport = (w, h);
+                if !self.healed && w > 0.0 && h > 0.0 {
+                    self.healed = true;
+                    self.heal_view().await;
+                }
                 out.push(json!({"type": "frame", "data": params.get("data"), "w": w, "h": h}));
             }
             "Target.targetCreated" | "Target.targetInfoChanged" => {
@@ -577,6 +597,26 @@ impl Bridge {
         out
     }
 
+    /// 当前可视区和用户定的差了(浏览器重启后窗口外框变了)就再改一次。
+    async fn heal_view(&mut self) {
+        let Some(view) = self.desired_view else {
+            return;
+        };
+        if (view.0 - self.viewport.0).abs() <= 2.0 && (view.1 - self.viewport.1).abs() <= 2.0 {
+            return;
+        }
+        let Some((target, _)) = self.current.clone() else {
+            return;
+        };
+        self.call_for(
+            "Browser.getWindowForTarget",
+            json!({"targetId": target}),
+            None,
+            Pending::Resize(view.0, view.1),
+        )
+        .await;
+    }
+
     /// `Browser.getWindowForTarget` 回来了:按「窗口 − 可视区」算出新窗口大小,改掉并记下来。
     async fn apply_resize(&mut self, reply: &Value, view: (f64, f64)) {
         let Some(window_id) = reply.pointer("/result/windowId").and_then(Value::as_u64) else {
@@ -607,6 +647,10 @@ impl Bridge {
         if let Some(path) = agent_file(&self.agent, "window-size") {
             let _ = tokio::fs::write(path, format!("{w},{h}\n")).await;
         }
+        if let Some(path) = agent_file(&self.agent, "view-size") {
+            let _ = tokio::fs::write(path, format!("{},{}\n", view.0, view.1)).await;
+        }
+        self.desired_view = Some(view);
     }
 
     /// 页面发来的一条消息 → CDP 调用。坐标是 CSS 像素(页面按帧的 w/h 换算好)。
@@ -655,6 +699,15 @@ impl Bridge {
         if kind == "close_browser" {
             // 整个浏览器退出(省内存 / 卡死时重来)。CDP 连接随之断开,页面收到 browser_gone
             // 后重连等待;agent 下次用浏览器时启动脚本按同一份资料重开,登录状态还在。
+            // 先把标签页一个个关掉:直接 Browser.close 的话下次启动会把它们全恢复回来
+            // (C9 实测;先关光再退出,重开只剩一个空白页)
+            let ids: Vec<String> = self.tabs.iter().map(|t| t.id.clone()).collect();
+            for id in ids {
+                self.call("Target.closeTarget", json!({"targetId": id}), None)
+                    .await;
+            }
+            // 关标签页是异步的,等它们真的关掉再退出,否则会话里还记着它们
+            tokio::time::sleep(Duration::from_millis(600)).await;
             self.call("Browser.close", json!({}), None).await;
             return;
         }
@@ -834,6 +887,15 @@ mod tests {
         assert_eq!(clamp_view(10.0, 10.0), Some((320.0, 200.0)));
         assert_eq!(clamp_view(0.0, 600.0), None);
         assert_eq!(clamp_view(f64::NAN, 600.0), None);
+    }
+
+    #[test]
+    fn the_saved_view_size_is_read_back_within_limits() {
+        assert_eq!(parse_view("1280,729\n"), Some((1280.0, 729.0)));
+        assert_eq!(parse_view(" 900 , 600 "), Some((900.0, 600.0)));
+        assert_eq!(parse_view("9999,9999"), Some((1280.0, 800.0)));
+        assert_eq!(parse_view("abc"), None);
+        assert_eq!(parse_view(""), None);
     }
 
     #[test]
