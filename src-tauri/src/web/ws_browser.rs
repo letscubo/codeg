@@ -12,7 +12,7 @@
 //!   → resize / close_tab / close_browser               → Browser.setWindowBounds / Target.closeTarget / Browser.close
 //!
 //! 标签页的网站图标:定时读 `/json/list` 的 faviconUrl,在容器里下载成 data: 地址推给页面
-//! (`{"type":"icon","targetId","data"}`)。
+//! (`{"type":"icon","targetId","data"}`;这页没有图标时 `data` 为 null,页面据此清掉旧图标)。
 //!
 //! 浏览器不在(从没用过 / 被关掉)时页面在地址栏输网址:用浏览器应用的启动脚本
 //! `browser-mcp.sh --launch` 把这个 agent 的浏览器起起来,再在新标签页里打开;
@@ -139,15 +139,12 @@ async fn scan_icons(port: u16, known: HashSet<String>) -> IconScan {
         if t.get("type").and_then(Value::as_str) != Some("page") {
             continue;
         }
-        let (Some(id), Some(icon)) = (
-            t.get("id").and_then(Value::as_str),
-            t.get("faviconUrl").and_then(Value::as_str),
-        ) else {
+        let Some(id) = t.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if !icon.is_empty() {
-            out.by_target.push((id.to_string(), icon.to_string()));
-        }
+        // 没有 faviconUrl = 这页没有图标(或还没加载出来):记成空串,好让页面清掉旧图标
+        let icon = t.get("faviconUrl").and_then(Value::as_str).unwrap_or("");
+        out.by_target.push((id.to_string(), icon.to_string()));
     }
     let Ok(web) = reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
@@ -160,7 +157,7 @@ async fn scan_icons(port: u16, known: HashSet<String>) -> IconScan {
         .by_target
         .iter()
         .map(|(_, u)| u.clone())
-        .filter(|u| !known.contains(u))
+        .filter(|u| !u.is_empty() && !known.contains(u))
         .collect();
     wanted.sort();
     wanted.dedup();
@@ -461,12 +458,13 @@ async fn run(mut socket: WebSocket, agent: String) {
                     if !changed {
                         continue;
                     }
-                    if let Some(Some(data)) = icons.get(&url) {
-                        let msg = json!({"type": "icon", "targetId": target, "data": data});
-                        if !send_json(&mut socket, msg).await {
-                            bridge.stop().await;
-                            return;
-                        }
+                    // 没有图标 / 下不到也要说:同一个标签页跳到别的网站后,不能还挂着上一个网站的
+                    // 图标(2026-10-06 C9:example.org 页挂着之前那页的 Google 图标)
+                    let data = icons.get(&url).cloned().flatten();
+                    let msg = json!({"type": "icon", "targetId": target, "data": data});
+                    if !send_json(&mut socket, msg).await {
+                        bridge.stop().await;
+                        return;
                     }
                     favicon_of.insert(target, url);
                 }
