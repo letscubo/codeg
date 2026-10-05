@@ -213,6 +213,9 @@ struct Bridge {
     tabs: Vec<Tab>,
     /// 当前在看的页面与它的 CDP session
     current: Option<(String, String)>,
+    /// 想看的页面。attach 是异步的:连上时已有好几个标签页会接连触发跟随,回包回来时
+    /// 不是它的就立刻 detach,免得后台标签页一直推帧
+    want: Option<String>,
     /// 用户手动选过 —— 之后新开的页面不再自动跟过去
     pinned: bool,
     /// 等回包的请求:id → 用途
@@ -233,6 +236,7 @@ impl Bridge {
             next_id: 0,
             tabs: Vec::new(),
             current: None,
+            want: None,
             pinned: false,
             pending: HashMap::new(),
             viewport: (0.0, 0.0),
@@ -279,6 +283,7 @@ impl Bridge {
     }
 
     async fn follow(&mut self, target_id: &str) {
+        self.want = Some(target_id.to_string());
         if self.current.as_ref().is_some_and(|(t, _)| t == target_id) {
             return;
         }
@@ -323,6 +328,16 @@ impl Bridge {
             if let Some(Pending::Attach(target)) = self.pending.remove(&id) {
                 if let Some(session) = v.pointer("/result/sessionId").and_then(Value::as_str) {
                     let session = session.to_string();
+                    // 回包回来时已经想看别的页面了(连上时接连触发的跟随):这个不要了
+                    if self.want.as_deref() != Some(target.as_str()) {
+                        self.call(
+                            "Target.detachFromTarget",
+                            json!({"sessionId": session}),
+                            None,
+                        )
+                        .await;
+                        return out;
+                    }
                     self.current = Some((target, session.clone()));
                     self.call("Page.enable", json!({}), Some(&session)).await;
                     self.call("Page.bringToFront", json!({}), Some(&session))
@@ -392,13 +407,23 @@ impl Bridge {
                 if tab.id.is_empty() {
                     return out;
                 }
-                let is_new = !self.tabs.iter().any(|t| t.id == tab.id);
+                let old_url = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab.id)
+                    .map(|t| t.url.clone());
                 match self.tabs.iter_mut().find(|t| t.id == tab.id) {
                     Some(existing) => *existing = tab.clone(),
                     None => self.tabs.push(tab.clone()),
                 }
-                // 默认跟最新打开的页面;用户手动选过就不跟了
-                if (is_new && !self.pinned) || self.current.is_none() {
+                // 跟着 agent 走:新开的页面,或者**刚跳转过的页面**。agent 常在已有的
+                // 标签页里直接 goto_url,只跟「最新打开的」会停在一个它早就不用的页面上
+                // (2026-10-05 预览站实测:面板停在上一轮的 BBC 页,agent 在 GitHub 那页干活)。
+                // 只认地址变化,标题变化不算 —— 后台页面改标题不该把画面抢走。
+                // 用户手动选过就都不跟了。
+                if !self.pinned && should_follow(old_url.as_deref(), &tab.url) {
+                    self.follow(&tab.id).await;
+                } else if self.current.is_none() && self.want.is_none() {
                     self.follow(&tab.id).await;
                 }
                 out.push(self.tabs_msg());
@@ -535,6 +560,14 @@ impl Bridge {
     }
 }
 
+/// 页面的地址变化要不要把画面跟过去:新出现的页面要跟;已有页面只在地址真的变了时跟。
+pub(crate) fn should_follow(old_url: Option<&str>, new_url: &str) -> bool {
+    match old_url {
+        None => true,
+        Some(old) => old != new_url && !new_url.is_empty(),
+    }
+}
+
 pub(crate) fn allowed_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
@@ -559,6 +592,20 @@ mod tests {
         assert_eq!(parse_port("22"), None, "端口文件被改写也连不到别的服务");
         assert_eq!(parse_port("9401"), None);
         assert_eq!(parse_port("abc"), None);
+    }
+
+    #[test]
+    fn the_view_follows_new_tabs_and_tabs_that_just_navigated() {
+        assert!(should_follow(None, "about:blank"), "新开的页面");
+        assert!(
+            should_follow(Some("https://a.test/"), "https://b.test/"),
+            "agent 在老标签页里跳转"
+        );
+        assert!(
+            !should_follow(Some("https://a.test/"), "https://a.test/"),
+            "只改了标题"
+        );
+        assert!(!should_follow(Some("https://a.test/"), ""));
     }
 
     #[test]
