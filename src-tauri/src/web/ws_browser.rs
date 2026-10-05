@@ -9,6 +9,7 @@
 //! 网页 ──WS(本路由,与 /ws/events 同一把 token)──> codeg ──CDP──> 127.0.0.1:<port>
 //!   ← frame / tabs / status                          ← Page.screencastFrame
 //!   → mouse / wheel / key / text / select / navigate  → Input.dispatch* / Target.* / Page.navigate
+//!   → resize / close_tab / close_browser               → Browser.setWindowBounds / Target.closeTarget / Browser.close
 //! ```
 //!
 //! 画面用 `Page.startScreencast`:页面不动就不出帧,出一帧回一个 ack(不回就停推)。
@@ -19,7 +20,12 @@
 //! 指定。跟上之后 `Page.bringToFront` 一次 —— headless 下不在前台的页面不合成,一帧都不出
 //! (和 harness 截图首次超时是同一个原因)。
 //!
-//! 不改浏览器的视口:那会改变 agent 看到的页面。坐标由页面按帧里带的 `w`/`h`(CSS 像素)换算。
+//! 窗口大小跟着面板:用户在页面上改完悬浮窗大小,发一条 `resize`(想要的网页可视区,
+//! CSS 像素),这里把 agent 浏览器的**窗口**改成对应大小(`Browser.setWindowBounds`),网页随之
+//! 重新排版 —— 和真浏览器一样,而不是把一张固定大小的画面放大缩小。上限 1280×800(截图更大
+//! 会让模型费用变高)。所有标签页在同一个窗口里,新开的页面也是这个大小;agent 看到的就是这个
+//! 大小。改完记进 `~/.myclaw-browser/<agent>/window-size`,浏览器重启时启动脚本按它开窗口。
+//! 坐标仍由页面按帧里带的 `w`/`h`(CSS 像素)换算。
 //!
 //! 鉴权与 `/ws/events` 完全一致(挂同一个 `require_token`)。能连上这里的人本来就能让 agent
 //! 做任何事,接管浏览器没有扩大暴露面。
@@ -45,6 +51,9 @@ const SCREENCAST: &str =
 const WAIT_BROWSER: Duration = Duration::from_secs(2);
 /// 刚连上时逐个问标签页的等待上限 —— 卡死的页面不回话,不能让面板一直等它。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 网页可视区的上下限(CSS 像素)。上限与截图费用挂钩,下限再小网页就没法用了。
+const VIEW_MIN: (f64, f64) = (320.0, 200.0);
+const VIEW_MAX: (f64, f64) = (1280.0, 800.0);
 
 #[derive(Deserialize)]
 pub struct BrowserQuery {
@@ -68,13 +77,43 @@ pub(crate) fn valid_agent_id(agent: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn port_file(agent: &str) -> Option<PathBuf> {
+fn agent_file(agent: &str, name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
             .join(".myclaw-browser")
             .join(agent)
-            .join("port"),
+            .join(name),
+    )
+}
+
+fn port_file(agent: &str) -> Option<PathBuf> {
+    agent_file(agent, "port")
+}
+
+/// 想要的网页可视区 → 夹到上下限内、取整。
+pub(crate) fn clamp_view(w: f64, h: f64) -> Option<(f64, f64)> {
+    if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some((
+        w.clamp(VIEW_MIN.0, VIEW_MAX.0).round(),
+        h.clamp(VIEW_MIN.1, VIEW_MAX.1).round(),
+    ))
+}
+
+/// 可视区 → 窗口大小。窗口比可视区多出来的那圈(headless 下宽 0、高 143,版本不同可能不同)
+/// 按改之前的「窗口 − 可视区」现算,不写死。
+pub(crate) fn window_for_view(
+    view: (f64, f64),
+    bounds: (f64, f64),
+    current_view: (f64, f64),
+) -> (u32, u32) {
+    let extra_w = (bounds.0 - current_view.0).max(0.0);
+    let extra_h = (bounds.1 - current_view.1).max(0.0);
+    (
+        (view.0 + extra_w).round() as u32,
+        (view.1 + extra_h).round() as u32,
     )
 }
 
@@ -159,7 +198,7 @@ async fn run(mut socket: WebSocket, agent: String) {
             return;
         }
     };
-    let mut bridge = Bridge::new(cdp);
+    let mut bridge = Bridge::new(cdp, agent);
     // 先挑 agent 正在用的那页,再开始盯新标签页 —— 顺序反过来的话,已有的每个标签页都会
     // 被当成「新开的」挨个跟一遍,最后停在哪页全看上报顺序
     bridge.pick_initial().await;
@@ -213,6 +252,7 @@ struct Tab {
 
 struct Bridge {
     cdp: CdpStream,
+    agent: String,
     next_id: u64,
     /// 打开的页面,按出现先后
     tabs: Vec<Tab>,
@@ -231,13 +271,16 @@ struct Bridge {
 
 enum Pending {
     Attach(String),
+    /// 问窗口位置是为了改大小:想要的网页可视区
+    Resize(f64, f64),
     Ignore,
 }
 
 impl Bridge {
-    fn new(cdp: CdpStream) -> Self {
+    fn new(cdp: CdpStream, agent: String) -> Self {
         Self {
             cdp,
+            agent,
             next_id: 0,
             tabs: Vec::new(),
             current: None,
@@ -423,6 +466,12 @@ impl Bridge {
     async fn handle_cdp(&mut self, v: Value) -> Vec<Value> {
         let mut out = Vec::new();
         if let Some(id) = v.get("id").and_then(Value::as_u64) {
+            if let Some(Pending::Resize(w, h)) = self.pending.get(&id) {
+                let view = (*w, *h);
+                self.pending.remove(&id);
+                self.apply_resize(&v, view).await;
+                return out;
+            }
             if let Some(Pending::Attach(target)) = self.pending.remove(&id) {
                 if let Some(session) = v.pointer("/result/sessionId").and_then(Value::as_str) {
                     let session = session.to_string();
@@ -528,9 +577,61 @@ impl Bridge {
         out
     }
 
+    /// `Browser.getWindowForTarget` 回来了:按「窗口 − 可视区」算出新窗口大小,改掉并记下来。
+    async fn apply_resize(&mut self, reply: &Value, view: (f64, f64)) {
+        let Some(window_id) = reply.pointer("/result/windowId").and_then(Value::as_u64) else {
+            return;
+        };
+        let num = |k: &str| {
+            reply
+                .pointer(&format!("/result/bounds/{k}"))
+                .and_then(Value::as_f64)
+        };
+        let (Some(bw), Some(bh)) = (num("width"), num("height")) else {
+            return;
+        };
+        let (w, h) = window_for_view(view, (bw, bh), self.viewport);
+        self.call(
+            "Browser.setWindowBounds",
+            json!({"windowId": window_id, "bounds": {"windowState": "normal"}}),
+            None,
+        )
+        .await;
+        self.call(
+            "Browser.setWindowBounds",
+            json!({"windowId": window_id, "bounds": {"width": w, "height": h}}),
+            None,
+        )
+        .await;
+        // 浏览器重启后按这个大小开窗口(启动脚本读);写不进去不影响这次
+        if let Some(path) = agent_file(&self.agent, "window-size") {
+            let _ = tokio::fs::write(path, format!("{w},{h}\n")).await;
+        }
+    }
+
     /// 页面发来的一条消息 → CDP 调用。坐标是 CSS 像素(页面按帧的 w/h 换算好)。
     async fn handle_client(&mut self, v: Value) {
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "resize" {
+            let num = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+            // 还没出过画面就不知道窗口比可视区多多少,不改
+            let (Some(view), Some((target, _))) =
+                (clamp_view(num("w"), num("h")), self.current.clone())
+            else {
+                return;
+            };
+            if self.viewport.0 <= 0.0 || self.viewport.1 <= 0.0 {
+                return;
+            }
+            self.call_for(
+                "Browser.getWindowForTarget",
+                json!({"targetId": target}),
+                None,
+                Pending::Resize(view.0, view.1),
+            )
+            .await;
+            return;
+        }
         if kind == "select" {
             if let Some(id) = v.get("targetId").and_then(Value::as_str) {
                 if self.tabs.iter().any(|t| t.id == id) {
@@ -538,6 +639,23 @@ impl Bridge {
                     self.follow(id).await;
                 }
             }
+            return;
+        }
+        if kind == "close_tab" {
+            // 只关这个浏览器里认得的页面;关的是正在看的,targetDestroyed 会换到别的页
+            if let Some(id) = v.get("targetId").and_then(Value::as_str) {
+                if self.tabs.iter().any(|t| t.id == id) {
+                    let id = id.to_string();
+                    self.call("Target.closeTarget", json!({"targetId": id}), None)
+                        .await;
+                }
+            }
+            return;
+        }
+        if kind == "close_browser" {
+            // 整个浏览器退出(省内存 / 卡死时重来)。CDP 连接随之断开,页面收到 browser_gone
+            // 后重连等待;agent 下次用浏览器时启动脚本按同一份资料重开,登录状态还在。
+            self.call("Browser.close", json!({}), None).await;
             return;
         }
         if kind == "follow_latest" {
@@ -703,6 +821,33 @@ mod tests {
             "只改了标题"
         );
         assert!(!should_follow(Some("https://a.test/"), ""));
+    }
+
+    #[test]
+    fn the_view_size_is_kept_within_limits() {
+        assert_eq!(clamp_view(1000.4, 600.6), Some((1000.0, 601.0)));
+        assert_eq!(
+            clamp_view(5000.0, 5000.0),
+            Some((1280.0, 800.0)),
+            "上限 1280×800"
+        );
+        assert_eq!(clamp_view(10.0, 10.0), Some((320.0, 200.0)));
+        assert_eq!(clamp_view(0.0, 600.0), None);
+        assert_eq!(clamp_view(f64::NAN, 600.0), None);
+    }
+
+    #[test]
+    fn the_window_adds_what_it_had_beyond_the_view() {
+        // C9 实测:窗口 780×580 时可视区 780×437(headless 顶上多 143)
+        assert_eq!(
+            window_for_view((1000.0, 507.0), (780.0, 580.0), (780.0, 437.0)),
+            (1000, 650)
+        );
+        assert_eq!(
+            window_for_view((800.0, 500.0), (800.0, 500.0), (800.0, 500.0)),
+            (800, 500),
+            "没有多出来的就原样"
+        );
     }
 
     #[test]
