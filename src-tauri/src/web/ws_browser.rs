@@ -11,6 +11,9 @@
 //!   → mouse / wheel / key / text / select / navigate  → Input.dispatch* / Target.* / Page.navigate
 //!   → resize / close_tab / close_browser               → Browser.setWindowBounds / Target.closeTarget / Browser.close
 //!
+//! 标签页的网站图标:定时读 `/json/list` 的 faviconUrl,在容器里下载成 data: 地址推给页面
+//! (`{"type":"icon","targetId","data"}`)。
+//!
 //! 浏览器不在(从没用过 / 被关掉)时页面在地址栏输网址:用浏览器应用的启动脚本
 //! `browser-mcp.sh --launch` 把这个 agent 的浏览器起起来,再在新标签页里打开;
 //! 浏览器在但一个标签页都没有时同样开新标签页。
@@ -36,7 +39,7 @@
 //! 鉴权与 `/ws/events` 完全一致(挂同一个 `require_token`)。能连上这里的人本来就能让 agent
 //! 做任何事,接管浏览器没有扩大暴露面。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -97,6 +100,138 @@ fn agent_file(agent: &str, name: &str) -> Option<PathBuf> {
 
 fn port_file(agent: &str) -> Option<PathBuf> {
     agent_file(agent, "port")
+}
+
+/// 隔多久看一次各标签页的网站图标
+const ICON_SCAN_EVERY: Duration = Duration::from_secs(3);
+/// 一次最多新下载几个图标、每个最大多少字节(大图标多半不是 favicon,不要)
+const ICON_FETCH_PER_SCAN: usize = 8;
+const ICON_MAX_BYTES: usize = 100 * 1024;
+
+struct IconScan {
+    /// 标签页 → 它此刻的网站图标地址
+    by_target: Vec<(String, String)>,
+    /// 这次新下载的:图标地址 → data: 地址(下不到为 None,记下来不再重试)
+    fetched: Vec<(String, Option<String>)>,
+}
+
+async fn scan_icons(port: u16, known: HashSet<String>) -> IconScan {
+    let mut out = IconScan {
+        by_target: Vec::new(),
+        fetched: Vec::new(),
+    };
+    let Ok(local) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()
+    else {
+        return out;
+    };
+    let Ok(resp) = local
+        .get(format!("http://127.0.0.1:{port}/json/list"))
+        .send()
+        .await
+    else {
+        return out;
+    };
+    let list: Vec<Value> = resp.json().await.unwrap_or_default();
+    for t in &list {
+        if t.get("type").and_then(Value::as_str) != Some("page") {
+            continue;
+        }
+        let (Some(id), Some(icon)) = (
+            t.get("id").and_then(Value::as_str),
+            t.get("faviconUrl").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !icon.is_empty() {
+            out.by_target.push((id.to_string(), icon.to_string()));
+        }
+    }
+    let Ok(web) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36")
+        .build()
+    else {
+        return out;
+    };
+    let mut wanted: Vec<String> = out
+        .by_target
+        .iter()
+        .map(|(_, u)| u.clone())
+        .filter(|u| !known.contains(u))
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+    for url in wanted.into_iter().take(ICON_FETCH_PER_SCAN) {
+        let data = fetch_icon(&web, &url).await;
+        out.fetched.push((url, data));
+    }
+    out
+}
+
+/// 图标地址 → data: 地址。只要图片,太大的不要。
+async fn fetch_icon(client: &reqwest::Client, url: &str) -> Option<String> {
+    use base64::Engine as _;
+    if url.starts_with("data:image/") {
+        return (url.len() <= ICON_MAX_BYTES * 2).then(|| url.to_string());
+    }
+    if !allowed_url(url) {
+        return None;
+    }
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let header_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > ICON_MAX_BYTES {
+        return None;
+    }
+    let mime = icon_mime(header_type.as_deref(), url)?;
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// 图标的类型:响应头说是图片就信它;没说或说成二进制流就按扩展名猜;说是别的(网页等)就不要。
+pub(crate) fn icon_mime(header_type: Option<&str>, url: &str) -> Option<String> {
+    match header_type {
+        Some(t) if t.starts_with("image/") => return Some(t.to_string()),
+        Some(t) if !t.is_empty() && t != "application/octet-stream" => return None,
+        _ => {}
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime = if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/x-icon"
+    };
+    Some(mime.to_string())
 }
 
 /// 浏览器还没起来时页面发来的消息:只认地址栏的 `navigate`(http/https),返回网址。
@@ -221,7 +356,7 @@ async fn run(mut socket: WebSocket, agent: String) {
     // 的启动脚本(`--launch`)把这个 agent 的浏览器起起来,连上后在新标签页里打开它。
     let mut announced = false;
     let mut pending_url: Option<String> = None;
-    let ws_url = loop {
+    let (port, ws_url) = loop {
         let port = match port_file(&agent) {
             Some(path) => tokio::fs::read_to_string(path)
                 .await
@@ -231,7 +366,7 @@ async fn run(mut socket: WebSocket, agent: String) {
         };
         if let Some(port) = port {
             if let Some(url) = browser_ws_url(port).await {
-                break url;
+                break (port, url);
             }
         }
         if !announced {
@@ -298,8 +433,44 @@ async fn run(mut socket: WebSocket, agent: String) {
             .await;
     }
 
+    // 标签页的网站图标:每隔几秒问一次浏览器(`/json/list` 带 faviconUrl,CDP 事件里没有),
+    // 新出现的图标在容器里下载、转成 data: 地址推给页面 —— 页面不直接去各网站拉:有的是
+    // http、有的防盗链,容器里打开的内网 / 本机地址用户那边也根本连不到。
+    let mut icon_tick = tokio::time::interval(ICON_SCAN_EVERY);
+    let (icon_tx, mut icon_rx) = tokio::sync::mpsc::channel::<IconScan>(2);
+    let mut icon_scanning = false;
+    let mut favicon_of: HashMap<String, String> = HashMap::new();
+    let mut icons: HashMap<String, Option<String>> = HashMap::new();
+
     loop {
         tokio::select! {
+            _ = icon_tick.tick(), if !icon_scanning => {
+                icon_scanning = true;
+                let known: HashSet<String> = icons.keys().cloned().collect();
+                let tx = icon_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(scan_icons(port, known).await).await;
+                });
+            }
+            Some(scan) = icon_rx.recv() => {
+                icon_scanning = false;
+                let fresh: HashSet<String> = scan.fetched.iter().map(|(u, _)| u.clone()).collect();
+                icons.extend(scan.fetched);
+                for (target, url) in scan.by_target {
+                    let changed = favicon_of.get(&target) != Some(&url) || fresh.contains(&url);
+                    if !changed {
+                        continue;
+                    }
+                    if let Some(Some(data)) = icons.get(&url) {
+                        let msg = json!({"type": "icon", "targetId": target, "data": data});
+                        if !send_json(&mut socket, msg).await {
+                            bridge.stop().await;
+                            return;
+                        }
+                    }
+                    favicon_of.insert(target, url);
+                }
+            }
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
@@ -1018,6 +1189,27 @@ mod tests {
         );
         assert_eq!(navigate_url(r#"{"type":"reload"}"#), None);
         assert_eq!(navigate_url("not json"), None);
+    }
+
+    #[test]
+    fn site_icons_are_accepted_only_as_images() {
+        assert_eq!(
+            icon_mime(Some("image/png"), "https://a.test/x"),
+            Some("image/png".into())
+        );
+        assert_eq!(
+            icon_mime(Some("text/html"), "https://a.test/favicon.ico"),
+            None,
+            "被重定向到网页"
+        );
+        assert_eq!(
+            icon_mime(None, "https://a.test/favicon.ico?v=2"),
+            Some("image/x-icon".into())
+        );
+        assert_eq!(
+            icon_mime(Some("application/octet-stream"), "https://a.test/i.svg"),
+            Some("image/svg+xml".into())
+        );
     }
 
     #[test]
