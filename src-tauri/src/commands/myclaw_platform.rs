@@ -144,6 +144,19 @@ async fn signed_request(
     body: Option<String>,
     timeout: Duration,
 ) -> Result<Value, String> {
+    signed_request_with_query(ep, method, path, &[], body, timeout).await
+}
+
+/// 同 `signed_request`,另带查询参数。签名只覆盖路径(平台按 `pathname` 验签),查询参数
+/// 不进签名 —— 只能放无关鉴权的上报值。
+async fn signed_request_with_query(
+    ep: &PlatformEndpoint,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, &str)],
+    body: Option<String>,
+    timeout: Duration,
+) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(timeout)
@@ -154,6 +167,7 @@ async fn signed_request(
     let sig = sign(&ep.secret, ts, method.as_str(), path, &body_str);
     let mut req = client
         .request(method.clone(), format!("{}{path}", ep.base))
+        .query(query)
         .header("x-codeg-vm", &ep.vm_id)
         .header("x-codeg-ts", ts.to_string())
         .header("x-codeg-sig", sig);
@@ -275,6 +289,43 @@ pub async fn call(
         .ok_or_else(|| "the platform returned no tool result".to_string())
 }
 
+pub const TARGET_VERSION_PATH: &str = "/api/codeg/target-version";
+const TARGET_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 平台要这台实例用哪个 codeg 版本(设计文档「闲时自动升级 codeg」)。
+///
+/// `Ok(None)` = 平台没有可下发的版本,保持现状。`Err` = 不是平台托管 / 平台不可达,
+/// 调用方下次再问。顺带上报当前版本(和上次试运行失败的版本),供 ops-hub 看进度。
+pub async fn target_version(
+    db: &AppDatabase,
+    current: &str,
+    failed: Option<&str>,
+) -> Result<Option<String>, String> {
+    let ep = endpoint(db).await?;
+    let mut query = vec![("current", current)];
+    if let Some(f) = failed {
+        query.push(("failed", f));
+    }
+    let data = signed_request_with_query(
+        &ep,
+        reqwest::Method::GET,
+        TARGET_VERSION_PATH,
+        &query,
+        None,
+        TARGET_VERSION_TIMEOUT,
+    )
+    .await?;
+    Ok(target_version_of(&data))
+}
+
+fn target_version_of(data: &Value) -> Option<String> {
+    data.get("version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// 失败时给模型的结果:MCP 约定用 isError 结果,不是协议错误。
 pub fn error_result(message: &str) -> Value {
     serde_json::json!({
@@ -367,6 +418,17 @@ mod tests {
         assert!(
             endpoint_from_hooks(&[hook("https://myclaw.ai/api/codeg/events?s=x", true)]).is_none()
         );
+    }
+
+    #[test]
+    fn target_version_reads_the_platform_data() {
+        assert_eq!(
+            target_version_of(&serde_json::json!({ "version": "0.30.10-43", "source": "stable" })),
+            Some("0.30.10-43".to_string())
+        );
+        assert_eq!(target_version_of(&serde_json::json!({ "version": null, "source": "none" })), None);
+        assert_eq!(target_version_of(&serde_json::json!({ "version": "  " })), None);
+        assert_eq!(TARGET_VERSION_PATH, "/api/codeg/target-version");
     }
 
     #[test]

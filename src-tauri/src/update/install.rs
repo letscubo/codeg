@@ -201,12 +201,101 @@ fn mark_upgrade_staged() -> Result<(), AppCommandError> {
 /// probation; it must not consume the marker, or the trial window would lose
 /// its second-perform guard and the rollback target could be clobbered.
 pub fn take_upgrade_staged() -> bool {
+    // 启动计数只对「这一次暂存的升级」有意义,标记一消费就一起清掉。
+    if let Some(p) = sibling_path(BOOT_COUNTER_FILE) {
+        let _ = std::fs::remove_file(p);
+    }
     match upgrade_marker_path() {
         Some(p) if p.exists() => {
             let _ = std::fs::remove_file(&p);
             true
         }
         _ => false,
+    }
+}
+
+// ─── fork(letscubo):非 supervised 部署的试运行与自动回退 ─────────────────────────
+//
+// MyClaw 实例容器里 codeg 由系统的 supervisord 拉起(`autorestart=true`、
+// `startretries=999999`),不是 codeg 自带的 `--supervise`。于是自更新走 re-exec,原本
+// 没有试运行、也没有自动回退:新版要是起不来(比如 codeg.db 迁移拒绝启动),supervisord
+// 会无限重拉同一个坏二进制,实例的 codeg 就一直挂着。
+//
+// 这里在 worker 自己身上补一层:暂存标记还在时,每次启动先给「这个未经证明的版本」记
+// 一次启动;撑过试运行期(`upgrade_trial_secs`)才清标记。起到第 `REEXEC_MAX_BOOTS` 次
+// 还没清 = 前面那次没撑住、被 supervisord 重拉了 → 从 `.bak` 退回旧版,记下这个失败的
+// 版本(平台自动升级据此不再反复装它),再 re-exec 进旧版。
+
+const BOOT_COUNTER_FILE: &str = ".codeg-upgrade-boots";
+const FAILED_VERSION_FILE: &str = ".codeg-upgrade-failed";
+
+/// 未经证明的新版最多启动几次:第 1 次是升级后的正常启动;第 2 次说明第 1 次没撑过试运行期。
+pub const REEXEC_MAX_BOOTS: u32 = 2;
+
+fn sibling_path(name: &str) -> Option<PathBuf> {
+    crate::update::runtime::self_exe()
+        .parent()
+        .map(|d| d.join(name))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReexecBootOutcome {
+    /// 没有暂存的升级,照常启动。
+    NoUpgrade,
+    /// 这是新版的试运行启动;调用方在试运行期满后 `take_upgrade_staged()`。
+    OnTrial,
+    /// 新版没撑过试运行,已从 `.bak` 恢复旧版;调用方应立刻 re-exec 进旧版。
+    RolledBack { failed_version: String },
+}
+
+/// 非 supervised 启动时调用(取代原先的「启动即清标记」)。
+pub fn reexec_boot_guard() -> ReexecBootOutcome {
+    if !upgrade_staged() {
+        if let Some(p) = sibling_path(BOOT_COUNTER_FILE) {
+            let _ = std::fs::remove_file(p);
+        }
+        return ReexecBootOutcome::NoUpgrade;
+    }
+    let counter = sibling_path(BOOT_COUNTER_FILE);
+    let boots = counter
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    if let Some(p) = &counter {
+        let _ = std::fs::write(p, boots.to_string());
+    }
+    if boots < REEXEC_MAX_BOOTS {
+        return ReexecBootOutcome::OnTrial;
+    }
+    let failed_version = env!("CARGO_PKG_VERSION").to_string();
+    if let Some(p) = sibling_path(FAILED_VERSION_FILE) {
+        let _ = std::fs::write(p, &failed_version);
+    }
+    match rollback() {
+        Ok(()) => ReexecBootOutcome::RolledBack { failed_version },
+        Err(e) => {
+            // 没有 `.bak` 可退:只能清掉标记照常启动,至少不再被当成「已暂存」挡住后续升级。
+            tracing::error!("[update] trial failed but rollback impossible: {e}");
+            let _ = take_upgrade_staged();
+            ReexecBootOutcome::NoUpgrade
+        }
+    }
+}
+
+/// 上一次试运行失败而被退回的版本(没有就是 None)。平台自动升级遇到同一个目标版本就跳过。
+pub fn failed_upgrade_version() -> Option<String> {
+    sibling_path(FAILED_VERSION_FILE)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 平台换了目标版本后清掉失败记录,让新目标可以装。
+pub fn clear_failed_upgrade_version() {
+    if let Some(p) = sibling_path(FAILED_VERSION_FILE) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -248,6 +337,24 @@ pub async fn perform_update(
     data_dir: &Path,
     on_progress: &ProgressFn<'_>,
 ) -> Result<InstallOutcome, AppCommandError> {
+    perform_update_from(data_dir, on_progress, ReleaseSource::Latest).await
+}
+
+/// 装哪个版本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseSource {
+    /// GitHub「最新发布」(原有行为):只升不降,已是最新则拒绝。
+    Latest,
+    /// fork(letscubo):平台指定的版本(`/api/codeg/target-version`)。比当前高是升级,
+    /// 比当前低就是回退 —— 只要和当前运行的版本不同就装。资产从固定 tag 下载。
+    Pinned(String),
+}
+
+pub async fn perform_update_from(
+    data_dir: &Path,
+    on_progress: &ProgressFn<'_>,
+    source: ReleaseSource,
+) -> Result<InstallOutcome, AppCommandError> {
     let asset = asset_basename().ok_or_else(|| {
         AppCommandError::new(
             crate::app_error::AppErrorCode::DependencyMissing,
@@ -271,23 +378,41 @@ pub async fn perform_update(
     let targets = resolve_targets()?;
     preflight_writable(&targets)?;
 
-    let manifest = version::fetch_latest_manifest().await?;
-    let new_version = version::trim_v_prefix(&manifest.version).to_string();
-
-    // Refuse a non-newer target before touching the network or disk. A stale
-    // client (whose cached "update available" predates another client already
-    // upgrading this server) or a direct API call could otherwise re-install
-    // the running version over itself — which moves the *current* binary into
-    // `.bak`, destroying the genuine previous version that rollback depends on,
-    // for no benefit. The check mirrors `check_app_update`'s availability test.
-    if !version::is_newer(&manifest.version, env!("CARGO_PKG_VERSION")) {
-        return Err(AppCommandError::already_exists(
-            "The server is already running the latest version",
-        ));
-    }
+    let (new_version, download_base) = match &source {
+        ReleaseSource::Latest => {
+            let manifest = version::fetch_latest_manifest().await?;
+            // Refuse a non-newer target before touching the network or disk. A
+            // stale client (whose cached "update available" predates another
+            // client already upgrading this server) or a direct API call could
+            // otherwise re-install the running version over itself — which moves
+            // the *current* binary into `.bak`, destroying the genuine previous
+            // version that rollback depends on, for no benefit. The check mirrors
+            // `check_app_update`'s availability test.
+            if !version::is_newer(&manifest.version, env!("CARGO_PKG_VERSION")) {
+                return Err(AppCommandError::already_exists(
+                    "The server is already running the latest version",
+                ));
+            }
+            (
+                version::trim_v_prefix(&manifest.version).to_string(),
+                version::RELEASE_DOWNLOAD_BASE.to_string(),
+            )
+        }
+        ReleaseSource::Pinned(v) => {
+            let v = version::trim_v_prefix(v.trim()).to_string();
+            // 与运行中的版本相同就不装:重装会把当前二进制挪进 `.bak`,毁掉真正的上一版。
+            if v.is_empty() || v == env!("CARGO_PKG_VERSION") {
+                return Err(AppCommandError::already_exists(
+                    "The server is already running the requested version",
+                ));
+            }
+            let base = version::release_download_base_for(&v);
+            (v, base)
+        }
+    };
 
     let ext = archive_ext();
-    let archive_url = format!("{}/{}{}", version::RELEASE_DOWNLOAD_BASE, asset, ext);
+    let archive_url = format!("{download_base}/{asset}{ext}");
     let sig_url = format!("{archive_url}.sig");
 
     // 1. Download archive (with progress) and its detached signature.

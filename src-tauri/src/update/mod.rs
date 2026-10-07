@@ -11,6 +11,9 @@
 //! - **Standalone** (no supervisor): the worker re-execs itself.
 
 pub mod install;
+/// fork(letscubo):平台下发目标版本的闲时自动升级(只在服务端构建)。
+#[cfg(not(feature = "tauri-runtime"))]
+pub mod platform;
 pub mod runtime;
 pub mod state;
 pub mod verify;
@@ -38,6 +41,12 @@ pub fn schedule_restart(hold: tokio::sync::OwnedMutexGuard<()>) {
         let _hold = hold;
         restart_now();
     });
+}
+
+/// fork(letscubo):试运行失败、已从 `.bak` 恢复旧版后,立刻 re-exec 进旧版(见
+/// `install::reexec_boot_guard`)。只在非 supervised 部署里调用。
+pub fn reexec_restored_binary() -> ! {
+    reexec()
 }
 
 fn restart_now() -> ! {

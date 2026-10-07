@@ -179,11 +179,27 @@ async fn async_main() -> ExitCode {
             });
         }
     } else {
-        // Standalone (non-supervised) self-update re-execs this binary in place,
-        // with no supervisor and thus no trial/rollback. Clear the marker on
-        // startup so a re-exec'd upgrade doesn't leave it behind and block every
-        // future update with "already staged".
-        let _ = codeg_lib::update::install::take_upgrade_staged();
+        // Standalone (non-supervised) self-update re-execs this binary in place.
+        // fork(letscubo):MyClaw 实例里由系统 supervisord 托管、无限重拉,没有
+        // `--supervise` 那套试运行。这里在 worker 自身补上:新版撑过试运行期才清标记;
+        // 没撑住被重拉到第二次就从 `.bak` 退回旧版并 re-exec(见 reexec_boot_guard)。
+        use codeg_lib::update::install::{reexec_boot_guard, ReexecBootOutcome};
+        match reexec_boot_guard() {
+            ReexecBootOutcome::NoUpgrade => {}
+            ReexecBootOutcome::OnTrial => {
+                let trial = codeg_lib::update::runtime::upgrade_trial_secs();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(trial)).await;
+                    let _ = codeg_lib::update::install::take_upgrade_staged();
+                });
+            }
+            ReexecBootOutcome::RolledBack { failed_version } => {
+                eprintln!(
+                    "[SERVER] v{failed_version} did not survive its trial; rolled back, re-executing the previous version"
+                );
+                codeg_lib::update::reexec_restored_binary();
+            }
+        }
     }
 
     tracing::info!("[SERVER] codeg-server v{}", app_version);
@@ -491,6 +507,10 @@ async fn async_main() -> ExitCode {
     ) {
         tokio::spawn(codeg_lib::work_task::run_task_engine(engine));
     }
+
+    // fork(letscubo):平台托管实例按平台下发的目标版本闲时自动升级(见 update::platform)。
+    // 非平台托管(没有指向平台的 webhook)时每次检查都直接跳过。
+    codeg_lib::update::platform::spawn(state.clone());
 
     // Config-sync uploader (mirrors lib.rs setup): sleeps a minute, then
     // compares the configuration's hash every interval and uploads only when

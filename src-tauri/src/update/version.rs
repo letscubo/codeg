@@ -23,6 +23,16 @@ pub const UPDATE_MANIFEST_URL: &str =
 pub const RELEASE_DOWNLOAD_BASE: &str =
     "https://github.com/letscubo/codeg/releases/latest/download";
 
+/// fork(letscubo):某个固定 tag 的 release 资产目录 —— 平台指定目标版本时用它,而不是
+/// 「最新发布」。资产文件名与 `latest/download/` 下的相同(按平台拼的固定名),只是钉在
+/// `v<version>` 这个 tag 上。
+pub fn release_download_base_for(version: &str) -> String {
+    format!(
+        "https://github.com/letscubo/codeg/releases/download/v{}",
+        trim_v_prefix(version)
+    )
+}
+
 /// Short-timeout client for the small manifest fetch. Proxy env vars are
 /// sampled at build time, so `init_proxy_from_db` must run before the first
 /// request — both startup paths already do that.
@@ -130,6 +140,13 @@ mod tests {
     #[test]
     fn v_prefix_is_ignored() {
         assert!(!is_newer("v0.14.11", "0.14.11"));
+    }
+
+    #[test]
+    fn pinned_download_base_points_at_the_tag() {
+        let want = "https://github.com/letscubo/codeg/releases/download/v0.30.10-43";
+        assert_eq!(release_download_base_for("0.30.10-43"), want);
+        assert_eq!(release_download_base_for("v0.30.10-43"), want);
     }
 
     #[test]

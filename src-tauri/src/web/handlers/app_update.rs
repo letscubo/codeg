@@ -123,6 +123,17 @@ fn ensure_supported() -> Result<(), AppCommandError> {
 
 #[cfg(not(feature = "tauri-runtime"))]
 async fn perform_impl(state: Arc<AppState>) -> Result<AppUpdateState, AppCommandError> {
+    start_perform(state, crate::update::install::ReleaseSource::Latest).await
+}
+
+/// 发起下载 / 校验 / 替换并立即返回当前快照(与 `perform_app_update` 同一条路径、同一套
+/// 并发保护)。fork(letscubo):平台自动升级用 `ReleaseSource::Pinned` 调它
+/// (见 `update::platform`)。
+#[cfg(not(feature = "tauri-runtime"))]
+pub(crate) async fn start_perform(
+    state: Arc<AppState>,
+    source: crate::update::install::ReleaseSource,
+) -> Result<AppUpdateState, AppCommandError> {
     use crate::update::install::UpdatePhase;
     use crate::update::state as update_state;
 
@@ -173,7 +184,8 @@ async fn perform_impl(state: Arc<AppState>) -> Result<AppUpdateState, AppCommand
         // while still holding the lock would let a concurrent restart claim it,
         // fail to acquire the lock, and bounce a genuinely-staged update to
         // `Error`.
-        let outcome = crate::update::install::perform_update(&state.data_dir, &progress).await;
+        let outcome =
+            crate::update::install::perform_update_from(&state.data_dir, &progress, source).await;
         publish_after_releasing(guard, || match outcome {
             Ok(o) => {
                 update_state::set_ready(
@@ -207,7 +219,7 @@ fn publish_after_releasing<F: FnOnce()>(guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[cfg(not(feature = "tauri-runtime"))]
-fn restart_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCommandError> {
+pub(crate) fn restart_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCommandError> {
     ensure_supported()?;
     // Atomically claim the relaunch (flips the shared snapshot to `Restarting`)
     // — rejects a stale status-bar / second-window click unless an update is
