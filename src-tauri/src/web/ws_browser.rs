@@ -14,8 +14,9 @@
 //! 标签页的网站图标:定时读 `/json/list` 的 faviconUrl,在容器里下载成 data: 地址推给页面
 //! (`{"type":"icon","targetId","data"}`;这页没有图标时 `data` 为 null,页面据此清掉旧图标)。
 //!
-//! 浏览器不在(从没用过 / 被关掉)时页面在地址栏输网址:用浏览器应用的启动脚本
-//! `browser-mcp.sh --launch` 把这个 agent 的浏览器起起来,再在新标签页里打开;
+//! 浏览器不在(从没用过 / 被关掉)时页面在地址栏输网址:用 codeg 自带的启动脚本
+//! (`browser_launch.sh`,与应用脚本同一套约定)把这个 agent 的浏览器起起来,再在新标签页里打开 ——
+//! 和装没装浏览器应用无关;
 //! 浏览器在但一个标签页都没有时同样开新标签页。
 //! ```
 //!
@@ -243,17 +244,16 @@ pub(crate) fn navigate_url(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 用浏览器应用的启动脚本把这个 agent 的浏览器起起来(同一份资料、同一个端口、记住的
-/// 窗口大小)。脚本随应用下发;没装应用就没有它。
+/// codeg 自带的启动脚本(见 `browser_launch.sh`):和浏览器应用的启动脚本同一套目录、端口、锁,
+/// 所以不装应用也能打开,装了应用 agent 在对话里用的也是同一个浏览器。
+const LAUNCH_SCRIPT: &str = include_str!("browser_launch.sh");
+
+/// 把这个 agent 的浏览器起起来(同一份资料、同一个端口、记住的窗口大小)。
 async fn launch_browser(agent: &str) -> Result<(), String> {
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    let script = PathBuf::from(&home).join(".myclaw/skills/app-myclaw-browser/bin/browser-mcp.sh");
-    if !script.is_file() {
-        return Err("browser app is not installed on this instance".into());
-    }
     let run = tokio::process::Command::new("bash")
-        .arg(&script)
-        .arg("--launch")
+        .arg("-c")
+        .arg(LAUNCH_SCRIPT)
+        .arg("myclaw-browser-launch")
         .env("MYCLAW_AGENT_ID", agent)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -390,7 +390,12 @@ async fn run(mut socket: WebSocket, agent: String) {
         if let Some(url) = url {
             let _ = send_json(&mut socket, json!({"type": "status", "state": "launching"})).await;
             match launch_browser(&agent).await {
-                Ok(()) => pending_url = Some(url),
+                // 起来了下一圈就连上(连不上的话重新告诉页面「没有浏览器」)
+                Ok(()) => {
+                    pending_url = Some(url);
+                    announced = false;
+                }
+                // 没起来:报错留在页面上,不再发「没有浏览器」把它冲掉;页面可以再输网址重试
                 Err(message) => {
                     let _ = send_json(
                         &mut socket,
@@ -399,8 +404,6 @@ async fn run(mut socket: WebSocket, agent: String) {
                     .await;
                 }
             }
-            // 起来了下一圈就连上;没起来让页面重新看到「没有浏览器」
-            announced = false;
         }
     };
 
