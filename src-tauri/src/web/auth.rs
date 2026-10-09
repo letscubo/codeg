@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 pub const WS_EVENT_PROTOCOL: &str = "codeg-events";
 const WS_TOKEN_PROTOCOL_PREFIX: &str = "codeg-token.";
 
-fn token_from_ws_protocols(value: &str) -> Option<String> {
+pub(crate) fn token_from_ws_protocols(value: &str) -> Option<String> {
     value
         .split(',')
         .map(str::trim)

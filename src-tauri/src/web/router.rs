@@ -35,6 +35,10 @@ pub fn build_router(
     // `/myclaw/mcp/*`:rpc 在公共组里自己认 agent 派生凭证,entry 用它签派生凭证。
     let token_for_mcp = token.clone();
     let token_for_mcp_entry = token.clone();
+    // 「我的电脑」(ws_device.rs):平台取条目/设备凭证用主 token;agent 调用与连接器连接各认各的派生凭证
+    let token_for_device = token.clone();
+    let token_for_device_mcp = token.clone();
+    let token_for_device_ws = token.clone();
 
     let api = Router::new()
         .route("/health", post(health_check))
@@ -1765,6 +1769,19 @@ pub fn build_router(
                 handlers::myclaw::download::ServerToken(token_for_mcp_entry),
             )),
         )
+        // MyClaw fork ext:「我的电脑」—— 平台配对取设备凭证、投影取 agent 的工具条目(见 ws_device.rs)
+        .route(
+            "/myclaw/device-token",
+            get(super::ws_device::device_token_handler).layer(Extension(
+                handlers::myclaw::download::ServerToken(token_for_device.clone()),
+            )),
+        )
+        .route(
+            "/myclaw/device-entry/{agent}",
+            get(super::ws_device::device_entry).layer(Extension(
+                handlers::myclaw::download::ServerToken(token_for_device),
+            )),
+        )
         // Catch-all
         .fallback(api_not_found);
 
@@ -1807,6 +1824,14 @@ pub fn build_router(
             "/myclaw/mcp/{agent}",
             post(handlers::myclaw::mcp::rpc).layer(Extension(
                 handlers::myclaw::download::ServerToken(token_for_mcp),
+            )),
+        )
+        // MyClaw fork ext:「我的电脑」的工具端点。条目里只有 agent 派生凭证,handler 自己认,
+        // 绝不能让 require_token 认它(否则那把凭证就能调 /myclaw/exec)。
+        .route(
+            "/myclaw/device-mcp/{agent}",
+            post(super::ws_device::device_mcp).layer(Extension(
+                handlers::myclaw::download::ServerToken(token_for_device_mcp),
             )),
         )
         .route(
@@ -1865,6 +1890,14 @@ pub fn build_router(
         }))
         .layer(Extension(super::ws_invoke::ApiDispatch(invoke_router)));
 
+    // MyClaw fork ext: 用户电脑上的连接器连这里(见 ws_device.rs)。不进上面那组 —— 它只带
+    // 设备凭证,require_token 不认、也不能认;handler 自己核对。
+    let device_ws_route = Router::new()
+        .route("/ws/device", get(super::ws_device::ws_device_handler))
+        .layer(Extension(handlers::myclaw::download::ServerToken(
+            token_for_device_ws,
+        )));
+
     // Static file serving.
     // Next.js static export produces "folder.html" for "/folder" route.
     // We use a middleware to rewrite "/folder" → "/folder.html" before ServeDir.
@@ -1906,6 +1939,7 @@ pub fn build_router(
     Router::new()
         .nest("/api", api)
         .merge(ws_route)
+        .merge(device_ws_route)
         .fallback_service(fallback)
         .layer(html_rewrite)
         .layer(cors)
