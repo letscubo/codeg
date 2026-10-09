@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Path, Query};
+use axum::http::header::HeaderName;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -191,6 +192,21 @@ pub(crate) fn offline_reply(id: Value, method: &str, cached_tools: Option<Value>
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+/// MCP streamable-http 响应:带上 `Mcp-Session-Id` 头。
+///
+/// 真实的 MCP 客户端(Claude Agent SDK / openclaw)在 `initialize` 后要拿到一个会话 id 才认为
+/// 连接建立好了;**拿不到就一直等到超时**(实测 claude_code 报 `CONNECT_TIMEOUT: dialing …`,
+/// 而宽松的 curl 不要求它、所以一直"能用"假象)。我们这端是无状态转发,不校验回传的 session,
+/// 给一个按 agent 固定的值即可(与 /api/apps/gateway 的做法一致:initialize 必带 Mcp-Session-Id)。
+fn reply(agent: &str, body: Value) -> Response {
+    let mut resp = Json(body).into_response();
+    if let Ok(value) = format!("mycomp-{agent}").parse() {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("mcp-session-id"), value);
+    }
+    resp
+}
+
 pub async fn device_mcp(
     Path(agent): Path<String>,
     Extension(ServerToken(secret)): Extension<ServerToken>,
@@ -213,10 +229,38 @@ pub async fn device_mcp(
         return StatusCode::ACCEPTED.into_response();
     };
 
+    // 握手(initialize / ping)由本端直接答,**不转发给本机 cua-driver**:
+    //   · 必带 Mcp-Session-Id(见 reply),否则 Claude Agent SDK 握手超时;
+    //   · 结果形状可控(protocolVersion / serverInfo 齐全),不依赖 cua-driver 的 initialize 格式;
+    //   · 本机在不在线都能握手成功 —— 具体工具能不能用,交给 tools/list / tools/call 如实体现。
+    match req.method.as_str() {
+        "initialize" => {
+            let proto = raw
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str)
+                .unwrap_or(PROTOCOL_VERSION);
+            return reply(
+                &agent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": proto,
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "my-computer", "version": env!("CARGO_PKG_VERSION") },
+                    }
+                }),
+            );
+        }
+        "ping" => return reply(&agent, json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+        _ => {}
+    }
+
     let tx = DEVICE.lock().ok().and_then(|d| d.as_ref().map(|d| d.tx.clone()));
     let Some(tx) = tx else {
         let cached = TOOLS.lock().ok().and_then(|t| t.clone());
-        return Json(offline_reply(id, &req.method, cached)).into_response();
+        return reply(&agent, offline_reply(id, &req.method, cached));
     };
 
     let call = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -230,20 +274,22 @@ pub async fn device_mcp(
             p.remove(&call);
         }
         let cached = TOOLS.lock().ok().and_then(|t| t.clone());
-        return Json(offline_reply(id, &req.method, cached)).into_response();
+        return reply(&agent, offline_reply(id, &req.method, cached));
     }
     match tokio::time::timeout(CALL_TIMEOUT, done_rx).await {
-        Ok(Ok(res)) => Json(res).into_response(),
+        Ok(Ok(res)) => reply(&agent, res),
         _ => {
             if let Ok(mut p) = PENDING.lock() {
                 p.remove(&call);
             }
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32000, "message": "The user's computer did not answer in time (it may be waiting for the user to approve, or it disconnected)." },
-            }))
-            .into_response()
+            reply(
+                &agent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32000, "message": "The user's computer did not answer in time (it may be waiting for the user to approve, or it disconnected)." },
+                }),
+            )
         }
     }
 }
@@ -364,6 +410,16 @@ mod tests {
         assert!(!verify("", DEVICE_TOKEN_PREFIX, DEVICE_TOKEN_DOMAIN, "default", &dev));
         assert!(!verify(SECRET, DEVICE_TOKEN_PREFIX, DEVICE_TOKEN_DOMAIN, "default", SECRET));
         assert!(device_token("", "default").is_none());
+    }
+
+    #[test]
+    fn reply_carries_mcp_session_id() {
+        // 真实 MCP 客户端(Claude Agent SDK)要在 initialize 响应里拿到 Mcp-Session-Id 才认为连上了。
+        let resp = reply("va-abc", json!({ "ok": true }));
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap().to_str().unwrap(),
+            "mycomp-va-abc"
+        );
     }
 
     #[test]
