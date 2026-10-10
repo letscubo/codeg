@@ -17,7 +17,7 @@ use axum::{extract::Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::cli::{
-    binary, codex_binary, dsh_binary, CliConnectError, CliConnectRequest, CliConnection,
+    binary, codex_binary, dsh_binary, pi_binary, CliConnectError, CliConnectRequest, CliConnection,
 };
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
@@ -250,6 +250,7 @@ async fn connect(
     let executable = match agent_type {
         AgentType::DeepSeek => dsh_binary::resolve_dsh_executable(&runtime_env).await,
         AgentType::Codex => codex_binary::resolve_codex_executable(&runtime_env).await,
+        AgentType::Pi => pi_binary::resolve_pi_executable(&runtime_env).await,
         _ => binary::resolve_claude_executable(&runtime_env).await,
     }
     .map_err(|e| AppCommandError::dependency_missing(format!("cli_not_installed: {e}")))?;
@@ -282,8 +283,14 @@ async fn connect(
 
 /// Agents the CLI transport can drive. Adding one needs a driver in
 /// `acp::cli` and a binary resolver.
-const CLI_TRANSPORT_AGENTS: &[AgentType] =
-    &[AgentType::ClaudeCode, AgentType::DeepSeek, AgentType::Codex];
+const CLI_TRANSPORT_AGENTS: &[AgentType] = &[
+    AgentType::ClaudeCode,
+    AgentType::DeepSeek,
+    AgentType::Codex,
+    // pi 没有官方 ACP;之前那座第三方桥会把 provider 失败吞成一句普通回复,
+    // 所以 pi 直接走 CLI(见 acp::cli::pi_driver 的模块说明)。
+    AgentType::Pi,
+];
 
 /// Claude session ids and Codex thread ids are uuids; the official DeepSeek Harness launcher
 /// mints `session-<uuid>` and only continues an id in that exact spelling.
@@ -372,5 +379,17 @@ mod tests {
         assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::ClaudeCode));
         assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::DeepSeek));
         assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::Codex));
+        assert!(CLI_TRANSPORT_AGENTS.contains(&AgentType::Pi));
+    }
+
+    #[test]
+    fn a_pi_session_id_is_a_uuid() {
+        // pi 铸的是 uuidv7(`01a1271a-…`),走默认那条 uuid 校验。
+        assert!(validate_cli_session_id(
+            AgentType::Pi,
+            "01a1271a-81fb-7fbd-9bb4-5299598a4dbc"
+        )
+        .is_ok());
+        assert!(validate_cli_session_id(AgentType::Pi, "session-x").is_err());
     }
 }

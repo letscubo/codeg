@@ -21,6 +21,9 @@ pub mod dsh_profile;
 pub mod dsh_prompt;
 pub mod dsh_stream;
 pub mod dsh_tool_info;
+pub mod pi_binary;
+pub mod pi_driver;
+pub mod pi_stream;
 pub mod stream_json;
 pub mod tool_info;
 
@@ -294,6 +297,25 @@ impl ConnectionManager {
                     profile,
                     provider: provider.filter(|p| !p.trim().is_empty()),
                     delegation,
+                    continues_from,
+                };
+                tokio::spawn(driver.run(cmd_rx));
+            }
+            None if request.agent_type == AgentType::Pi => {
+                let driver = pi_driver::PiDriver {
+                    connection_id: connection_id.clone(),
+                    agent_type: request.agent_type,
+                    executable: request.executable,
+                    working_dir: request.working_dir,
+                    runtime_env: request.runtime_env,
+                    state: Arc::clone(&state),
+                    emitter: emitter.clone(),
+                    child_pid,
+                    connections: Arc::clone(&self.connections),
+                    provider: provider.filter(|p| !p.trim().is_empty()),
+                    // 会话目录由 `PI_CODING_AGENT_DIR` 按 agent 隔离(runtime_env 里
+                    // 已经带了),这里不再另指一个,免得两处定义打架。
+                    session_dir: None,
                     continues_from,
                 };
                 tokio::spawn(driver.run(cmd_rx));
