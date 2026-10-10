@@ -53,6 +53,12 @@ const AGENT_TOKEN_PREFIX: &str = "cdmcp_";
 const AGENT_TOKEN_DOMAIN: &str = "codeg-device-mcp/v1:";
 /// 一次调用最多等多久 —— 用户要在电脑上看弹窗、点允许,给足时间
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// 设备没连时,判「离线」前先等它(重)连上多久。
+///
+/// 覆盖「实例被闲忙逻辑暂停 → 一醒过来 codeg 重启、连接器还在重连」那几秒:此时 agent 会话
+/// 刚起、立刻 tools/list,设备却还没连回来。等一下再判离线,连接器重连(封顶 5s)后这次调用
+/// 就能拿到真工具,而不是让整个会话以为「没有这个工具」。连接器根本没在跑时,顶多多等这点时间。
+const RECONNECT_GRACE: Duration = Duration::from_secs(8);
 const KEEPALIVE: Duration = Duration::from_secs(25);
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const OFFLINE_MESSAGE: &str = "The user's computer is not connected right now. Ask the user to start the MyClaw connector on their computer, then try again. Do not retry in a loop.";
@@ -207,6 +213,21 @@ fn reply(agent: &str, body: Value) -> Response {
     resp
 }
 
+/// 取设备的发送口;没连就最多等 `grace`(每 250ms 看一次)等它(重)连上。
+/// 返回 None = 等满了还没连上。std Mutex 只在每次查看时短暂持有,不跨 await。
+async fn wait_for_device(grace: Duration) -> Option<mpsc::UnboundedSender<Message>> {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if let Some(tx) = DEVICE.lock().ok().and_then(|d| d.as_ref().map(|d| d.tx.clone())) {
+            return Some(tx);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 pub async fn device_mcp(
     Path(agent): Path<String>,
     Extension(ServerToken(secret)): Extension<ServerToken>,
@@ -257,7 +278,9 @@ pub async fn device_mcp(
         _ => {}
     }
 
-    let tx = DEVICE.lock().ok().and_then(|d| d.as_ref().map(|d| d.tx.clone()));
+    // 到这里的都是真要本机的调用(tools/list、tools/call …;握手已在上面本地答掉)。
+    // 设备没连时先等它(重)连上一会儿再判离线,平掉「实例刚唤醒、连接器还在重连」的竞态。
+    let tx = wait_for_device(RECONNECT_GRACE).await;
     let Some(tx) = tx else {
         let cached = TOOLS.lock().ok().and_then(|t| t.clone());
         return reply(&agent, offline_reply(id, &req.method, cached));
