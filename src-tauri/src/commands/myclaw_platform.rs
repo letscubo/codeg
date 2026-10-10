@@ -202,6 +202,24 @@ async fn endpoint(db: &AppDatabase) -> Result<PlatformEndpoint, String> {
 }
 
 /// 缓存的是清单接口的整个 data(`{ tools, instructions }`):工具与总览同一次请求、同一个 TTL。
+/// 带签名 POST 一条平台接口(JSON 体),返回 `data`。给伴生工具以外的 fork 功能用(如统一记忆快照)。
+pub async fn post_signed(
+    db: &AppDatabase,
+    path: &str,
+    body: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let ep = endpoint(db).await?;
+    signed_request(
+        &ep,
+        reqwest::Method::POST,
+        path,
+        Some(body.to_string()),
+        timeout,
+    )
+    .await
+}
+
 type CatalogCache = Mutex<Option<(Instant, Result<Value, String>)>>;
 
 fn catalog_cache() -> &'static CatalogCache {

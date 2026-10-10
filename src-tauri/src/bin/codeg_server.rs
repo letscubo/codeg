@@ -272,6 +272,11 @@ async fn async_main() -> ExitCode {
     ));
     let emitter = EventEmitter::web_only(broadcaster.clone(), acp_event_bus.clone());
 
+    // fork(letscubo): 统一记忆注入要读平台 webhook 配置(见 acp::myclaw_memory)
+    codeg_lib::acp::myclaw_memory::install_db(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    });
+
     // Build AppState
     let pet_state_handle = codeg_lib::pet_state_mapper::new_pet_state_handle();
     let connection_manager = codeg_lib::app_state::default_connection_manager();

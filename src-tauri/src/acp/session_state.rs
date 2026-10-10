@@ -260,6 +260,11 @@ pub enum ConnectionTransport {
 pub struct SessionState {
     // 身份
     pub connection_id: String,
+    /// fork(letscubo): 这条连接属于哪个 vm agent(从平台下发的 runtime env 认出,见
+    /// `acp::myclaw_memory`)。None = 不是平台托管的连接 / 认不出。
+    pub myclaw_agent_key: Option<String>,
+    /// fork(letscubo): 已注入过的统一记忆版本;平台版本变了才重新注入。
+    pub myclaw_memory_version: Option<String>,
     pub conversation_id: Option<i32>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
@@ -694,6 +699,8 @@ impl SessionState {
     ) -> Self {
         Self {
             connection_id,
+            myclaw_agent_key: None,
+            myclaw_memory_version: None,
             conversation_id: None,
             external_id: None,
             external_id_changed_at: None,

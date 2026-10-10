@@ -1759,6 +1759,11 @@ pub fn build_router(
         // 不采 CPU、不读磁盘,与 metrics 分开正是为了别为一个计数做那些系统调用。
         .route("/myclaw/activity", get(handlers::myclaw::activity::activity))
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
+        // 统一记忆:平台改了记忆 → 缓存作废,下一轮重新注入(见 acp/myclaw_memory.rs)
+        .route(
+            "/myclaw/memory/invalidate",
+            post(handlers::myclaw::memory::invalidate),
+        )
         .route("/myclaw/task/{taskId}", get(handlers::myclaw::task::get))
         // 伴生工具的 HTTP 传输 —— 给拿不到 stdio 伴生的 runtime(openclaw / pi)用。
         // 平台取条目走这里(主 token);条目里签的是 agent 派生凭证,不是主 token。

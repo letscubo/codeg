@@ -11,6 +11,7 @@ pub mod download;
 pub mod exec;
 pub mod file_ticket;
 pub mod mcp;
+pub mod memory;
 pub mod metrics;
 pub mod runner;
 pub mod task;

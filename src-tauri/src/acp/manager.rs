@@ -679,6 +679,47 @@ impl ConnectionManager {
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, AcpError> {
+        // fork(letscubo): 统一记忆 —— 记下这条连接属于哪个 vm agent(见 acp::myclaw_memory)。
+        // 新建与复用的连接都打上:同一会话的 env 指向同一个 agent。
+        let agent_key = crate::acp::myclaw_memory::agent_key_from_env(&runtime_env);
+        let id = self
+            .spawn_agent_untagged(
+                agent_type,
+                working_dir,
+                session_id,
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+            )
+            .await?;
+        if agent_key.is_some() {
+            let state = self
+                .connections
+                .lock()
+                .await
+                .get(&id)
+                .map(|c| c.state.clone());
+            if let Some(state) = state {
+                state.write().await.myclaw_agent_key = agent_key;
+            }
+        }
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent_untagged(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: Option<String>,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<String, AcpError> {
         // fork(letscubo): DeepSeek, Claude Code and Codex have no ACP process —
         // they run only on the CLI transport (official `dsh --profile headless`,
         // `claude -p`, `codex app-server`). Mode / config preferences are ACP-only and have
@@ -995,6 +1036,64 @@ impl ConnectionManager {
     /// this. Re-entering through `send_prompt` from `send_prompt_linked`
     /// while holding the lock would deadlock, hence the split.
     async fn send_prompt_inner(
+        &self,
+        conn_id: &str,
+        mut blocks: Vec<PromptInputBlock>,
+        user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+    ) -> Result<(), AcpError> {
+        // fork(letscubo): 统一记忆 —— 所有入口(网页 / 渠道 / 定时任务 / 派活)都走这里。
+        // 只往发给运行时的 blocks 最前面插,回显给界面的 user_message 不动;送出去了才记版本,
+        // 被拒(比如上一轮还没完)下一次照样注入。空 prompt 不注入 —— 留给下面原样拒掉。
+        let injected = if blocks.is_empty() {
+            None
+        } else {
+            self.plan_myclaw_memory(conn_id, &mut blocks).await
+        };
+        let result = self
+            .send_prompt_inner_raw(conn_id, blocks, user_message)
+            .await;
+        if result.is_ok() {
+            if let Some((state, version)) = injected {
+                state.write().await.myclaw_memory_version = Some(version);
+            }
+        }
+        result
+    }
+
+    /// 取这条连接的记忆快照,需要时插到 blocks 最前面;返回送达后该记下的版本。
+    async fn plan_myclaw_memory(
+        &self,
+        conn_id: &str,
+        blocks: &mut Vec<PromptInputBlock>,
+    ) -> Option<(
+        Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        String,
+    )> {
+        let state = self
+            .connections
+            .lock()
+            .await
+            .get(conn_id)
+            .map(|c| c.state.clone())?;
+        let (conversation_id, agent_key, injected) = {
+            let st = state.read().await;
+            (
+                st.conversation_id,
+                st.myclaw_agent_key.clone(),
+                st.myclaw_memory_version.clone(),
+            )
+        };
+        let snapshot =
+            crate::acp::myclaw_memory::snapshot_for(conversation_id, agent_key.as_deref()).await?;
+        let (block, version) =
+            crate::acp::myclaw_memory::plan_injection(injected.as_deref(), &snapshot);
+        if let Some(block) = block {
+            blocks.insert(0, block);
+        }
+        Some((state, version))
+    }
+
+    async fn send_prompt_inner_raw(
         &self,
         conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
