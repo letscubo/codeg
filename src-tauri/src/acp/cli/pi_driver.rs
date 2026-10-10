@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -91,14 +91,18 @@ struct TurnRecord {
     prompt_recorded: bool,
 }
 
-/// `pi [options] [--] [messages...]`. The `--` matters: a prompt that starts
-/// with `-` would otherwise be parsed as a flag.
+/// `pi --print --mode json [options]`. The prompt is **not** an argument: it is
+/// written to stdin, like the claude driver does.
+///
+/// Not a positional argument because `pi [options] [messages...]` has no way to
+/// stop option parsing on the version we run — the `--` separator only exists
+/// from pi 1.x (`Error: Unknown option: --` on 0.84.2), so a prompt starting
+/// with `-` would be read as a flag. stdin also has no argv length limit.
 pub(super) fn build_args(
     session_id: Option<&str>,
     provider: Option<&str>,
     model: Option<&str>,
     session_dir: Option<&Path>,
-    prompt: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "--print".to_string(),
@@ -123,8 +127,6 @@ pub(super) fn build_args(
         args.push("--session-id".to_string());
         args.push(session_id.to_string());
     }
-    args.push("--".to_string());
-    args.push(prompt.to_string());
     args
 }
 
@@ -200,9 +202,8 @@ impl PiDriver {
                     self.provider.as_deref(),
                     model.as_deref(),
                     self.session_dir.as_deref(),
-                    &prompt,
                 );
-                match self.spawn(&args).await {
+                match self.spawn(&args, &prompt).await {
                     Ok(child) => self.drive(child, &mut record, model.clone(), commands).await,
                     Err(err) => (
                         TurnFinish {
@@ -230,20 +231,29 @@ impl PiDriver {
         disconnect
     }
 
-    async fn spawn(&self, args: &[String]) -> std::io::Result<Child> {
+    /// Spawn pi and hand it the prompt on stdin, then EOF — `--print` runs the
+    /// turn and exits. Writing before the stdout pump starts is safe: the
+    /// prompt is far below the pipe buffer, and pi does not emit anything until
+    /// it has read it.
+    async fn spawn(&self, args: &[String], prompt: &str) -> std::io::Result<Child> {
         let mut command = crate::process::tokio_command(&self.executable);
         command
             .args(args)
             .current_dir(&self.working_dir)
             .envs(&self.runtime_env)
-            // `--print` takes the prompt from argv; nothing is fed on stdin.
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        crate::process::spawn_retrying_exec_busy(|| command.spawn()).await
+        let mut child = crate::process::spawn_retrying_exec_busy(|| command.spawn()).await?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes()).await?;
+            stdin.flush().await?;
+            // Dropping closes it: pi reads until EOF.
+        }
+        Ok(child)
     }
 
     async fn drive(
@@ -501,8 +511,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_first_turn_has_no_session_and_the_prompt_is_last() {
-        let args = build_args(None, Some("myclaw"), Some("GLM-5.3-FlashX"), None, "hello");
+    fn the_first_turn_has_no_session() {
+        let args = build_args(None, Some("myclaw"), Some("GLM-5.3-FlashX"), None);
         assert_eq!(
             args,
             [
@@ -513,8 +523,6 @@ mod tests {
                 "myclaw",
                 "--model",
                 "GLM-5.3-FlashX",
-                "--",
-                "hello",
             ]
         );
     }
@@ -522,7 +530,7 @@ mod tests {
     #[test]
     fn a_continued_turn_passes_the_session_id_and_dir() {
         let dir = PathBuf::from("/home/ubuntu/.myclaw/agents/a/pi-home/sessions");
-        let args = build_args(Some("01a1271a"), None, None, Some(&dir), "go on");
+        let args = build_args(Some("01a1271a"), None, None, Some(&dir));
         assert_eq!(
             args,
             [
@@ -533,17 +541,21 @@ mod tests {
                 "/home/ubuntu/.myclaw/agents/a/pi-home/sessions",
                 "--session-id",
                 "01a1271a",
-                "--",
-                "go on",
             ]
         );
     }
 
     #[test]
-    fn a_prompt_that_looks_like_a_flag_stays_a_prompt() {
-        // Without the `--` separator pi would parse this as an option.
-        let args = build_args(None, None, None, None, "--help me debug this");
-        assert_eq!(args.last().unwrap(), "--help me debug this");
-        assert_eq!(args[args.len() - 2], "--");
+    fn the_prompt_is_never_an_argument() {
+        // 0.84.2 不认 `--`(`Error: Unknown option: --`),所以提示词一律走 stdin;
+        // 参数里出现任何一段提示词都是回归。
+        for args in [
+            build_args(None, None, None, None),
+            build_args(Some("s"), Some("p"), Some("m"), Some(Path::new("/d"))),
+        ] {
+            assert!(!args.iter().any(|a| a == "--"), "{args:?}");
+            assert_eq!(args[0], "--print");
+            assert!(args.iter().all(|a| a.starts_with('-') || !a.contains(' ')), "{args:?}");
+        }
     }
 }
