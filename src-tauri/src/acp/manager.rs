@@ -1089,6 +1089,10 @@ impl ConnectionManager {
             crate::acp::myclaw_memory::plan_injection(injected.as_deref(), &snapshot);
         if let Some(block) = block {
             blocks.insert(0, block);
+            tracing::info!(
+                "[MyclawMemory][{conn_id}] injected memory version={version} conversation={conversation_id:?} agent={}",
+                agent_key.as_deref().unwrap_or("-")
+            );
         }
         Some((state, version))
     }

@@ -116,6 +116,31 @@ impl ConnectionManager {
     /// No process is spawned here — that happens per prompt.
     pub async fn create_or_reuse_cli_connection(
         &self,
+        request: CliConnectRequest,
+        emitter: EventEmitter,
+    ) -> Result<CliConnection, CliConnectError> {
+        // fork(letscubo): 统一记忆 —— CLI 通道不经过 spawn_agent,在这里同样记下连接属于哪个
+        // vm agent(见 acp::myclaw_memory)。新建与复用的连接都打上。
+        let agent_key = crate::acp::myclaw_memory::agent_key_from_env(&request.runtime_env);
+        let conn = self
+            .create_or_reuse_cli_connection_untagged(request, emitter)
+            .await?;
+        if agent_key.is_some() {
+            let state = self
+                .connections
+                .lock()
+                .await
+                .get(&conn.connection_id)
+                .map(|c| c.state.clone());
+            if let Some(state) = state {
+                state.write().await.myclaw_agent_key = agent_key;
+            }
+        }
+        Ok(conn)
+    }
+
+    async fn create_or_reuse_cli_connection_untagged(
+        &self,
         mut request: CliConnectRequest,
         emitter: EventEmitter,
     ) -> Result<CliConnection, CliConnectError> {

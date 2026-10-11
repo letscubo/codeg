@@ -120,7 +120,9 @@ fn db_cell() -> &'static OnceLock<AppDatabase> {
 
 /// 服务端启动时交给这里一份库句柄(读平台 webhook 配置要用)。没装 = 不注入(桌面版即如此)。
 pub fn install_db(db: AppDatabase) {
-    let _ = db_cell().set(db);
+    if db_cell().set(db).is_ok() {
+        tracing::info!("[MyclawMemory] memory injection enabled");
+    }
 }
 
 /// 平台改了记忆:所有缓存作废,每条连接下一轮重新取、版本变了就重新注入。
@@ -145,7 +147,10 @@ pub async fn snapshot_for(
     if conversation_id.is_none() && agent_key.is_none() {
         return None;
     }
-    let db = db_cell().get()?;
+    let Some(db) = db_cell().get() else {
+        tracing::debug!("[MyclawMemory] no database handle installed; memory injection is off");
+        return None;
+    };
     let key = cache_key(conversation_id, agent_key);
     let generation = GENERATION.load(Ordering::SeqCst);
     {
