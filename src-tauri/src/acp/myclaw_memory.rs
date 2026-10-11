@@ -21,7 +21,7 @@
 //!
 //! ## 绝不卡对话
 //!
-//! 取快照超时 1.5 秒;失败(平台不可达、不是平台托管、老平台没有这条接口)就跳过本次注入,
+//! 取快照超时 4 秒(只发生在每个会话的第一轮 / 记忆改过之后;平台那边要连查几次库,实测约 1.3–1.6 秒);失败(平台不可达、不是平台托管、老平台没有这条接口)就跳过本次注入,
 //! 只记日志。失败结果缓存 30 秒,别每一轮都去撞。
 //!
 //! 只改发给运行时的 `blocks`,不动回显给界面的 user message —— 实时界面看不到注入块;
@@ -39,7 +39,7 @@ use crate::acp::types::PromptInputBlock;
 use crate::db::AppDatabase;
 
 pub const SNAPSHOT_PATH: &str = "/api/codeg/memory/snapshot";
-const FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 /// 成功的快照最长留多久(兜底:平台的失效通知没送到时,最晚这么久后也会重新取)。
 const TTL_OK: Duration = Duration::from_secs(600);
 /// 取不到时多久内不再试。
@@ -184,7 +184,9 @@ pub async fn snapshot_for(
             Some(MemorySnapshot { version, text })
         }
         Err(e) => {
-            tracing::debug!("[MyclawMemory] snapshot unavailable: {e}");
+            tracing::info!(
+                "[MyclawMemory] snapshot unavailable, skipping injection this turn: {e}"
+            );
             None
         }
     };
