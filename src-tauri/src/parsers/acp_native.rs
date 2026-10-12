@@ -1442,6 +1442,41 @@ mod tests {
         }
     }
 
+    /// CLI 通道(claude -p)的截图:dsh_driver::transcript_update_for 记进自录线路的是只带
+    /// 落盘路径的 ACP 图片块,历史投影要原样给出同一个 file:// 路径(和实时侧落盘位置一致),
+    /// 且不带字节、不进文字字段。以前 CLI 通道整个丢图,刷新后截图就没了。
+    #[test]
+    fn a_cli_recorded_screenshot_projects_to_its_disk_path() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+        let img = ImageData { data: data.clone(), mime_type: "image/png".into(), uri: None };
+        let recorded = crate::acp::cli::dsh_driver::transcript_update_for(
+            &crate::acp::types::AcpEvent::ToolCallUpdate {
+                tool_name: None,
+                description: None,
+                tool_call_id: "call-1".into(),
+                title: None,
+                status: Some("completed".into()),
+                content: None,
+                raw_input: None,
+                raw_output: Some("\"window state\"".into()),
+                raw_output_append: None,
+                locations: None,
+                meta: None,
+                images: Some(vec![img.clone()]),
+            },
+        )
+        .expect("recorded");
+        let mut entries = pi_mcp_call(serde_json::json!(null));
+        entries[2] = update(3, serde_json::to_value(&recorded).unwrap());
+        let turns = project_turns(&entries);
+        let (output_preview, images) = tool_result_of(&turns[1]);
+        assert_eq!(output_preview.as_deref(), Some("window state"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "", "历史只报路径");
+        let expected = format!("file://{}", crate::acp::connection::tool_image_path(&img).unwrap().display());
+        assert_eq!(images[0].uri.as_deref(), Some(expected.as_str()));
+    }
+
     /// An image-only MCP result must leave the TEXT field empty.
     ///
     /// pi-acp attaches the whole MCP result as `rawOutput` and, with no text to

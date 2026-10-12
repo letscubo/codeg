@@ -524,6 +524,7 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
             tool_name,
             raw_input,
             raw_output,
+            images,
             ..
         } => {
             let mut v = json!({
@@ -553,6 +554,33 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             {
                 v["rawOutput"] = raw;
+            }
+            /*
+             * 工具结果里的图片(截图等)记成 ACP 的图片内容块,但**只记落盘路径、不带字节**:
+             * 实时那侧已经按 base64 摘要落了盘(driver 的 emit_recorded → persist_tool_images),
+             * 这里用同一个 tool_image_path 算出位置。历史投影(acp_native)对没有字节、只有
+             * file:// 的图原样给出路径,MyClaw 再经 /api/vms/<id>/file 取图 —— 自录线路不会
+             * 因为一张截图涨几十 KB。以前这里用 `..` 把 images 吞了,刷新后截图就没了。
+             */
+            if let Some(images) = images.as_ref().filter(|imgs| !imgs.is_empty()) {
+                let blocks: Vec<Value> = images
+                    .iter()
+                    .filter_map(|img| {
+                        let path = crate::acp::connection::tool_image_path(img)?;
+                        Some(json!({
+                            "type": "content",
+                            "content": {
+                                "type": "image",
+                                "data": "",
+                                "mimeType": img.mime_type,
+                                "uri": format!("file://{}", path.display()),
+                            },
+                        }))
+                    })
+                    .collect();
+                if !blocks.is_empty() {
+                    v["content"] = Value::Array(blocks);
+                }
             }
             set_tool_name_meta(&mut v, tool_name.as_deref());
             v
@@ -646,6 +674,42 @@ mod tests {
         assert_eq!(v["toolCallId"], "c9");
         assert_eq!(v["status"], "failed");
         assert_eq!(v["rawOutput"], "boom");
+    }
+
+    /// 工具结果的截图记进自录线路时只记落盘路径(file://),不带 base64 字节;
+    /// 仍是合法的 ACP 更新(transcript_update_for 能解析回 SessionUpdate)。
+    #[test]
+    fn tool_call_update_records_images_as_paths_only() {
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let update = transcript_update_for(&AcpEvent::ToolCallUpdate {
+            tool_name: None,
+            description: None,
+            tool_call_id: "c7".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: Some("\"ok\"".into()),
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: Some(vec![crate::acp::types::ToolCallImageInfo {
+                data: data.into(),
+                mime_type: "image/png".into(),
+                uri: None,
+            }]),
+        })
+        .expect("recorded");
+        let v = serde_json::to_value(&update).unwrap();
+        let img = &v["content"][0]["content"];
+        assert_eq!(v["content"][0]["type"], "content");
+        assert_eq!(img["type"], "image");
+        assert_eq!(img["data"], "");
+        assert_eq!(img["mimeType"], "image/png");
+        let uri = img["uri"].as_str().unwrap();
+        assert!(uri.starts_with("file://") && uri.ends_with(".png"), "{uri}");
+        assert!(!v.to_string().contains(data), "自录线路不能带 base64 字节");
+        assert_eq!(v["rawOutput"], "ok");
     }
 
     /// CLI 通道(claude_code / codex / dsh 共用本函数)里,工具刚出现时参数还没到:

@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use super::tool_info::tool_info;
-use crate::acp::types::AcpEvent;
+use crate::acp::types::{AcpEvent, ToolCallImageInfo};
 
 pub const STOP_END_TURN: &str = "end_turn";
 pub const STOP_CANCELLED: &str = "cancelled";
@@ -364,8 +364,44 @@ fn tool_result_update(id: &str, status: &str, content: &Value) -> AcpEvent {
         raw_output_append: None,
         locations: None,
         meta: None,
-        images: None,
+        // 截图等图片:以前这里写死 None、tool_result_text 又只取文字,图片在 CLI 通道整个丢了
+        // (agent 看得到、卡片上没有、历史里也没有)。落盘由 driver 的 emit_recorded 做。
+        images: Some(tool_result_images(content)).filter(|imgs| !imgs.is_empty()),
     }
+}
+
+/// tool_result 里的图片块。claude -p 把 MCP 的图片结果转成 Messages API 形状
+/// `{"type":"image","source":{"type":"base64","media_type","data"}}`;也认 MCP 原样的
+/// `{"type":"image","data","mimeType"}`。不是 base64 的(url 来源等)跳过 —— 卡片和落盘都只认字节。
+fn tool_result_images(content: &Value) -> Vec<ToolCallImageInfo> {
+    let Value::Array(parts) = content else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter(|p| p["type"].as_str() == Some("image"))
+        .filter_map(|p| {
+            let (data, mime) = match p.get("source") {
+                Some(src) => {
+                    if src["type"].as_str() != Some("base64") {
+                        return None;
+                    }
+                    (src["data"].as_str()?, src["media_type"].as_str())
+                }
+                None => (
+                    p["data"].as_str()?,
+                    p.get("mimeType")
+                        .or_else(|| p.get("mime_type"))
+                        .and_then(Value::as_str),
+                ),
+            };
+            (!data.is_empty()).then(|| ToolCallImageInfo {
+                data: data.to_string(),
+                mime_type: mime.unwrap_or("image/png").to_string(),
+                uri: None,
+            })
+        })
+        .collect()
 }
 
 fn text_event(text: &str, thinking: bool, parent_tool_use_id: Option<String>) -> AcpEvent {
@@ -495,6 +531,37 @@ mod tests {
     use serde_json::json;
 
     const SID: &str = "7a170f72-bff6-475a-bd3c-a3ead269f0b5";
+
+    /// claude -p 把 MCP 截图转成 Messages API 的图片块;以前 CLI 通道只取文字、images 写死 None,
+    /// 截图在卡片和历史里都丢了(agent 自己看得到)。
+    #[test]
+    fn tool_result_keeps_images_alongside_text() {
+        let content = json!([
+            {"type": "text", "text": "window state"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            {"type": "image", "data": "/9j/4AAQ", "mimeType": "image/jpeg"},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
+        ]);
+        let AcpEvent::ToolCallUpdate { raw_output, images, .. } = tool_result_update("t1", "completed", &content) else {
+            panic!("not a tool_call_update");
+        };
+        assert_eq!(raw_output.as_deref(), Some("\"window state\""));
+        let images = images.expect("images kept");
+        assert_eq!(images.len(), 2, "只认 base64 且非空的图");
+        assert_eq!((images[0].data.as_str(), images[0].mime_type.as_str()), ("iVBORw0KGgo=", "image/png"));
+        assert_eq!((images[1].data.as_str(), images[1].mime_type.as_str()), ("/9j/4AAQ", "image/jpeg"));
+    }
+
+    #[test]
+    fn tool_result_without_images_leaves_images_none() {
+        for content in [json!("plain text"), json!([{"type": "text", "text": "ok"}]), Value::Null] {
+            let AcpEvent::ToolCallUpdate { images, .. } = tool_result_update("t1", "completed", &content) else {
+                panic!("not a tool_call_update");
+            };
+            assert!(images.is_none(), "{content}");
+        }
+    }
 
     fn events(mapper: &mut StreamMapper, lines: &[Value]) -> Vec<Value> {
         let mut out = Vec::new();

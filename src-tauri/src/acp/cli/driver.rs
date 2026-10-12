@@ -500,6 +500,15 @@ impl CliDriver {
     /// transcript has no nesting for it, so recording it would re-read as the
     /// main agent talking — and MyClaw's live view drops it for that reason.
     async fn emit_recorded(&self, event: AcpEvent, session_id: &str) {
+        // 工具结果的图片先落盘:自录线路(transcript_update_for)只记路径,历史靠这份文件取图。
+        // 和 ACP 通道收到工具结果时的 persist_tool_images 是同一套(按 base64 摘要命名、已存在就跳过)。
+        if let AcpEvent::ToolCallUpdate {
+            images: Some(images),
+            ..
+        } = &event
+        {
+            crate::acp::connection::persist_tool_images(images);
+        }
         let sidechain_prose = matches!(
             &event,
             AcpEvent::ContentDelta {
