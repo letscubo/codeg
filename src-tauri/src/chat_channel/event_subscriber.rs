@@ -283,6 +283,14 @@ async fn process_envelope(
     let Some((event_type, msg)) = parse_acp_event(&envelope.payload, config.lang) else {
         return;
     };
+    // fork(letscubo)专属: turn_complete 对**任何**结局都发 webhook(带 stop_reason)——
+    // 平台靠它把这一轮落库,被取消 / 截断的轮次也要留下记录并标出结局。IM 渠道推送
+    // 仍只认正常结束(end_turn):取消那一刻往群里推一条「已完成」是噪音。
+    let stop_reason = match &envelope.payload {
+        AcpEvent::TurnComplete { stop_reason, .. } => Some(stop_reason.as_str()),
+        _ => None,
+    };
+    let push_to_channels = stop_reason.is_none_or(|r| r == "end_turn");
 
     // Fail closed unless the global filter reflects a clean read for the latest
     // config. An unread/unreadable filter (cold-start DB error or corrupt value)
@@ -433,6 +441,9 @@ async fn process_envelope(
         ) {
             payload["relay_turn_id"] = serde_json::json!(turn_id);
         }
+        if let Some(reason) = stop_reason {
+            payload["stop_reason"] = serde_json::json!(reason);
+        }
         super::webhook::spawn_webhook_delivery(
             webhook_client.clone(),
             config.webhooks.clone(),
@@ -453,6 +464,10 @@ async fn process_envelope(
     //   - question_request: like permission_request, a blocking interactive
     //     gate (the agent is parked on ask_user_question); a second gate within
     //     the 5s window would be dropped with no later event to re-trigger it.
+    if !push_to_channels {
+        return;
+    }
+
     let debounced = !matches!(
         event_type.as_str(),
         "permission_request" | "user_prompt_sent" | "question_request"
@@ -518,10 +533,8 @@ fn parse_acp_event(payload: &AcpEvent, lang: Lang) -> Option<(String, RichMessag
             agent_type,
             ..
         } => {
-            // Only push for end_turn, not for intermediate completions.
-            if stop_reason != "end_turn" {
-                return None;
-            }
+            // Every outcome maps to an event (webhooks carry all of them); the
+            // channel push is limited to end_turn by the caller.
             Some((
                 "turn_complete".to_string(),
                 message_formatter::format_turn_complete(agent_type, stop_reason, lang),
@@ -1874,5 +1887,119 @@ mod permission_push_tests {
             request.contains("\"event\":\"question_request\""),
             "got: {request}"
         );
+    }
+
+    fn cancelled_turn_envelope(connection_id: &str) -> EventEnvelope {
+        EventEnvelope {
+            seq: 1,
+            connection_id: connection_id.into(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "cancelled".into(),
+                agent_type: "claude_code".into(),
+                duration_ms: None,
+            },
+        }
+    }
+
+    /// A cancelled turn is not announced to IM channels — "turn complete" right
+    /// as the user hit stop is noise.
+    #[tokio::test]
+    async fn cancelled_turn_complete_is_not_pushed_to_channels() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (chat, rec) = manager_with_recorder(7).await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let config = config_all_on(7);
+        let mut last_push = HashMap::new();
+
+        process_envelope(
+            &cancelled_turn_envelope("c"),
+            &bridge,
+            &chat,
+            &db.conn,
+            &config,
+            &mut last_push,
+            &test_client(),
+            &ConnectionManager::new(),
+        )
+        .await;
+
+        assert!(sent(&rec).await.is_empty());
+    }
+
+    /// fork(letscubo): the platform persists a turn off its turn_complete webhook,
+    /// so a cancelled turn must still reach it — with the outcome attached.
+    #[tokio::test]
+    async fn cancelled_turn_complete_reaches_webhook_with_stop_reason() {
+        use tokio::net::TcpListener;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (chat, rec) = manager_with_recorder(7).await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let mut last_push = HashMap::new();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { accept_request(&listener).await });
+
+        let mut config = config_all_on(7);
+        config.webhooks = vec![format!("http://{addr}/hook")];
+
+        process_envelope(
+            &cancelled_turn_envelope("desktop-conn"),
+            &bridge,
+            &chat,
+            &db.conn,
+            &config,
+            &mut last_push,
+            &test_client(),
+            &ConnectionManager::new(),
+        )
+        .await;
+
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("webhook should be delivered within 5s")
+            .unwrap();
+        assert!(request.contains("\"event\":\"turn_complete\""), "got: {request}");
+        assert!(request.contains("\"stop_reason\":\"cancelled\""), "got: {request}");
+        assert!(sent(&rec).await.is_empty(), "IM channels stay quiet");
+    }
+
+    /// The normal outcome carries stop_reason too, so the platform can tell
+    /// end_turn from an old codeg that never sent the field.
+    #[tokio::test]
+    async fn end_turn_webhook_carries_stop_reason() {
+        use tokio::net::TcpListener;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (chat, _rec) = manager_with_recorder(7).await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let mut last_push = HashMap::new();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { accept_request(&listener).await });
+
+        let mut config = config_all_on(7);
+        config.webhooks = vec![format!("http://{addr}/hook")];
+
+        process_envelope(
+            &turn_complete_envelope("desktop-conn"),
+            &bridge,
+            &chat,
+            &db.conn,
+            &config,
+            &mut last_push,
+            &test_client(),
+            &ConnectionManager::new(),
+        )
+        .await;
+
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("webhook should be delivered within 5s")
+            .unwrap();
+        assert!(request.contains("\"stop_reason\":\"end_turn\""), "got: {request}");
     }
 }
