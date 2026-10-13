@@ -21,6 +21,10 @@
 //!
 //! 原型限制:每个实例一台设备(名字 `default`);电脑不在线时工具清单用最近一次连接器报的,
 //! 调用一律如实回「未连接」。
+//!
+//! 连接器握手(`hello`)时自报身份:系统、电脑名、登录用户名、连接器版本。记在这条连接上,
+//! 平台问在线状态时一起带回去(面板显示「连的是哪台」)。只用于展示,不参与任何鉴权 ——
+//! 这些值是用户电脑自己说的,照样清洗、限长。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +70,52 @@ const OFFLINE_MESSAGE: &str = "The user's computer is not connected right now. A
 struct Device {
     conn: u64,
     tx: mpsc::UnboundedSender<Message>,
+    /// 握手时自报的身份;握手前为空
+    info: DeviceInfo,
+}
+
+/// 连接器握手时自报的身份(只给面板显示)。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct DeviceInfo {
+    /// 连接器的 `std::env::consts::OS`:`macos` / `windows`
+    platform: Option<String>,
+    /// 电脑名(Mac 的「电脑名称」/ Windows 的 COMPUTERNAME)
+    hostname: Option<String>,
+    /// 连接器所在的登录用户名(同一台电脑多个账号时据此区分)
+    user: Option<String>,
+    /// 连接器版本
+    version: Option<String>,
+}
+
+const INFO_FIELD_MAX: usize = 64;
+
+/// 去掉控制字符、压空白、截长;空了就当没报。
+fn clean_field(v: Option<&Value>, max: usize) -> Option<String> {
+    let s: String = v?.as_str()?.chars().filter(|c| !c.is_control()).collect();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!s.is_empty()).then(|| s.chars().take(max).collect())
+}
+
+impl DeviceInfo {
+    pub(crate) fn from_hello(v: &Value) -> Self {
+        Self {
+            // 系统名只收小写字母,别的一律当没报
+            platform: clean_field(v.get("platform"), 16)
+                .filter(|p| p.chars().all(|c| c.is_ascii_lowercase())),
+            hostname: clean_field(v.get("hostname"), INFO_FIELD_MAX),
+            user: clean_field(v.get("user"), INFO_FIELD_MAX),
+            version: clean_field(v.get("version"), 32),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "platform": self.platform,
+            "hostname": self.hostname,
+            "user": self.user,
+            "version": self.version,
+        })
+    }
 }
 
 static DEVICE: LazyLock<Mutex<Option<Device>>> = LazyLock::new(|| Mutex::new(None));
@@ -138,10 +188,20 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 // ---- 平台调(require_token 组) ----
 
-/// 配对用:签出连接器的设备凭证。
+/// 配对用:签出连接器的设备凭证。顺带答在线状态,在线时带上连着的那台自报的身份(`computer`)。
 pub async fn device_token_handler(Extension(ServerToken(secret)): Extension<ServerToken>) -> Response {
+    let computer = DEVICE
+        .lock()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.info.to_json()));
     match device_token(&secret, DEFAULT_DEVICE) {
-        Some(token) => Json(json!({ "device": DEFAULT_DEVICE, "token": token, "online": DEVICE.lock().map(|d| d.is_some()).unwrap_or(false) })).into_response(),
+        Some(token) => Json(json!({
+            "device": DEFAULT_DEVICE,
+            "token": token,
+            "online": computer.is_some(),
+            "computer": computer,
+        }))
+        .into_response(),
         None => (StatusCode::INTERNAL_SERVER_ERROR, "server token unavailable").into_response(),
     }
 }
@@ -355,7 +415,7 @@ async fn run_device(socket: WebSocket) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     // 新连接顶掉旧的(同一台电脑重连):旧的发送口被丢掉,它的写任务随之结束
     if let Ok(mut d) = DEVICE.lock() {
-        *d = Some(Device { conn, tx: tx.clone() });
+        *d = Some(Device { conn, tx: tx.clone(), info: DeviceInfo::default() });
     }
     let writer = tokio::spawn(async move {
         let mut keepalive = tokio::time::interval(KEEPALIVE);
@@ -383,6 +443,12 @@ async fn run_device(socket: WebSocket) {
         let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
         match v.get("t").and_then(Value::as_str) {
             Some("hello") => {
+                // 只记到自己这条连接上(可能已被同名新连接顶掉)
+                if let Ok(mut d) = DEVICE.lock() {
+                    if let Some(d) = d.as_mut().filter(|d| d.conn == conn) {
+                        d.info = DeviceInfo::from_hello(&v);
+                    }
+                }
                 if let Some(tools) = v.get("tools").filter(|t| t.is_array()) {
                     if let Ok(mut t) = TOOLS.lock() {
                         *t = Some(json!({ "tools": tools }));
@@ -456,6 +522,30 @@ mod tests {
         assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("not connected"));
         let bad = offline_reply(json!(4), "nope", None);
         assert_eq!(bad["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn hello_identity_is_cleaned_and_bounded() {
+        let info = DeviceInfo::from_hello(&json!({
+            "t": "hello",
+            "platform": "windows",
+            "hostname": "  WIN-7H2\u{7}K  ",
+            "user": "Admin\nistrator",
+            "version": "0.3.1",
+        }));
+        assert_eq!(info.platform.as_deref(), Some("windows"));
+        assert_eq!(info.hostname.as_deref(), Some("WIN-7H2K"));
+        assert_eq!(info.user.as_deref(), Some("Administrator"));
+        assert_eq!(info.version.as_deref(), Some("0.3.1"));
+
+        // 老连接器只报 platform;怪值、超长、空白都不当真
+        let old = DeviceInfo::from_hello(&json!({ "platform": "macos" }));
+        assert_eq!(old, DeviceInfo { platform: Some("macos".into()), ..Default::default() });
+        let odd = DeviceInfo::from_hello(&json!({ "platform": "Mac OS", "hostname": "x".repeat(200), "user": "  " }));
+        assert_eq!(odd.platform, None);
+        assert_eq!(odd.hostname.map(|h| h.chars().count()), Some(INFO_FIELD_MAX));
+        assert_eq!(odd.user, None);
+        assert_eq!(DeviceInfo::from_hello(&json!({ "hostname": 42 })), DeviceInfo::default());
     }
 
     #[test]
