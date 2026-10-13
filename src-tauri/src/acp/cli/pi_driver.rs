@@ -412,6 +412,14 @@ impl PiDriver {
     /// `SessionStarted` on the first turn lands header + prompt on disk before
     /// it is emitted, so the lifecycle bind never precedes the recorded prompt.
     async fn emit_recorded(&self, event: AcpEvent, record: &mut TurnRecord) {
+        // 工具结果的图片先落盘:自录线路只记路径,历史靠这份文件取图(与 claude 线路 driver.rs 同一套)。
+        if let AcpEvent::ToolCallUpdate {
+            images: Some(images),
+            ..
+        } = &event
+        {
+            crate::acp::connection::persist_tool_images(images);
+        }
         if let AcpEvent::SessionStarted { session_id } = &event {
             record.session_id = Some(session_id.clone());
             if !record.prompt_recorded {

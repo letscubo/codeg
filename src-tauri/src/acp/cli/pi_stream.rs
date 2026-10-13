@@ -36,7 +36,8 @@ use serde_json::Value;
 // 两边都是 pi-ai 那套命名,所以标题/类别/定位直接复用,不另起一份会漂移的副本。
 use super::dsh_tool_info::dsh_tool_info;
 use super::stream_json::{
-    CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_END_TURN, STOP_UNKNOWN,
+    tool_result_images, CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_END_TURN,
+    STOP_UNKNOWN,
 };
 use crate::acp::types::AcpEvent;
 
@@ -304,7 +305,14 @@ fn on_tool_end(v: &Value) -> Vec<AcpEvent> {
     // Same convention as the claude / dsh mappers: `raw_output` carries the
     // serialized string, not the raw JSON.
     let raw = text.clone().map(|t| Value::String(t).to_string());
-    vec![tool_update(id, status, None, raw)]
+    let mut event = tool_update(id, status, None, raw);
+    // 截图等图片:只取文字的话,纯图片的结果(浏览器截图)整条变空 —— agent 看得到图,卡片和历史里
+    // 却是 null(2026-10-13 C10 实测,直连 pi 之后才出现;走 ACP 桥时图是带着的)。
+    // 与 claude 线路同一个解析(MCP 原样的 {type:image,data,mimeType});落盘由 pi_driver 的 emit_recorded 做。
+    if let AcpEvent::ToolCallUpdate { images, .. } = &mut event {
+        *images = Some(tool_result_images(&v["result"]["content"])).filter(|imgs| !imgs.is_empty());
+    }
+    vec![event]
 }
 
 fn tool_update(
@@ -662,6 +670,42 @@ mod tests {
                 [AcpEvent::ToolCallUpdate { raw_output, .. }] => {
                     assert_eq!(raw_output.as_deref(), Some("\"hi\\n\""));
                 }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_screenshot_result_carries_its_image() {
+        // 浏览器截图:结果只有一张图、没有文字。以前只取文字,整条结果是空的。
+        let mut m = mapper();
+        let end = json!({"type":"tool_execution_end","toolCallId":"c9","toolName":"mcp__app_myclaw_browser",
+            "result":{"content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]},
+            "isError":false,"durationMs":900});
+        match feed(&mut m, end) {
+            LineOutcome::Events(e) => match &e[..] {
+                [AcpEvent::ToolCallUpdate { images: Some(images), raw_output, status, .. }] => {
+                    assert_eq!(status.as_deref(), Some("completed"));
+                    assert_eq!(raw_output, &None);
+                    assert_eq!(images.len(), 1);
+                    assert_eq!(images[0].data, "iVBORw0KGgo=");
+                    assert_eq!(images[0].mime_type, "image/png");
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_text_only_result_has_no_images() {
+        let mut m = mapper();
+        let end = json!({"type":"tool_execution_end","toolCallId":"c1","toolName":"read",
+            "result":{"content":[{"type":"text","text":"hi"}]},"isError":false,"durationMs":1});
+        match feed(&mut m, end) {
+            LineOutcome::Events(e) => match &e[..] {
+                [AcpEvent::ToolCallUpdate { images, .. }] => assert!(images.is_none()),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),

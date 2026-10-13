@@ -373,7 +373,7 @@ fn tool_result_update(id: &str, status: &str, content: &Value) -> AcpEvent {
 /// tool_result 里的图片块。claude -p 把 MCP 的图片结果转成 Messages API 形状
 /// `{"type":"image","source":{"type":"base64","media_type","data"}}`;也认 MCP 原样的
 /// `{"type":"image","data","mimeType"}`。不是 base64 的(url 来源等)跳过 —— 卡片和落盘都只认字节。
-fn tool_result_images(content: &Value) -> Vec<ToolCallImageInfo> {
+pub(super) fn tool_result_images(content: &Value) -> Vec<ToolCallImageInfo> {
     let Value::Array(parts) = content else {
         return Vec::new();
     };
