@@ -367,6 +367,8 @@ impl ChatChannelManager {
         let bridge = Arc::new(Mutex::new(SessionBridge::new()));
         *self.inner.session_bridge.lock().await = Some(bridge.clone());
 
+        super::relay_outbox::start(db_conn.clone());
+
         // Spawn event subscriber
         let manager_for_events = self.clone_ref();
         super::event_subscriber::spawn_event_subscriber(

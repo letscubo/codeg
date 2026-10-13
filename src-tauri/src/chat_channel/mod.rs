@@ -14,5 +14,10 @@ pub mod tool_detail;
 pub mod tg_html;
 pub mod traits;
 pub mod turn_relay;
+mod slack_relay;
+mod relay_outbox;
+mod relay_result;
 pub mod types;
 pub mod webhook;
+
+mod relay_input;

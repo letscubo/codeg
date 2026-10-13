@@ -429,6 +429,7 @@ async fn process_envelope(
         // turn_complete 是一轮的终点,取走认领;error 可能不是终点,只读。
         if let Some(turn_id) = super::turn_relay::relay_turn_id_for(
             &envelope.connection_id,
+            envelope.seq,
             event_type == "turn_complete",
         ) {
             payload["relay_turn_id"] = serde_json::json!(turn_id);

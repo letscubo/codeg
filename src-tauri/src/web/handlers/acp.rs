@@ -186,7 +186,22 @@ pub struct AcpPromptParams {
 
 pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
-    Json(mut params): Json<AcpPromptParams>,
+    Json(params): Json<AcpPromptParams>,
+) -> Result<Json<()>, AppCommandError> {
+    if params.outbound.is_some() {
+        // A disconnected HTTP caller must not strand a committed running marker
+        // between relay registration and prompt submission.
+        tokio::spawn(acp_prompt_inner(state, params))
+            .await
+            .map_err(|_| AppCommandError::task_execution_failed("relay submission interrupted"))?
+    } else {
+        acp_prompt_inner(state, params).await
+    }
+}
+
+async fn acp_prompt_inner(
+    state: Arc<AppState>,
+    mut params: AcpPromptParams,
 ) -> Result<Json<()>, AppCommandError> {
     crate::web::handlers::cli::reject_cli_connection(
         &state.connection_manager,
@@ -194,23 +209,35 @@ pub async fn acp_prompt(
         "transport_mismatch",
     )
     .await?;
+    let prompt_guard = if params.outbound.is_some() {
+        Some(
+            state
+                .connection_manager
+                .clone_prompt_lock(&params.connection_id)
+                .await
+                .map_err(|_| AppCommandError::not_found("connection_not_found"))?
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
     // 须在提交之前登记,这一轮的事件才不会漏
     let relay_turn = match params.outbound.take() {
-        Some(spec) => {
-            crate::chat_channel::turn_relay::register_for_prompt(
-                &state,
-                &params.connection_id,
-                params.conversation_id,
-                spec,
-            )
-            .await
-        }
+        Some(spec) => crate::chat_channel::turn_relay::register_for_prompt(
+            &state,
+            &params.connection_id,
+            params.conversation_id,
+            spec,
+        )
+        .await
+        .map_err(crate::chat_channel::turn_relay::admission_error)?,
         None => None,
     };
     let connection_id = params.connection_id.clone();
     state
         .connection_manager
-        .send_prompt_linked_with_message_id(
+        .send_prompt_linked_under_lock(
             &state.db,
             &params.connection_id,
             params.blocks,
@@ -218,6 +245,7 @@ pub async fn acp_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            prompt_guard,
         )
         .await
         .map_err(|e| {

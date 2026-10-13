@@ -1169,7 +1169,7 @@ impl ConnectionManager {
     /// Clone the connection's `prompt_lock` under a short connections-map lock.
     /// Returned Arc allows the caller to hold the prompt lock without
     /// keeping the connections map locked.
-    async fn clone_prompt_lock(
+    pub(crate) async fn clone_prompt_lock(
         &self,
         conn_id: &str,
     ) -> Result<Arc<tokio::sync::Mutex<()>>, AcpError> {
@@ -1242,11 +1242,38 @@ impl ConnectionManager {
         &self,
         db: &AppDatabase,
         conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+        delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+        client_message_id: Option<String>,
+    ) -> Result<Option<i32>, AcpError> {
+        self.send_prompt_linked_under_lock(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            delegation,
+            client_message_id,
+            None,
+        )
+        .await
+    }
+
+    /// Relay HTTP handlers hold this connection's prompt lock from registration
+    /// through admission, so an ordinary UI prompt cannot claim their event range.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_prompt_linked_under_lock(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+        prompt_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1291,8 +1318,10 @@ impl ConnectionManager {
         // racing the UI) are now strictly serialized — the second waiter
         // observes `already_linked == true` after the first commits, so
         // it can't double-create a conversation row.
-        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
-        let _prompt_guard = prompt_lock.lock_owned().await;
+        let _prompt_guard = match prompt_guard {
+            Some(guard) => guard,
+            None => self.clone_prompt_lock(conn_id).await?.lock_owned().await,
+        };
 
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
@@ -1930,6 +1959,49 @@ impl ConnectionManager {
             .map_err(|_| AcpError::protocol("Async task stop reply channel closed".to_string()))?
     }
 
+    /// Enqueue only while both the session generation and relay claim match.
+    /// Reserving first means no await can separate validation from enqueue.
+    pub async fn cancel_relay_turn(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        turn_id: &str,
+        generation: u64,
+    ) -> Result<bool, AcpError> {
+        let (cmd_tx, state_arc, emitter) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (
+                conn.cmd_tx.clone(),
+                conn.state.clone(),
+                conn.emitter.clone(),
+            )
+        };
+        let permit = cmd_tx
+            .reserve()
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        // Keep a subsequent prompt from entering until the eager status write
+        // completes, including when the cancelled turn finishes immediately.
+        let _prompt_guard = self.clone_prompt_lock(conn_id).await?.lock_owned().await;
+        let state = state_arc.read().await;
+        if !state.turn_in_flight || state.turns_completed != generation {
+            return Ok(false);
+        }
+        let cancelled =
+            crate::chat_channel::turn_relay::enqueue_if_current(conn_id, turn_id, || {
+                permit.send(ConnectionCommand::Cancel);
+            });
+        drop(state);
+        if cancelled {
+            self.mark_conversation_cancelled(db, conn_id, &state_arc, &emitter)
+                .await;
+        }
+        Ok(cancelled)
+    }
+
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
         let (cmd_tx, state_arc, emitter) = {
             let connections = self.connections.lock().await;
@@ -1947,6 +2019,18 @@ impl ConnectionManager {
             .await
             .map_err(|_| AcpError::ProcessExited)?;
 
+        self.mark_conversation_cancelled(db, conn_id, &state_arc, &emitter)
+            .await;
+        Ok(())
+    }
+
+    async fn mark_conversation_cancelled(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        state_arc: &Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        emitter: &EventEmitter,
+    ) {
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
         // "running" state immediately. The agent typically replies with
         // `TurnComplete{cancelled}` which the lifecycle subscriber ignores,
@@ -1966,8 +2050,8 @@ impl ConnectionManager {
             {
                 Ok(true) => {
                     emit_with_state(
-                        &state_arc,
-                        &emitter,
+                        state_arc,
+                        emitter,
                         AcpEvent::ConversationStatusChanged {
                             conversation_id: cid,
                             status: ConversationStatus::Cancelled,
@@ -1984,8 +2068,6 @@ impl ConnectionManager {
                 }
             }
         }
-
-        Ok(())
     }
 
     pub async fn respond_permission(
@@ -4997,6 +5079,77 @@ mod tests {
     async fn mark_prompting(mgr: &ConnectionManager, conn_id: &str) {
         let state = mgr.get_state(conn_id).await.expect("connection");
         state.write().await.status = ConnectionStatus::Prompting;
+    }
+
+    #[tokio::test]
+    async fn relay_cancel_does_not_cancel_a_newer_turn_after_waiting_for_capacity() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx =
+            insert_live_connection(&mgr, "relay-cancel-generation", AgentType::Codex, None).await;
+        let state = mgr.get_state("relay-cancel-generation").await.unwrap();
+        state.write().await.turn_in_flight = true;
+        let tx = mgr
+            .connections
+            .lock()
+            .await
+            .get("relay-cancel-generation")
+            .unwrap()
+            .cmd_tx
+            .clone();
+        for _ in 0..4 {
+            tx.send(ConnectionCommand::Cancel).await.unwrap();
+        }
+        let cancel = mgr.cancel_relay_turn(&db.conn, "relay-cancel-generation", "old-turn", 0);
+        tokio::pin!(cancel);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut cancel)
+                .await
+                .is_err()
+        );
+        state.write().await.turns_completed = 1;
+        rx.recv().await.unwrap();
+        assert!(!cancel.await.unwrap());
+        for _ in 0..3 {
+            rx.recv().await.unwrap();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "stale cancellation was not enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_admission_guard_serializes_ordinary_prompts_until_submission() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder = crate::db::test_helpers::seed_folder(&db, "/tmp/relay-admission").await;
+        let mgr = ConnectionManager::new();
+        let id = "relay-admission-lock";
+        let mut rx = insert_live_connection(&mgr, id, AgentType::Codex, None).await;
+        let guard = mgr.clone_prompt_lock(id).await.unwrap().lock_owned().await;
+        let ordinary = mgr.send_prompt(id, one_text_block());
+        tokio::pin!(ordinary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut ordinary)
+                .await
+                .is_err()
+        );
+        mgr.send_prompt_linked_under_lock(
+            &db,
+            id,
+            one_text_block(),
+            Some(folder),
+            None,
+            None,
+            Some("channel-message".into()),
+            Some(guard),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ordinary.await, Err(AcpError::TurnInProgress)));
+        let messages = drain_prompt_user_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_ref().unwrap().0, "channel-message");
     }
 
     /// Mirror what a live `active` goal snapshot leaves on the state.

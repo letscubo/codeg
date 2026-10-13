@@ -1,44 +1,7 @@
-//! fork(letscubo)专属: 渠道回合直推(turn relay)。
-//!
-//! MyClaw 的 Telegram 托管 bot(一个 agent 一个 bot)收到消息后,由平台调 `acp_prompt` /
-//! `cli_prompt` 驱动这一轮,并在参数里带上 `outbound`(bot token + 私聊 chat_id)。本模块
-//! 按连接订阅这一轮的事件,**边生成边推到 Telegram**:
-//!
-//! - 还没有正文时,草稿显示一行状态:开始是「💭 思考中…」(平台按用户语言给),调用工具时换成
-//!   「🔧 <工具的一句话说明>」,工具结束回到「思考中」。空草稿在 Telegram 桌面端只是个「…」气泡,
-//!   看不出 agent 在干什么(2026-09-21 用户反馈)
-//! - 第一段正文到达:`sendMessage` 发出**一条**消息并记下 message_id,之后正文增长一律
-//!   `editMessageText` 改这条消息(Slack 的 chat.startStream / Multica 的 Telegram 出站都是
-//!   这个形态:一条消息逐渐长出来)。只有超过单条长度上限才定稿当前这条、另起一条
-//! - 工具调用**不再断句**:正在跑工具时状态行挂在这条消息末尾,跑完去掉
-//! - 结束:最后编辑一次,写入定稿正文(去掉状态行);取消 / 失败补一句提示
-//! - 草稿里的正文和正式消息一样把 Markdown 转成 Telegram HTML(见 `tg_html`):转换器只给成对
-//!   闭合的标记加格式,写到一半的 `**` 原样留着,没闭合的代码块自动补上,所以半截内容也是合法
-//!   HTML。草稿与正式消息同样排版 —— 某些客户端正式消息到了草稿还会多挂几秒(2026-09-21 用户
-//!   反馈),挂着的也不是一堆 `##` / `**`。Telegram 报解析错误就退回纯文本重发。状态行是纯文本
-//!
-//! ## 节奏(2026-09-21 实测,A1-HM 托管 bot)
-//! - 草稿每秒 1 次连续 90 秒不限流;每秒 1.5 次会 429 → 两次更新至少间隔 1 秒。编辑与草稿
-//!   共享限额,同样按这个节流(⚠️ editMessageText 的具体额度官方无明文,待实测再调)。
-//!   来字就推、推送在路上时新字攒着(本 worker 串行发请求,天然单飞),不设固定计时器
-//! - 草稿没有更新约 **10 秒**就消失(文档说 30 秒;2026-09-22 在 Telegram Web 里挂 DOM 监听实测,
-//!   两次都是最后一次更新后 ~10 秒消失)。消失后再发同 id 的草稿,客户端当新草稿重建并把整段
-//!   文字重新「打字」一遍 —— 正文写完、这一轮迟迟不结束时就会反复「消失 → 重打 → 消失」。
-//!   所以没有新字时每 5 秒重发一次续上,赶在过期前。**正文消息不会过期**,没有新内容就不动它
-//!
-//! ## 和平台的分工
-//! - 平台照旧靠 `turn_complete` webhook 同步历史。本模块在该 webhook 里写上
-//!   `relay_turn_id`(见 [`relay_turn_id_for`]),平台看到它就**不再**自己发回复,避免两份
-//! - 本模块写失败时,另发一个 `relay_failed` webhook,**带上已写出的 message_id**:平台编辑
-//!   这些消息写入落库正文,而不是重发一遍。编辑幂等 —— 这就是不用「投递账本」也不会重复的原因
-//! - 事件总线落后(`Lagged`)时丢掉认领、停止推送:turn_complete 不带 relay_turn_id,
-//!   平台照旧自己发 —— 拼接的正文可能缺字,宁可交回平台
-//!
-//! ## token
-//! 只在本进程内存里,这一轮结束即丢;不落盘、不进日志(`Debug` 已脱敏)、**不进 agent 进程
-//! 的环境变量**(agent 能执行命令)。
-//!
-//! 目前只接 Telegram;Slack 的流式接口(chat.startStream / appendStream)另行接入。
+//! Per-turn Telegram and Slack delivery. Tokens live only in worker memory.
+//! `relay_turn_id` is a delivery claim, never a success acknowledgement. V2
+//! consumers wait for the durable `relay_result` after the worker stops writing.
+//! Unknown non-idempotent writes are never blindly replayed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -46,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -54,6 +17,7 @@ use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::db::service::app_metadata_service;
 
+pub use super::relay_result::ResultFormat;
 use super::tg_html;
 
 /// 两次更新(草稿或编辑正文)的最小间隔。实测草稿 1/s 稳定、1.5/s 触发 429;
@@ -67,9 +31,8 @@ const MAX_TURN: Duration = Duration::from_secs(3 * 60 * 60);
 const CLAIM_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// 草稿 / 单条消息的字数上限。Telegram 是 4096(按 UTF-16 计),留余量给 emoji 之类双单元字符。
 const TG_CHUNK: usize = 3800;
-/// 最终消息 429 时的重试次数与单次等待上限。
+/// 最终消息 429 时的重试次数；每次完整遵守平台 retry_after。
 const SEND_RETRIES: usize = 3;
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
 // ── 入参 ────────────────────────────────────────────────────────────────────
 
@@ -81,6 +44,14 @@ pub enum OutboundSpec {
     Telegram {
         /// 平台生成的本轮 id,原样写回 webhook(`relay_turn_id`)。
         turn_id: String,
+        #[serde(default)]
+        delivery_version: u8,
+        #[serde(default)]
+        result_format: ResultFormat,
+        #[serde(default)]
+        result_webhook_url: Option<String>,
+        #[serde(flatten)]
+        presentation: super::relay_input::Presentation,
         bot_token: String,
         chat_id: i64,
         /// 草稿 id 基数(非 0);不给就由 turn_id 派生。每段正文用 `基数 + 段号`。
@@ -89,15 +60,48 @@ pub enum OutboundSpec {
         #[serde(default)]
         texts: RelayTexts,
     },
+    #[serde(rename_all = "camelCase")]
+    Slack {
+        turn_id: String,
+        #[serde(default)]
+        delivery_version: u8,
+        #[serde(default)]
+        result_format: ResultFormat,
+        #[serde(default)]
+        result_webhook_url: Option<String>,
+        #[serde(flatten)]
+        presentation: super::relay_input::Presentation,
+        bot_token: String,
+        channel: String,
+        thread_ts: String,
+        recipient_user_id: String,
+        recipient_team_id: String,
+        #[serde(default)]
+        texts: RelayTexts,
+    },
 }
 
 impl std::fmt::Debug for OutboundSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutboundSpec::Telegram { turn_id, chat_id, .. } => f
+            OutboundSpec::Telegram {
+                turn_id, chat_id, ..
+            } => f
                 .debug_struct("Telegram")
                 .field("turn_id", turn_id)
                 .field("chat_id", chat_id)
+                .field("bot_token", &"<redacted>")
+                .finish(),
+            OutboundSpec::Slack {
+                turn_id,
+                channel,
+                thread_ts,
+                ..
+            } => f
+                .debug_struct("Slack")
+                .field("turn_id", turn_id)
+                .field("channel", channel)
+                .field("thread_ts", thread_ts)
                 .field("bot_token", &"<redacted>")
                 .finish(),
         }
@@ -107,7 +111,7 @@ impl std::fmt::Debug for OutboundSpec {
 impl OutboundSpec {
     pub fn turn_id(&self) -> &str {
         match self {
-            OutboundSpec::Telegram { turn_id, .. } => turn_id,
+            OutboundSpec::Telegram { turn_id, .. } | OutboundSpec::Slack { turn_id, .. } => turn_id,
         }
     }
 }
@@ -146,6 +150,7 @@ pub(crate) struct Composer {
 
 impl Composer {
     /// 第几条消息(0 起)。
+    #[cfg(test)]
     pub(crate) fn index(&self) -> u32 {
         self.index
     }
@@ -159,7 +164,7 @@ impl Composer {
     pub(crate) fn push(&mut self, delta: &str) -> Vec<String> {
         self.text.push_str(delta);
         let mut out = Vec::new();
-        while self.text.chars().count() > TG_CHUNK {
+        while self.text.encode_utf16().count() > TG_CHUNK {
             let (head, tail) = split_head(&self.text, TG_CHUNK);
             out.push(head);
             self.text = tail;
@@ -171,10 +176,13 @@ impl Composer {
 
 /// 按字符数切出不超过 `max` 的头部:优先在最后一个换行处切,没有换行就硬切。
 fn split_head(text: &str, max: usize) -> (String, String) {
+    let mut units = 0;
     let cut = text
         .char_indices()
-        .nth(max)
-        .map(|(i, _)| i)
+        .find_map(|(i, c)| {
+            units += c.len_utf16();
+            (units > max).then_some(i)
+        })
         .unwrap_or(text.len());
     let window = &text[..cut];
     let at = match window.rfind('\n') {
@@ -182,12 +190,12 @@ fn split_head(text: &str, max: usize) -> (String, String) {
         _ => cut,
     };
     let head = text[..at].to_string();
-    let tail = text[at..].trim_start_matches('\n').to_string();
+    let tail = text[at..].to_string();
     (head, tail)
 }
 
 /// 由 turn_id 派生草稿 id 基数(1..2^30),留出空间给 `+ 段号`。
-fn derive_draft_base(turn_id: &str) -> i64 {
+pub(crate) fn derive_draft_base(turn_id: &str) -> i64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in turn_id.bytes() {
         h ^= u64::from(b);
@@ -198,11 +206,15 @@ fn derive_draft_base(turn_id: &str) -> i64 {
 
 // ── Telegram 调用 ────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum TgError {
     /// 429:按 Telegram 给的秒数等。
+    #[error("rate limited for {0}s")]
     RetryAfter(u64),
+    #[error("{0}")]
     Other(String),
+    #[error("delivery outcome unknown")]
+    Unknown,
 }
 
 #[async_trait]
@@ -227,11 +239,11 @@ impl TgApi for HttpTg {
             .send()
             .await
             // reqwest 的错误文本会带上 URL(含 token),只留类别
-            .map_err(|e| TgError::Other(format!("request failed (timeout={})", e.is_timeout())))?;
-        let v: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|_| TgError::Other("unreadable response".into()))?;
+            .map_err(|_| TgError::Unknown)?;
+        if res.status().is_server_error() {
+            return Err(TgError::Unknown);
+        }
+        let v: serde_json::Value = res.json().await.map_err(|_| TgError::Unknown)?;
         if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
             return Ok(v.pointer("/result/message_id").and_then(|m| m.as_i64()));
         }
@@ -245,7 +257,7 @@ impl TgApi for HttpTg {
             v.get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("unknown error")
-                .to_string(),
+                .replace(&self.token, "<redacted>"),
         ))
     }
 }
@@ -256,11 +268,15 @@ pub(crate) enum RelayInput {
     Event(Arc<EventEnvelope>),
     /// 事件总线落后:正文可能缺字,停止推送,交回平台。
     Lagged,
+    SilentComplete,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
     Completed,
+    #[serde(rename = "completed")]
+    Silent,
     Cancelled,
     Failed,
     /// 连接被新一轮顶替 / 提交失败被撤回:什么都不发。
@@ -269,12 +285,63 @@ pub(crate) enum Outcome {
     Lagged,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DeliverySegment {
+    pub index: usize,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_ts: Option<String>,
+    pub delivered: bool,
+    #[serde(skip)]
+    pub unknown: bool,
+}
+
+impl DeliverySegment {
+    pub(crate) fn new(index: usize, text: String) -> Self {
+        Self {
+            index,
+            text,
+            message_id: None,
+            message_ts: None,
+            delivered: false,
+            unknown: false,
+        }
+    }
+}
+
 pub(crate) struct TurnReport {
     pub outcome: Outcome,
-    /// 有内容没写出去(平台需要兜底)。
     pub delivery_failed: bool,
-    /// 这一轮写过的 Telegram 消息 id,按顺序。平台兜底时**编辑**这些消息,不重发。
     pub message_ids: Vec<i64>,
+    pub segments: Vec<DeliverySegment>,
+    pub final_text: String,
+    pub text_complete: bool,
+    pub delivery_unknown: bool,
+}
+
+impl TurnReport {
+    pub(crate) fn new(
+        outcome: Outcome,
+        mut segments: Vec<DeliverySegment>,
+        final_text: String,
+        delivery_unknown: bool,
+    ) -> Self {
+        for (index, segment) in segments.iter_mut().enumerate() {
+            segment.index = index;
+        }
+        let text_complete = !matches!(outcome, Outcome::Lagged | Outcome::Aborted);
+        Self {
+            delivery_failed: segments.iter().any(|s| !s.delivered) || !text_complete,
+            message_ids: segments.iter().filter_map(|s| s.message_id).collect(),
+            delivery_unknown: delivery_unknown || segments.iter().any(|s| s.unknown),
+            outcome,
+            segments,
+            final_text,
+            text_complete,
+        }
+    }
 }
 
 /// 工具状态行最长多少字(工具说明是模型写的,可能很长)。
@@ -304,158 +371,157 @@ pub(crate) struct TelegramTurn {
     pub texts: RelayTexts,
 }
 
-/// 正在写的那条 Telegram 消息。
-struct Live {
-    message_id: i64,
-    /// 这条消息当前显示的文字(相同就不必再编辑)。
-    shown: String,
-}
-
 impl TelegramTurn {
     pub(crate) async fn run(self, mut rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
         let deadline = Instant::now() + MAX_TURN;
         let mut body = Composer::default();
-        let mut live: Option<Live> = None;
-        // 这一轮用到的消息 id,按顺序;失败时交给平台,让它编辑同一条而不是重发
-        let mut message_ids: Vec<i64> = Vec::new();
-        let mut delivery_failed = false;
-        // 还没有正文时草稿显示过什么(避免同样的状态重复推)
-        let mut draft_shown: Option<String> = None;
-        let mut last_update: Option<Instant> = None;
-        let mut blocked_until: Option<Instant> = None;
-        // 长回复被切成多条时,跨条的未闭合代码块(见 tg_html::render_chunk)
-        let mut fence: Option<String> = None;
+        let mut full_text = String::new();
+        let mut segments = vec![DeliverySegment::new(0, String::new())];
+        let mut fence = None;
+        let mut draft_shown = None;
+        let mut last_update = None;
+        let mut blocked_until = None;
+        let mut shown = String::new();
         let mut status = self.texts.thinking.clone();
-        let mut status_tool: Option<String> = None;
-
-        // 立刻给出状态(还没有正文,走草稿:不占消息历史)
-        self.draft(&status, &mut draft_shown, &mut last_update, &mut blocked_until)
-            .await;
-
+        let mut status_tool = None;
+        self.draft(
+            &status,
+            &mut draft_shown,
+            &mut last_update,
+            &mut blocked_until,
+        )
+        .await;
         let outcome = loop {
             let want = self.display(&body, &status, status_tool.is_some());
-            let dirty = match &live {
-                Some(l) => l.shown != want,
-                None => draft_shown.as_deref() != Some(want.as_str()),
+            let current = segments.last().unwrap();
+            let has_message = current.message_id.is_some();
+            let dirty = if has_message {
+                shown != want
+            } else {
+                draft_shown.as_deref() != Some(&want)
             };
             let base = last_update.unwrap_or_else(Instant::now);
-            // 正文消息不会过期,没有新内容就不用动;草稿约 10 秒消失,要心跳续上
-            let mut next = if dirty {
-                base + MIN_UPDATE_INTERVAL
-            } else if live.is_some() {
-                base + MAX_TURN
-            } else {
-                base + DRAFT_HEARTBEAT
-            };
+            let mut next = base
+                + if dirty {
+                    MIN_UPDATE_INTERVAL
+                } else if has_message {
+                    MAX_TURN
+                } else {
+                    DRAFT_HEARTBEAT
+                };
             if let Some(b) = blocked_until {
                 next = next.max(b);
             }
-
+            if current.unknown && current.message_id.is_none() {
+                next = deadline;
+            }
             tokio::select! {
                 input = rx.recv() => match input {
                     None => break Outcome::Aborted,
                     Some(RelayInput::Lagged) => break Outcome::Lagged,
+                    Some(RelayInput::SilentComplete) => break Outcome::Silent,
                     Some(RelayInput::Event(env)) => match &env.payload {
                         AcpEvent::ContentDelta { text, parent_tool_use_id: None } => {
-                            // 超长:当前这条消息定稿成 head,之后的正文另起一条
+                            full_text.push_str(text);
                             for head in body.push(text) {
-                                delivery_failed |= !self
-                                    .write(&head, &mut live, &mut fence, &mut message_ids, &mut last_update, &mut blocked_until)
-                                    .await;
-                                live = None;
+                                let segment = segments.last_mut().unwrap();
+                                segment.text = head.clone();
+                                self.write(&head, segment, &fence, &mut shown, &mut last_update, &mut blocked_until).await;
+                                // Only finalized chunks advance the cross-message fence.
+                                tg_html::render_chunk(&head, &mut fence);
+                                segments.push(DeliverySegment::new(segments.len(), String::new()));
+                                shown.clear();
                             }
+                            { let segment = segments.last_mut().unwrap(); segment.text = body.text().to_owned(); segment.delivered = false; }
                         }
                         AcpEvent::ToolCall { tool_call_id, title, description, .. } => {
                             if let Some(line) = tool_status(description.as_deref(), title) {
-                                status = line;
-                                status_tool = Some(tool_call_id.clone());
+                                status = line; status_tool = Some(tool_call_id.clone());
                             }
                         }
                         AcpEvent::ToolCallUpdate { tool_call_id, title, description, status: tool_state, .. }
-                            if status_tool.as_deref() == Some(tool_call_id.as_str()) =>
-                        {
+                            if status_tool.as_deref() == Some(tool_call_id.as_str()) => {
                             if matches!(tool_state.as_deref(), Some("completed" | "failed")) {
-                                status = self.texts.thinking.clone();
-                                status_tool = None;
-                            } else if let Some(line) = description
-                                .as_deref()
-                                .map(|d| tool_status(Some(d), ""))
-                                .or_else(|| title.as_deref().map(|t| tool_status(None, t)))
-                                .flatten()
-                            {
-                                // 首帧没带说明、更新时才补上的
+                                status = self.texts.thinking.clone(); status_tool = None;
+                            } else if let Some(line) = tool_status(description.as_deref(), title.as_deref().unwrap_or("")) {
                                 status = line;
                             }
                         }
-                        AcpEvent::TurnComplete { stop_reason, .. } => {
-                            break match stop_reason.as_str() {
-                                "end_turn" => Outcome::Completed,
-                                "cancelled" => Outcome::Cancelled,
-                                _ => Outcome::Failed,
-                            };
-                        }
-                        AcpEvent::Error { terminal: true, .. } => break Outcome::Failed,
-                        AcpEvent::StatusChanged {
-                            status: ConnectionStatus::Disconnected | ConnectionStatus::Error,
-                        } => break Outcome::Failed,
+                        AcpEvent::TurnComplete { stop_reason, .. } => break match stop_reason.as_str() {
+                            "end_turn" => Outcome::Completed, "cancelled" => Outcome::Cancelled, _ => Outcome::Failed,
+                        },
+                        AcpEvent::Error { terminal: true, .. } |
+                        AcpEvent::StatusChanged { status: ConnectionStatus::Disconnected | ConnectionStatus::Error } => break Outcome::Failed,
                         _ => {}
-                    },
+                    }
                 },
                 _ = tokio::time::sleep_until(next) => {
-                    let want = self.display(&body, &status, status_tool.is_some());
                     if body.text().trim().is_empty() {
                         self.draft(&want, &mut draft_shown, &mut last_update, &mut blocked_until).await;
                     } else {
-                        delivery_failed |= !self
-                            .write(&want, &mut live, &mut fence, &mut message_ids, &mut last_update, &mut blocked_until)
-                            .await;
+                        self.write(&want, segments.last_mut().unwrap(), &fence, &mut shown, &mut last_update, &mut blocked_until).await;
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => break Outcome::Failed,
             }
         };
-
         if matches!(outcome, Outcome::Aborted | Outcome::Lagged) {
-            return TurnReport {
-                outcome,
-                delivery_failed: false,
-                message_ids,
-            };
+            // Only repair the already known message. A missing ID must never
+            // become a new send while handing an incomplete turn back.
+            if let Some(segment) = segments.last() {
+                if let Some(id) = segment.message_id {
+                    if !segment.text.trim().is_empty() && shown != segment.text {
+                        let mut local_fence = fence.clone();
+                        let html = tg_html::render_chunk(&segment.text, &mut local_fence);
+                        let _ = self.send_with_plain_fallback("editMessageText",
+                            serde_json::json!({"chat_id":self.chat_id,"message_id":id,"text":html,"parse_mode":"HTML"}),
+                            serde_json::json!({"chat_id":self.chat_id,"message_id":id,"text":segment.text}),
+                        ).await;
+                    }
+                }
+            }
+            segments.retain(|s| !s.text.is_empty() || s.message_id.is_some() || s.unknown);
+            return TurnReport::new(outcome, segments, full_text, false);
         }
-
-        // 收尾:正文定稿(去掉状态行)
-        let final_text = body.text().trim().to_string();
-        if !final_text.is_empty() {
-            delivery_failed |= !self
-                .write(&final_text, &mut live, &mut fence, &mut message_ids, &mut last_update, &mut blocked_until)
-                .await;
-        }
+        segments.last_mut().unwrap().text = body.text().to_owned();
+        segments.retain(|s| !s.text.trim().is_empty() || s.message_id.is_some() || s.unknown);
         let note = match outcome {
-            Outcome::Completed if final_text.is_empty() && message_ids.is_empty() => Some(&self.texts.empty),
+            Outcome::Completed if full_text.trim().is_empty() => Some(&self.texts.empty),
             Outcome::Cancelled => Some(&self.texts.cancelled),
             Outcome::Failed => Some(&self.texts.failed),
             _ => None,
         };
         if let Some(note) = note {
-            match self
-                .send(serde_json::json!({ "chat_id": self.chat_id, "text": note }))
-                .await
-            {
-                Ok(Some(id)) => message_ids.push(id),
-                Ok(None) => {}
-                Err(_) => delivery_failed = true,
+            if !full_text.is_empty() {
+                full_text.push_str("\n\n");
             }
+            full_text.push_str(note);
+            segments.push(DeliverySegment::new(segments.len(), note.clone()));
         }
-        // 草稿只在还没有正文时用过;正文消息发出后它会自行消失
-        TurnReport {
-            outcome,
-            delivery_failed,
-            message_ids,
+        // Reconcile all final segments, including a failed earlier split. A
+        // transient failed edit does not latch failure after successful repair.
+        let mut fence = None;
+        for segment in &mut segments {
+            let text = segment.text.clone();
+            if segment.delivered {
+                tg_html::render_chunk(&text, &mut fence);
+                continue;
+            }
+            let mut final_shown = String::new();
+            self.write(
+                &text,
+                segment,
+                &fence,
+                &mut final_shown,
+                &mut last_update,
+                &mut blocked_until,
+            )
+            .await;
+            tg_html::render_chunk(&text, &mut fence);
         }
+        TurnReport::new(outcome, segments, full_text, false)
     }
 
-    /// 这条消息该显示什么:正文,外加正在跑工具时末尾的一行状态。
-    /// 还没有正文时就只有状态行(那时走草稿)。
     fn display(&self, body: &Composer, status: &str, tool_running: bool) -> String {
         let text = body.text().trim_end();
         if text.trim().is_empty() {
@@ -468,80 +534,98 @@ impl TelegramTurn {
         }
     }
 
-    /// 写正文:没有活动消息就新发一条并记下 id,有就编辑它。
-    ///
-    /// 编辑天然幂等 —— 重试同一条内容结果一样,不会像「发多条」那样重复。Telegram 说
-    /// 「内容没变」按成功算;消息被用户删了就重新发一条,接着在新消息上写。
-    /// 返回是否写成功。
     async fn write(
         &self,
         text: &str,
-        live: &mut Option<Live>,
-        fence: &mut Option<String>,
-        message_ids: &mut Vec<i64>,
+        segment: &mut DeliverySegment,
+        fence: &Option<String>,
+        shown: &mut String,
         last_update: &mut Option<Instant>,
         blocked_until: &mut Option<Instant>,
-    ) -> bool {
+    ) {
         if text.trim().is_empty() {
-            return true;
+            return;
         }
-        if live.as_ref().is_some_and(|l| l.shown == text) {
-            return true;
+        if shown == text {
+            segment.delivered = text == segment.text;
+            return;
         }
+        // A lost sendMessage response may have created a message. Never create
+        // another one without its ID. Edits with known IDs remain repairable.
+        if segment.unknown && segment.message_id.is_none() {
+            return;
+        }
+        let mut next = last_update
+            .map(|at| at + MIN_UPDATE_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        if let Some(blocked) = blocked_until {
+            next = next.max(*blocked);
+        }
+        tokio::time::sleep_until(next).await;
         *last_update = Some(Instant::now());
-        // 跨消息的未闭合代码块:本条用一份副本,定稿时才落回真实状态
         let mut local_fence = fence.clone();
         let html = tg_html::render_chunk(text, &mut local_fence);
-        let ok = match live.as_ref().map(|l| l.message_id) {
-            None => {
-                let body = serde_json::json!({ "chat_id": self.chat_id, "text": html, "parse_mode": "HTML" });
-                let plain = serde_json::json!({ "chat_id": self.chat_id, "text": text });
-                match self.send_with_plain_fallback("sendMessage", body, plain).await {
-                    Ok(id) => {
-                        if let Some(id) = id {
-                            message_ids.push(id);
-                            *live = Some(Live { message_id: id, shown: text.to_string() });
-                        }
-                        true
+        loop {
+            let method = if segment.message_id.is_some() {
+                "editMessageText"
+            } else {
+                "sendMessage"
+            };
+            let mut body =
+                serde_json::json!({"chat_id": self.chat_id, "text": html, "parse_mode": "HTML"});
+            let mut plain = serde_json::json!({"chat_id": self.chat_id, "text": text});
+            if let Some(id) = segment.message_id {
+                body["message_id"] = id.into();
+                plain["message_id"] = id.into();
+            }
+            match self.send_with_plain_fallback(method, body, plain).await {
+                Ok(id) => {
+                    if segment.message_id.is_none() {
+                        let Some(id) = id else {
+                            segment.unknown = true;
+                            segment.delivered = false;
+                            break;
+                        };
+                        segment.message_id = Some(id);
                     }
-                    Err(e) => {
-                        tracing::warn!("[TurnRelay] telegram sendMessage failed: {e}");
-                        false
-                    }
+                    segment.delivered = text == segment.text;
+                    segment.unknown = false;
+                    *shown = text.to_owned();
+                    break;
+                }
+                Err(TgError::Other(e))
+                    if segment.message_id.is_some() && e.contains("not modified") =>
+                {
+                    segment.delivered = text == segment.text;
+                    segment.unknown = false;
+                    *shown = text.to_owned();
+                    break;
+                }
+                Err(TgError::Other(e))
+                    if segment.message_id.is_some() && e.contains("message to edit not found") =>
+                {
+                    segment.message_id = None;
+                    segment.unknown = false;
+                }
+                Err(TgError::Unknown) => {
+                    segment.delivered = false;
+                    segment.unknown = segment.message_id.is_none();
+                    break;
+                }
+                Err(TgError::RetryAfter(s)) => {
+                    *blocked_until = Some(Instant::now() + Duration::from_secs(s));
+                    segment.delivered = false;
+                    break;
+                }
+                Err(TgError::Other(_)) => {
+                    segment.delivered = false;
+                    break;
                 }
             }
-            Some(id) => {
-                let body = serde_json::json!({
-                    "chat_id": self.chat_id, "message_id": id, "text": html, "parse_mode": "HTML"
-                });
-                let plain = serde_json::json!({ "chat_id": self.chat_id, "message_id": id, "text": text });
-                match self.send_with_plain_fallback("editMessageText", body, plain).await {
-                    Ok(_) => {
-                        if let Some(l) = live.as_mut() {
-                            l.shown = text.to_string();
-                        }
-                        true
-                    }
-                    Err(e) if e.contains("not modified") => true,
-                    Err(e) if e.contains("not found") || e.contains("can't be edited") => {
-                        // 用户把消息删了:另起一条接着写
-                        tracing::warn!("[TurnRelay] telegram message {id} no longer editable ({e}); sending a new one");
-                        *live = None;
-                        Box::pin(self.write(text, live, fence, message_ids, last_update, blocked_until)).await
-                    }
-                    Err(e) => {
-                        tracing::warn!("[TurnRelay] telegram editMessageText failed: {e}");
-                        false
-                    }
-                }
-            }
-        };
-        *fence = local_fence;
-        *blocked_until = None;
-        ok
+        }
+        *last_update = Some(Instant::now());
     }
 
-    /// 还没有正文时的状态草稿(不占消息历史)。纯展示:失败只记日志,429 记下冷却时间。
     async fn draft(
         &self,
         text: &str,
@@ -549,64 +633,60 @@ impl TelegramTurn {
         last_update: &mut Option<Instant>,
         blocked_until: &mut Option<Instant>,
     ) {
-        let body = serde_json::json!({
-            "chat_id": self.chat_id, "draft_id": self.draft_base, "text": text
-        });
         *last_update = Some(Instant::now());
-        match self.api.call("sendMessageDraft", body).await {
+        match self
+            .api
+            .call(
+                "sendMessageDraft",
+                serde_json::json!({"chat_id":self.chat_id,"draft_id":self.draft_base,"text":text}),
+            )
+            .await
+        {
             Ok(_) => {
-                *draft_shown = Some(text.to_string());
+                *draft_shown = Some(text.to_owned());
                 *blocked_until = None;
             }
             Err(TgError::RetryAfter(s)) => {
                 *blocked_until = Some(Instant::now() + Duration::from_secs(s));
             }
-            Err(TgError::Other(e)) => {
-                tracing::warn!("[TurnRelay] telegram draft failed: {e}");
-                // 当作已显示,免得每个 tick 都重试同一句;有新内容会再发
-                *draft_shown = Some(text.to_string());
+            Err(_) => {
+                *draft_shown = Some(text.to_owned());
             }
         }
     }
 
-    /// 先按 HTML 发;Telegram 拒收(解析错误等)就退回纯文本再发一次。
     async fn send_with_plain_fallback(
         &self,
         method: &str,
         html: serde_json::Value,
         plain: serde_json::Value,
-    ) -> Result<Option<i64>, String> {
+    ) -> Result<Option<i64>, TgError> {
         match self.call_with_retry(method, html).await {
-            Ok(id) => Ok(id),
-            Err(e) if e.contains("not modified") || e.contains("not found") || e.contains("can't be edited") => Err(e),
-            Err(e) => {
-                tracing::warn!("[TurnRelay] telegram HTML rejected ({e}); retrying as plain text");
+            Err(TgError::Other(e))
+                if e.contains("can't parse entities")
+                    || e.contains("can't find end")
+                    || e.contains("unsupported start tag") =>
+            {
                 self.call_with_retry(method, plain).await
             }
+            result => result,
         }
     }
 
-    /// 429 按 Telegram 给的秒数等待后重试(重试同一条编辑是幂等的)。
     async fn call_with_retry(
         &self,
         method: &str,
         body: serde_json::Value,
-    ) -> Result<Option<i64>, String> {
-        for _ in 0..SEND_RETRIES {
+    ) -> Result<Option<i64>, TgError> {
+        for attempt in 0..SEND_RETRIES {
             match self.api.call(method, body.clone()).await {
-                Ok(id) => return Ok(id),
-                Err(TgError::RetryAfter(s)) => {
-                    tokio::time::sleep(Duration::from_secs(s).min(MAX_RETRY_WAIT)).await;
+                Err(TgError::RetryAfter(s)) if attempt + 1 < SEND_RETRIES => {
+                    tokio::time::sleep(Duration::from_secs(s)).await
                 }
-                Err(TgError::Other(e)) => return Err(e),
+                result => return result,
             }
         }
-        Err("rate limited".into())
-    }
-
-    /// 发一条独立消息(收尾提示语)。
-    async fn send(&self, body: serde_json::Value) -> Result<Option<i64>, String> {
-        self.call_with_retry("sendMessage", body).await
+        unreachable!()
     }
 }
 
@@ -614,19 +694,23 @@ impl TelegramTurn {
 
 struct Worker {
     turn_id: String,
+    generation: u64,
+    start_seq: u64,
     tx: mpsc::UnboundedSender<RelayInput>,
 }
 
 struct Claim {
     turn_id: String,
+    start_seq: u64,
     at: std::time::Instant,
 }
 
 struct Relay {
+    admission: tokio::sync::Mutex<()>,
     db: DatabaseConnection,
     client: reqwest::Client,
     workers: StdMutex<HashMap<String, Worker>>,
-    claims: StdMutex<HashMap<String, Claim>>,
+    claims: StdMutex<HashMap<String, Vec<Claim>>>,
 }
 
 static RELAY: OnceLock<Arc<Relay>> = OnceLock::new();
@@ -635,6 +719,7 @@ static RELAY: OnceLock<Arc<Relay>> = OnceLock::new();
 fn relay(bus: &Arc<InternalEventBus>, db: &DatabaseConnection) -> Arc<Relay> {
     Arc::clone(RELAY.get_or_init(|| {
         let relay = Arc::new(Relay {
+            admission: tokio::sync::Mutex::new(()),
             db: db.clone(),
             client: super::webhook::make_webhook_client(),
             workers: StdMutex::new(HashMap::new()),
@@ -646,26 +731,24 @@ fn relay(bus: &Arc<InternalEventBus>, db: &DatabaseConnection) -> Arc<Relay> {
     }))
 }
 
-async fn dispatch(
-    relay: Arc<Relay>,
-    mut rx: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>,
-) {
+async fn dispatch(relay: Arc<Relay>, mut rx: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
         match rx.recv().await {
             Ok(env) => {
                 let workers = relay.workers.lock().unwrap();
                 if let Some(w) = workers.get(&env.connection_id) {
-                    let _ = w.tx.send(RelayInput::Event(env));
+                    if env.seq > w.start_seq {
+                        let _ = w.tx.send(RelayInput::Event(env));
+                    }
                 }
             }
             Err(RecvError::Lagged(n)) => {
                 tracing::warn!("[TurnRelay] event bus lagged by {n}; handing active turns back");
                 let mut workers = relay.workers.lock().unwrap();
-                let mut claims = relay.claims.lock().unwrap();
-                for (conn, w) in workers.drain() {
+                // Keep claims: incomplete output must not race platform fallback.
+                for (_, w) in workers.drain() {
                     let _ = w.tx.send(RelayInput::Lagged);
-                    claims.remove(&conn);
                 }
             }
             Err(RecvError::Closed) => break,
@@ -682,19 +765,90 @@ pub async fn register_for_prompt(
     connection_id: &str,
     conversation_id: Option<i32>,
     spec: OutboundSpec,
-) -> Option<String> {
-    if let Some(session) = state.connection_manager.get_state(connection_id).await {
-        if session.read().await.turn_in_flight {
-            return None;
-        }
+) -> Result<Option<String>, String> {
+    let relay = relay(&state.acp_event_bus, &state.db.conn);
+    let _admission = relay.admission.lock().await;
+    if spec.turn_id().is_empty() || spec.turn_id().len() > 200 {
+        return Err("invalid_relay_turn_id".into());
     }
-    Some(register(
+    if super::relay_outbox::get(&state.db.conn, spec.turn_id())
+        .await
+        .map_err(|_| "relay_storage_unavailable".to_string())?
+        .is_some()
+    {
+        return Err("relay_turn_already_exists".into());
+    }
+    if relay.workers.lock().unwrap().contains_key(connection_id) {
+        return Err("relay_turn_in_progress".into());
+    }
+    let (generation, start_seq) =
+        if let Some(session) = state.connection_manager.get_state(connection_id).await {
+            let session = session.read().await;
+            if session.turn_in_flight {
+                return Err("relay_turn_in_progress".into());
+            }
+            (session.turns_completed, session.event_seq)
+        } else {
+            return Err("relay_connection_not_found".into());
+        };
+    let (version, kind, target, callback, format) = match &spec {
+        OutboundSpec::Telegram {
+            delivery_version,
+            chat_id,
+            result_webhook_url,
+            result_format,
+            ..
+        } => (
+            *delivery_version,
+            "telegram",
+            serde_json::json!({"chat_id":chat_id}),
+            result_webhook_url.as_deref(),
+            *result_format,
+        ),
+        OutboundSpec::Slack {
+            delivery_version,
+            channel,
+            thread_ts,
+            result_webhook_url,
+            result_format,
+            ..
+        } => {
+            if channel.is_empty() || thread_ts.is_empty() || thread_ts == "0" {
+                return Err("invalid_slack_relay_target".into());
+            }
+            (
+                *delivery_version,
+                "slack",
+                serde_json::json!({"channel":channel,"thread_ts":thread_ts}),
+                result_webhook_url.as_deref(),
+                *result_format,
+            )
+        }
+    };
+    let callback_hash = if version >= 2 {
+        super::relay_outbox::validated_target(&state.db.conn, callback).await
+    } else {
+        None
+    };
+    if version >= 2 {
+        super::relay_outbox::save(&state.db.conn, spec.turn_id(), serde_json::json!({
+            "event_id":uuid::Uuid::new_v4().to_string(), "event":"relay_result", "relay_version":2,
+            "relay_turn_id":spec.turn_id(), "relay_kind":kind, "connection_id":connection_id,
+            "conversation_id":conversation_id, "delivery_status":"running",
+            "fallback_allowed":false, "text_complete":false, "final_text":"", "segments":[],
+            "target":target, "occurred_at":chrono::Utc::now().to_rfc3339(), "source":"codeg"
+        }), callback_hash.clone(), format).await.map_err(|_| "relay_storage_unavailable".to_string())?;
+    }
+    register(
         &state.acp_event_bus,
         &state.db.conn,
         connection_id,
         conversation_id,
         spec,
-    ))
+        (generation, start_seq),
+        callback_hash,
+    )
+    .map(Some)
 }
 
 /// 登记一轮直推。须在提交 prompt **之前**调用(之后的事件才不会漏)。
@@ -704,51 +858,123 @@ fn register(
     connection_id: &str,
     conversation_id: Option<i32>,
     spec: OutboundSpec,
-) -> String {
+    (generation, start_seq): (u64, u64),
+    callback_hash: Option<String>,
+) -> Result<String, String> {
     let relay = relay(bus, db);
     let turn_id = spec.turn_id().to_string();
     let (tx, rx) = mpsc::unbounded_channel();
     {
         let mut workers = relay.workers.lock().unwrap();
-        // 同一连接上一轮还登记着 → 替换掉(旧 worker 的 rx 关闭,按 Aborted 退出)
-        workers.insert(
-            connection_id.to_string(),
+        insert_worker(
+            &mut workers,
+            connection_id,
             Worker {
                 turn_id: turn_id.clone(),
+                generation,
+                start_seq,
                 tx,
             },
-        );
+        )?;
         let mut claims = relay.claims.lock().unwrap();
-        claims.retain(|_, c| c.at.elapsed() < CLAIM_TTL);
-        claims.insert(
-            connection_id.to_string(),
-            Claim {
+        claims.retain(|_, entries| {
+            entries.retain(|c| c.at.elapsed() < CLAIM_TTL);
+            !entries.is_empty()
+        });
+        claims
+            .entry(connection_id.to_string())
+            .or_default()
+            .push(Claim {
                 turn_id: turn_id.clone(),
+                start_seq,
                 at: std::time::Instant::now(),
-            },
-        );
+            });
     }
 
-    let OutboundSpec::Telegram {
-        bot_token,
-        chat_id,
-        draft_id,
-        texts,
-        ..
-    } = spec;
-    let turn = TelegramTurn {
-        api: Arc::new(HttpTg {
-            client: relay.client.clone(),
-            token: bot_token,
-        }),
-        chat_id,
-        draft_base: draft_id.filter(|d| *d > 0).unwrap_or_else(|| derive_draft_base(&turn_id)),
-        texts,
+    let (version, kind, target) = match &spec {
+        OutboundSpec::Telegram {
+            delivery_version,
+            chat_id,
+            ..
+        } => (
+            *delivery_version,
+            "telegram",
+            serde_json::json!({"chat_id":chat_id}),
+        ),
+        OutboundSpec::Slack {
+            delivery_version,
+            channel,
+            thread_ts,
+            ..
+        } => (
+            *delivery_version,
+            "slack",
+            serde_json::json!({"channel":channel,"thread_ts":thread_ts}),
+        ),
     };
+    let (presentation, result_format) = match &spec {
+        OutboundSpec::Telegram {
+            presentation,
+            result_format,
+            ..
+        }
+        | OutboundSpec::Slack {
+            presentation,
+            result_format,
+            ..
+        } => (presentation.clone(), *result_format),
+    };
+    let rx = super::relay_input::wrap(rx, presentation);
     let connection_id = connection_id.to_string();
     let tid = turn_id.clone();
     tokio::spawn(async move {
-        let report = turn.run(rx).await;
+        let report = match spec {
+            OutboundSpec::Telegram {
+                bot_token,
+                chat_id,
+                draft_id,
+                texts,
+                ..
+            } => {
+                TelegramTurn {
+                    api: Arc::new(HttpTg {
+                        client: relay.client.clone(),
+                        token: bot_token,
+                    }),
+                    chat_id,
+                    draft_base: draft_id
+                        .filter(|d| *d > 0)
+                        .unwrap_or_else(|| derive_draft_base(&tid)),
+                    texts,
+                }
+                .run(rx)
+                .await
+            }
+            OutboundSpec::Slack {
+                bot_token,
+                channel,
+                thread_ts,
+                recipient_user_id,
+                recipient_team_id,
+                texts,
+                ..
+            } => {
+                super::slack_relay::SlackTurn {
+                    session_key: super::slack_relay::session_key(&bot_token, &channel, &thread_ts),
+                    api: Arc::new(super::slack_relay::HttpSlack {
+                        client: relay.client.clone(),
+                        token: bot_token,
+                    }),
+                    channel,
+                    thread_ts,
+                    recipient_user_id,
+                    recipient_team_id,
+                    texts,
+                }
+                .run(rx)
+                .await
+            }
+        };
         tracing::info!(
             "[TurnRelay] turn {tid} on {connection_id}: {:?} (delivery_failed={})",
             report.outcome,
@@ -760,11 +986,57 @@ fn register(
                 workers.remove(&connection_id);
             }
         }
-        if report.delivery_failed {
-            report_failure(&relay, &connection_id, conversation_id, &tid, &report.message_ids).await;
+        if version >= 2 {
+            let status = if report.delivery_unknown {
+                "unknown"
+            } else if report.delivery_failed {
+                "failed"
+            } else {
+                "delivered"
+            };
+            let payload = serde_json::json!({
+                "event_id": uuid::Uuid::new_v4().to_string(), "event": "relay_result", "relay_version": 2,
+                "relay_turn_id": tid, "relay_kind": kind, "connection_id": connection_id,
+                "conversation_id": conversation_id, "outcome": report.outcome,
+                "delivery_status": status,
+                "fallback_allowed": report.delivery_failed && !report.delivery_unknown && report.text_complete,
+                "text_complete": report.text_complete, "final_text": report.final_text,
+                "segments": report.segments, "target": target,
+                "failure_code": if report.delivery_unknown { Some("write_outcome_unknown") } else if !report.text_complete { Some("incomplete_event_stream") } else if report.delivery_failed { Some("platform_write_failed") } else { None },
+                "occurred_at": chrono::Utc::now().to_rfc3339(), "source": "codeg",
+            });
+            if super::relay_outbox::save(&relay.db, &tid, payload, callback_hash, result_format)
+                .await
+                .is_err()
+            {
+                tracing::error!("[TurnRelay] terminal result persistence failed");
+            }
+        } else if report.delivery_failed && !report.delivery_unknown && report.text_complete {
+            report_failure(
+                &relay,
+                &connection_id,
+                conversation_id,
+                &tid,
+                &report.message_ids,
+            )
+            .await;
         }
     });
-    turn_id
+    Ok(turn_id)
+}
+
+fn insert_worker(
+    workers: &mut HashMap<String, Worker>,
+    connection_id: &str,
+    worker: Worker,
+) -> Result<(), String> {
+    match workers.entry(connection_id.to_owned()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(worker);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(_) => Err("relay_turn_in_progress".into()),
+    }
 }
 
 /// 提交 prompt 失败时撤回登记(只撤本轮的,不误伤后来者)。
@@ -775,26 +1047,26 @@ pub fn abort(connection_id: &str, turn_id: &str) {
         workers.remove(connection_id); // 丢掉 tx → worker 按 Aborted 退出
     }
     let mut claims = relay.claims.lock().unwrap();
-    if claims.get(connection_id).map(|c| c.turn_id == turn_id) == Some(true) {
-        claims.remove(connection_id);
+    if let Some(entries) = claims.get_mut(connection_id) {
+        entries.retain(|c| c.turn_id != turn_id);
     }
 }
 
 /// webhook 用:这条连接的当前轮是否由本模块直推。`take` = 取走(turn_complete 时)。
-pub fn relay_turn_id_for(connection_id: &str, take: bool) -> Option<String> {
+pub fn relay_turn_id_for(connection_id: &str, seq: u64, take: bool) -> Option<String> {
     let relay = RELAY.get()?;
     let mut claims = relay.claims.lock().unwrap();
-    let fresh = claims
-        .get(connection_id)
-        .is_some_and(|c| c.at.elapsed() < CLAIM_TTL);
-    if !fresh {
-        claims.remove(connection_id);
-        return None;
-    }
+    let entries = claims.get_mut(connection_id)?;
+    claim_for_event(entries, seq, take)
+}
+
+fn claim_for_event(entries: &mut Vec<Claim>, seq: u64, take: bool) -> Option<String> {
+    entries.retain(|c| c.at.elapsed() < CLAIM_TTL);
+    let index = entries.iter().rposition(|c| c.start_seq < seq)?;
     if take {
-        claims.remove(connection_id).map(|c| c.turn_id)
+        Some(entries.remove(index).turn_id)
     } else {
-        claims.get(connection_id).map(|c| c.turn_id.clone())
+        Some(entries[index].turn_id.clone())
     }
 }
 
@@ -806,12 +1078,13 @@ async fn report_failure(
     turn_id: &str,
     message_ids: &[i64],
 ) {
-    let urls = app_metadata_service::get_value(&relay.db, super::event_subscriber::EVENT_WEBHOOKS_KEY)
-        .await
-        .ok()
-        .flatten()
-        .map(|json| super::webhook::enabled_webhook_urls(&json))
-        .unwrap_or_default();
+    let urls =
+        app_metadata_service::get_value(&relay.db, super::event_subscriber::EVENT_WEBHOOKS_KEY)
+            .await
+            .ok()
+            .flatten()
+            .map(|json| super::webhook::enabled_webhook_urls(&json))
+            .unwrap_or_default();
     if urls.is_empty() {
         return;
     }
@@ -852,7 +1125,7 @@ mod tests {
         let out = c.push(&text);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], format!("{line}\n{line}\n{line}"));
-        assert_eq!(c.text(), format!("{line}\n尾巴"));
+        assert_eq!(c.text(), format!("\n{line}\n尾巴"));
         assert_eq!(c.index(), 1);
     }
 
@@ -902,14 +1175,20 @@ mod tests {
 
     #[async_trait]
     impl TgApi for FakeTg {
-        async fn call(&self, method: &str, body: serde_json::Value) -> Result<Option<i64>, TgError> {
+        async fn call(
+            &self,
+            method: &str,
+            body: serde_json::Value,
+        ) -> Result<Option<i64>, TgError> {
             let text = body["text"].as_str().unwrap_or_default().to_string();
             self.calls.lock().unwrap().push((method.to_string(), text));
             if self.fail_messages && method == "sendMessage" {
                 return Err(TgError::Other("Forbidden".into()));
             }
             if self.edit_gone && method == "editMessageText" {
-                return Err(TgError::Other("Bad Request: message to edit not found".into()));
+                return Err(TgError::Other(
+                    "Bad Request: message to edit not found".into(),
+                ));
             }
             if self.reject_html && body.get("parse_mode").is_some() {
                 return Err(TgError::Other("Bad Request: can't parse entities".into()));
@@ -1027,7 +1306,13 @@ mod tests {
         let api = Arc::new(FakeTg::default());
         let r = run_with(
             Arc::clone(&api),
-            vec![delta("我先看看"), tool_call("t", "Bash", None), delta("结论是 "), delta("42"), complete("end_turn")],
+            vec![
+                delta("我先看看"),
+                tool_call("t", "Bash", None),
+                delta("结论是 "),
+                delta("42"),
+                complete("end_turn"),
+            ],
         )
         .await;
         assert_eq!(r.outcome, Outcome::Completed);
@@ -1036,7 +1321,10 @@ mod tests {
         assert_eq!(messages(&api), vec!["我先看看结论是 42"]);
         assert_eq!(r.message_ids, vec![1]);
         // 第一次调用就是「思考中」状态,不是空草稿
-        assert_eq!(drafts(&api).first().unwrap(), &RelayTexts::default().thinking);
+        assert_eq!(
+            drafts(&api).first().unwrap(),
+            &RelayTexts::default().thinking
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1069,7 +1357,8 @@ mod tests {
 
         tx.send(delta("正文")).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况"))).unwrap();
+        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况")))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(edits(&api).last().unwrap(), "正文\n\n🔧 查看磁盘使用情况");
 
@@ -1087,14 +1376,18 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(turn_with(Arc::clone(&api)).run(rx));
 
-        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况"))).unwrap();
+        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况")))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(drafts(&api).last().unwrap(), "🔧 查看磁盘使用情况");
         assert!(messages(&api).is_empty(), "还没有正文就不占消息历史");
 
         tx.send(tool_done("t1")).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(drafts(&api).last().unwrap(), &RelayTexts::default().thinking);
+        assert_eq!(
+            drafts(&api).last().unwrap(),
+            &RelayTexts::default().thinking
+        );
 
         tx.send(complete("end_turn")).unwrap();
         handle.await.unwrap();
@@ -1107,8 +1400,15 @@ mod tests {
         assert_eq!(messages(&api), vec![RelayTexts::default().empty]);
 
         let api = Arc::new(FakeTg::default());
-        run_with(Arc::clone(&api), vec![delta("写了一半"), complete("cancelled")]).await;
-        assert_eq!(messages(&api), vec!["写了一半".to_string(), RelayTexts::default().cancelled]);
+        run_with(
+            Arc::clone(&api),
+            vec![delta("写了一半"), complete("cancelled")],
+        )
+        .await;
+        assert_eq!(
+            messages(&api),
+            vec!["写了一半".to_string(), RelayTexts::default().cancelled]
+        );
 
         let api = Arc::new(FakeTg::default());
         let r = run_with(Arc::clone(&api), vec![complete("max_tokens")]).await;
@@ -1132,14 +1432,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn markdown_is_sent_as_html_and_falls_back_to_plain() {
         let api = Arc::new(FakeTg::default());
-        run_with(Arc::clone(&api), vec![delta("**总结**:磁盘 `/` 充裕"), complete("end_turn")]).await;
+        run_with(
+            Arc::clone(&api),
+            vec![delta("**总结**:磁盘 `/` 充裕"), complete("end_turn")],
+        )
+        .await;
         assert_eq!(messages(&api), vec!["<b>总结</b>:磁盘 <code>/</code> 充裕"]);
 
         let api = Arc::new(FakeTg {
             reject_html: true,
             ..Default::default()
         });
-        let r = run_with(Arc::clone(&api), vec![delta("**总结**"), complete("end_turn")]).await;
+        let r = run_with(
+            Arc::clone(&api),
+            vec![delta("**总结**"), complete("end_turn")],
+        )
+        .await;
         assert!(!r.delivery_failed);
         // 先试 HTML 被拒,再以原文纯文本发出
         assert_eq!(messages(&api), vec!["<b>总结</b>", "**总结**"]);
@@ -1162,7 +1470,7 @@ mod tests {
         assert!(!r.delivery_failed);
         // 编辑失败(消息已删)→ 另起一条,内容完整
         assert_eq!(messages(&api).last().unwrap(), "第一段、第二段");
-        assert_eq!(r.message_ids, vec![1, 2]);
+        assert_eq!(r.message_ids, vec![2]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1174,6 +1482,22 @@ mod tests {
         let r = run_with(Arc::clone(&api), vec![delta("hi"), complete("end_turn")]).await;
         assert!(r.delivery_failed);
         assert!(r.message_ids.is_empty(), "一条都没发出去 → 平台整条补发");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lagged_turn_removes_tool_status_only_from_its_known_message() {
+        let api = Arc::new(FakeTg::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(turn_with(api.clone()).run(rx));
+        tx.send(delta("partial body")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(tool_call("t", "Running tool", None)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(RelayInput::Lagged).unwrap();
+        let report = handle.await.unwrap();
+        assert!(!report.text_complete);
+        assert_eq!(messages(&api).len(), 1);
+        assert_eq!(edits(&api).last().unwrap(), "partial body");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1193,18 +1517,394 @@ mod tests {
         // 距上次更新已超过 1 秒,先到的字立刻发出(select 先取事件还是先触发计时器不确定,
         // 所以只断言「发了一条、内容是 abcd 的前缀」),余下攒到下一次一起写
         assert_eq!(messages(&api).len(), 1);
-        assert!("abcd".starts_with(messages(&api)[0].as_str()), "{:?}", messages(&api));
-        assert_eq!(edits(&api).last().unwrap(), "abcd");
+        assert!(
+            "abcd".starts_with(messages(&api)[0].as_str()),
+            "{:?}",
+            messages(&api)
+        );
+        // The select loop may consume the whole batch before its first write;
+        // then the original send already has abcd and no edit is needed.
+        assert_eq!(
+            edits(&api).pop().or_else(|| messages(&api).pop()).unwrap(),
+            "abcd"
+        );
 
         // 正文消息不会过期 → 没有新字就不再调用
         let before = api.calls.lock().unwrap().len();
         tokio::time::sleep(Duration::from_secs(20)).await;
-        assert_eq!(api.calls.lock().unwrap().len(), before, "静默时不打扰 Telegram");
+        assert_eq!(
+            api.calls.lock().unwrap().len(),
+            before,
+            "静默时不打扰 Telegram"
+        );
 
         tx.send(complete("end_turn")).unwrap();
         let r = handle.await.unwrap();
         assert_eq!(r.outcome, Outcome::Completed);
         assert_eq!(messages(&api).len(), 1, "全程只发了一条消息");
-        assert_eq!(edits(&api).last().unwrap(), "abcd");
+        assert_eq!(
+            edits(&api).pop().or_else(|| messages(&api).pop()).unwrap(),
+            "abcd"
+        );
+    }
+}
+
+pub async fn get_result(
+    db: &DatabaseConnection,
+    turn_id: &str,
+    format: ResultFormat,
+) -> Result<Option<serde_json::Value>, String> {
+    super::relay_outbox::get(db, turn_id)
+        .await?
+        .filter(|result| result["delivery_status"] != "running")
+        .map(|result| super::relay_result::for_wire(result, format))
+        .transpose()
+}
+
+pub(crate) fn admission_error(message: String) -> crate::app_error::AppCommandError {
+    use crate::app_error::{AppCommandError, AppErrorCode};
+    match message.as_str() {
+        "relay_turn_in_progress" | "relay_turn_already_exists" => {
+            AppCommandError::new(AppErrorCode::TurnInProgress, message)
+        }
+        "relay_storage_unavailable" => AppCommandError::task_execution_failed(message),
+        "relay_connection_not_found" => AppCommandError::not_found("connection_not_found"),
+        _ => AppCommandError::invalid_input(message),
+    }
+}
+
+/// Execute without an await while the exact worker identity remains locked.
+pub(crate) fn enqueue_if_current(
+    connection_id: &str,
+    turn_id: &str,
+    enqueue: impl FnOnce(),
+) -> bool {
+    let Some(relay) = RELAY.get() else {
+        return false;
+    };
+    let workers = relay.workers.lock().unwrap();
+    if workers
+        .get(connection_id)
+        .is_some_and(|w| w.turn_id == turn_id)
+    {
+        enqueue();
+        true
+    } else {
+        false
+    }
+}
+
+pub async fn cancel_turn(
+    state: &crate::app_state::AppState,
+    turn_id: &str,
+) -> Result<&'static str, String> {
+    let worker = RELAY.get().and_then(|relay| {
+        relay
+            .workers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, w)| w.turn_id == turn_id)
+            .map(|(id, w)| (id.clone(), w.generation))
+    });
+    if let Some((connection_id, generation)) = worker {
+        return state
+            .connection_manager
+            .cancel_relay_turn(&state.db.conn, &connection_id, turn_id, generation)
+            .await
+            .map(|cancelled| if cancelled { "cancelled" } else { "not_found" })
+            .map_err(|_| "relay cancel failed".into());
+    }
+    Ok(
+        match super::relay_outbox::get(&state.db.conn, turn_id).await? {
+            Some(result) if result["delivery_status"] != "running" => "terminal",
+            _ => "not_found",
+        },
+    )
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    #[test]
+    fn parallel_registrations_cannot_replace_the_winning_worker() {
+        let workers = Arc::new(StdMutex::new(HashMap::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let tasks: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                let workers = workers.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    barrier.wait();
+                    insert_worker(
+                        &mut workers.lock().unwrap(),
+                        "connection",
+                        Worker {
+                            turn_id: id.into(),
+                            generation: 0,
+                            start_seq: 0,
+                            tx,
+                        },
+                    )
+                    .map(|_| id)
+                })
+            })
+            .collect();
+        let winners: Vec<_> = tasks
+            .into_iter()
+            .filter_map(|t| t.join().unwrap().ok())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(workers.lock().unwrap()["connection"].turn_id, winners[0]);
+    }
+
+    #[test]
+    fn delayed_completion_takes_only_its_own_claim() {
+        let mut entries = vec![
+            Claim {
+                turn_id: "old".into(),
+                start_seq: 10,
+                at: std::time::Instant::now(),
+            },
+            Claim {
+                turn_id: "new".into(),
+                start_seq: 20,
+                at: std::time::Instant::now(),
+            },
+        ];
+        assert_eq!(
+            claim_for_event(&mut entries, 20, true).as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            claim_for_event(&mut entries, 21, false).as_deref(),
+            Some("new")
+        );
+        assert!(claim_for_event(&mut entries, 19, true).is_none());
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_turn_id_rejects_resubmission_before_any_agent_or_http_work() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::app_state::AppState::new_for_test(db, directory.path().to_owned());
+        super::super::relay_outbox::save(
+            &state.db.conn,
+            "already-done",
+            serde_json::json!({"delivery_status":"delivered"}),
+            None,
+            ResultFormat::Legacy,
+        )
+        .await
+        .unwrap();
+        let spec:OutboundSpec=serde_json::from_value(serde_json::json!({"kind":"telegram","turnId":"already-done","deliveryVersion":2,"botToken":"unused","chatId":1})).unwrap();
+        assert_eq!(
+            register_for_prompt(&state, "missing-connection", None, spec)
+                .await
+                .unwrap_err(),
+            "relay_turn_already_exists"
+        );
+        let spec:OutboundSpec=serde_json::from_value(serde_json::json!({"kind":"telegram","turnId":"not-admitted","deliveryVersion":2,"botToken":"unused","chatId":1})).unwrap();
+        assert_eq!(
+            register_for_prompt(&state, "missing-connection", None, spec)
+                .await
+                .unwrap_err(),
+            "relay_connection_not_found"
+        );
+        assert!(
+            get_result(&state.db.conn, "not-admitted", ResultFormat::Legacy)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[derive(Default)]
+    struct Scripted {
+        replies: StdMutex<VecDeque<Result<Option<i64>, TgError>>>,
+        calls: StdMutex<Vec<(String, serde_json::Value)>>,
+    }
+    #[async_trait]
+    impl TgApi for Scripted {
+        async fn call(
+            &self,
+            method: &str,
+            body: serde_json::Value,
+        ) -> Result<Option<i64>, TgError> {
+            self.calls.lock().unwrap().push((method.into(), body));
+            if method == "sendMessageDraft" {
+                return Ok(None);
+            }
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(Some(42)))
+        }
+    }
+    fn turn(api: Arc<Scripted>) -> TelegramTurn {
+        TelegramTurn {
+            api,
+            chat_id: 1,
+            draft_base: 1,
+            texts: RelayTexts::default(),
+        }
+    }
+    fn delta(text: &str) -> RelayInput {
+        input(AcpEvent::ContentDelta {
+            text: text.into(),
+            parent_tool_use_id: None,
+        })
+    }
+    fn input(payload: AcpEvent) -> RelayInput {
+        RelayInput::Event(Arc::new(EventEnvelope {
+            seq: 0,
+            connection_id: "c".into(),
+            payload,
+        }))
+    }
+    fn done() -> RelayInput {
+        input(AcpEvent::TurnComplete {
+            session_id: "s".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+            duration_ms: None,
+        })
+    }
+    #[tokio::test(start_paused = true)]
+    async fn unknown_send_is_never_replayed_as_plain_or_next_tick() {
+        let api = Arc::new(Scripted::default());
+        api.replies.lock().unwrap().push_back(Err(TgError::Unknown));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(turn(api.clone()).run(rx));
+        tx.send(delta("hello")).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tx.send(delta(" world")).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tx.send(done()).unwrap();
+        let report = worker.await.unwrap();
+        assert!(report.delivery_unknown);
+        assert_eq!(report.final_text, "hello world");
+        assert_eq!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "sendMessage")
+                .count(),
+            1
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn temporary_edit_failure_is_cleared_by_successful_final_edit() {
+        let api = Arc::new(Scripted::default());
+        api.replies.lock().unwrap().extend([
+            Ok(Some(7)),
+            Err(TgError::Other("Bad Request".into())),
+            Ok(None),
+        ]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(turn(api).run(rx));
+        tx.send(delta("one")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(delta(" two")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(done()).unwrap();
+        let report = worker.await.unwrap();
+        assert!(!report.delivery_failed);
+        assert_eq!(report.message_ids, vec![7]);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn repeated_full_text_render_does_not_advance_fence() {
+        let api = Arc::new(Scripted::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(turn(api.clone()).run(rx));
+        tx.send(delta("```rust\nfn a() {")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(delta("}\n```")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(done()).unwrap();
+        worker.await.unwrap();
+        let calls = api.calls.lock().unwrap();
+        let last = calls
+            .iter()
+            .rev()
+            .find(|(m, _)| m == "editMessageText")
+            .unwrap();
+        assert_eq!(
+            last.1["text"],
+            "<pre><code class=\"language-rust\">fn a() {}</code></pre>"
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_over_thirty_seconds_is_respected() {
+        let api = Arc::new(Scripted::default());
+        api.replies
+            .lock()
+            .unwrap()
+            .extend([Err(TgError::RetryAfter(45)), Ok(Some(8))]);
+        let start = Instant::now();
+        assert_eq!(
+            turn(api)
+                .call_with_retry("sendMessage", serde_json::json!({"text":"x"}))
+                .await
+                .unwrap(),
+            Some(8)
+        );
+        assert!(start.elapsed() >= Duration::from_secs(45));
+    }
+    #[test]
+    fn utf16_split_and_segment_join_preserve_the_reply() {
+        let mut composer = Composer::default();
+        let text = format!("{}\n{}", "😀".repeat(1900), "尾".repeat(40));
+        let heads = composer.push(&text);
+        assert!(heads.iter().all(|s| s.encode_utf16().count() <= TG_CHUNK));
+        assert_eq!(heads.join("") + composer.text(), text);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_whitespace_only_segments_keeps_contiguous_result_indices() {
+        let api = Arc::new(Scripted::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(delta(&format!("{}reply", " ".repeat(TG_CHUNK))))
+            .unwrap();
+        tx.send(done()).unwrap();
+        let report = turn(api).run(rx).await;
+        assert_eq!(report.segments.len(), 1);
+        assert_eq!(report.segments[0].index, 0);
+        assert_eq!(report.segments[0].text, "reply");
+        let compact = super::super::relay_result::compact(
+            serde_json::json!({"final_text":report.final_text,"segments":report.segments}),
+        )
+        .unwrap();
+        assert_eq!(compact["segments"][0]["text_start"], TG_CHUNK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telegram_terminal_note_and_emoji_compact_without_changing_segment_body() {
+        for stop_reason in ["cancelled", "refusal"] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(delta("🦀回答")).unwrap();
+            tx.send(input(AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: stop_reason.into(),
+                agent_type: "codex".into(),
+                duration_ms: None,
+            }))
+            .unwrap();
+            let report = turn(Arc::new(Scripted::default())).run(rx).await;
+            let original =
+                serde_json::json!({"final_text":report.final_text,"segments":report.segments});
+            let compact = super::super::relay_result::compact(original.clone()).unwrap();
+            assert_eq!(compact["segments"][0]["text_end"], 4);
+            assert_eq!(compact["segments"][1]["text_start"], 6);
+            assert_eq!(
+                super::super::relay_result::for_wire(compact, ResultFormat::Legacy).unwrap(),
+                original
+            );
+        }
     }
 }

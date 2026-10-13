@@ -42,6 +42,9 @@ pub fn build_router(
 
     let api = Router::new()
         .route("/health", post(health_check))
+        .route("/get_relay_capabilities", post(handlers::relay::get_relay_capabilities))
+        .route("/get_relay_result", post(handlers::relay::get_relay_result))
+        .route("/cancel_relay_turn", post(handlers::relay::cancel_relay_turn))
         // Debug endpoint: operator-facing snapshot of `EventBusMetrics`
         // (emit volume, lag/eviction counts, attach decision counts).
         // Sits behind the same auth middleware as every other route.

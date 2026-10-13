@@ -72,7 +72,20 @@ pub struct CliCancelParams {
 
 pub async fn cli_prompt(
     Extension(state): Extension<Arc<AppState>>,
-    Json(mut params): Json<CliPromptParams>,
+    Json(params): Json<CliPromptParams>,
+) -> Result<Json<CliPromptResult>, AppCommandError> {
+    if params.outbound.is_some() {
+        tokio::spawn(cli_prompt_inner(state, params))
+            .await
+            .map_err(|_| AppCommandError::task_execution_failed("relay submission interrupted"))?
+    } else {
+        cli_prompt_inner(state, params).await
+    }
+}
+
+async fn cli_prompt_inner(
+    state: Arc<AppState>,
+    mut params: CliPromptParams,
 ) -> Result<Json<CliPromptResult>, AppCommandError> {
     if params.blocks.is_empty() {
         return Err(coded_invalid(
@@ -109,6 +122,18 @@ pub async fn cli_prompt(
         }
     }
 
+    let prompt_guard = if params.outbound.is_some() {
+        Some(
+            manager
+                .clone_prompt_lock(&connection_id)
+                .await
+                .map_err(prompt_error)?
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
     // 须在提交之前登记,这一轮的事件才不会漏
     let relay_turn = match params.outbound.take() {
         Some(spec) => {
@@ -120,10 +145,20 @@ pub async fn cli_prompt(
             )
             .await
         }
-        None => None,
+        None => Ok(None),
+    };
+    let relay_turn = match relay_turn {
+        Ok(turn) => turn,
+        Err(error) => {
+            drop(prompt_guard);
+            if created {
+                let _ = manager.disconnect(&connection_id).await;
+            }
+            return Err(crate::chat_channel::turn_relay::admission_error(error));
+        }
     };
     let sent = manager
-        .send_prompt_linked_with_message_id(
+        .send_prompt_linked_under_lock(
             &state.db,
             &connection_id,
             params.blocks,
@@ -131,6 +166,7 @@ pub async fn cli_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            prompt_guard,
         )
         .await;
     let conversation_id = match sent {
@@ -385,11 +421,9 @@ mod tests {
     #[test]
     fn a_pi_session_id_is_a_uuid() {
         // pi 铸的是 uuidv7(`01a1271a-…`),走默认那条 uuid 校验。
-        assert!(validate_cli_session_id(
-            AgentType::Pi,
-            "01a1271a-81fb-7fbd-9bb4-5299598a4dbc"
-        )
-        .is_ok());
+        assert!(
+            validate_cli_session_id(AgentType::Pi, "01a1271a-81fb-7fbd-9bb4-5299598a4dbc").is_ok()
+        );
         assert!(validate_cli_session_id(AgentType::Pi, "session-x").is_err());
     }
 }
