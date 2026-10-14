@@ -21,3 +21,4 @@ pub mod types;
 pub mod webhook;
 
 mod relay_input;
+mod telegram_typing;

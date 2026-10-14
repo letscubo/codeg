@@ -26,7 +26,7 @@ const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// 没有新字时续草稿的间隔。草稿不更新约 10 秒就消失(见文件头),取一半留余量。
 const DRAFT_HEARTBEAT: Duration = Duration::from_secs(5);
 /// 一轮最长跟多久;超过按失败收尾,防止连接异常没有结束事件时 worker 常驻。
-const MAX_TURN: Duration = Duration::from_secs(3 * 60 * 60);
+pub(super) const MAX_TURN: Duration = Duration::from_secs(3 * 60 * 60);
 /// 认领记录保留多久(给 event_subscriber 取;正常在 turn_complete 时就取走了)。
 const CLAIM_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// 草稿 / 单条消息的字数上限。Telegram 是 4096(按 UTF-16 计),留余量给 emoji 之类双单元字符。
@@ -372,7 +372,11 @@ pub(crate) struct TelegramTurn {
 }
 
 impl TelegramTurn {
-    pub(crate) async fn run(self, mut rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
+    pub(crate) async fn run(self, rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
+        super::telegram_typing::run(self, rx).await
+    }
+
+    pub(super) async fn run_delivery(self, mut rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
         let deadline = Instant::now() + MAX_TURN;
         let mut body = Composer::default();
         let mut full_text = String::new();
@@ -1529,13 +1533,14 @@ mod tests {
             "abcd"
         );
 
-        // 正文消息不会过期 → 没有新字就不再调用
-        let before = api.calls.lock().unwrap().len();
+        // 正文消息不会过期 → 没有新字就不再写正文/草稿，typing 独立续期。
+        let body_calls = || messages(&api).len() + edits(&api).len() + drafts(&api).len();
+        let before = body_calls();
         tokio::time::sleep(Duration::from_secs(20)).await;
         assert_eq!(
-            api.calls.lock().unwrap().len(),
+            body_calls(),
             before,
-            "静默时不打扰 Telegram"
+            "静默时不重写正文或草稿"
         );
 
         tx.send(complete("end_turn")).unwrap();
@@ -1735,7 +1740,7 @@ mod regression_tests {
             body: serde_json::Value,
         ) -> Result<Option<i64>, TgError> {
             self.calls.lock().unwrap().push((method.into(), body));
-            if method == "sendMessageDraft" {
+            if matches!(method, "sendMessageDraft" | "sendChatAction") {
                 return Ok(None);
             }
             self.replies
