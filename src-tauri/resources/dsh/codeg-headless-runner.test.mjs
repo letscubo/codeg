@@ -1,10 +1,24 @@
 // Run: node --test src-tauri/resources/dsh/codeg-headless-runner.test.mjs
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { descendantsOf, entryOf, isBusy, launcherRoot, packageDir, settle, summarize } from "./codeg-headless-runner.mjs";
+import {
+  attachImagesToLine,
+  descendantsOf,
+  entryOf,
+  imageAttachingSink,
+  indexToolImages,
+  isBusy,
+  launcherRoot,
+  packageDir,
+  settle,
+  summarize,
+  toolImageFileName,
+  toolResultImages,
+  toolResultOf,
+} from "./codeg-headless-runner.mjs";
 
 /** A fake Agent: `run(ms)` makes it busy for `ms`, then idle. */
 function fakeAgent(id) {
@@ -122,4 +136,110 @@ test("launcherRoot / packageDir / entryOf follow a real npm global layout", () =
   assert.equal(entryOf(nested), join(nested, "lib", "index.js"));
   assert.equal(entryOf(hoisted), join(hoisted, "lib", "main.js"));
   assert.throws(() => packageDir(dsh, "dsh-missing"));
+});
+
+// ── tool-result images ─────────────────────────────────────────────────────
+// dsh's projection keeps text blocks only, so a screenshot reached codeg as an
+// empty result: the model saw it, the card and the history never did.
+
+/** A fake Session: events by seq, like dsh's own. */
+function fakeSession(events) {
+  return { seq: events.length, eventAt: (seq) => events[seq] };
+}
+
+/** 0.1.6 wraps the result in `content[0]`; 0.2.x puts it straight on `message`. */
+function toolResultEvent(callId, content, { nested = true } = {}) {
+  const result = { toolCallId: callId, content };
+  return {
+    type: "tool/result",
+    data: { message: nested ? { content: [result] } : result },
+  };
+}
+
+test("两种图片块形状都认: MCP 的 {data,mimeType} 和 Messages API 的 source.base64", () => {
+  assert.deepEqual(
+    toolResultImages([
+      { type: "text", text: "ok" },
+      { type: "image", data: "AAA", mimeType: "image/jpeg" },
+      { type: "image", source: { type: "base64", data: "BBB", media_type: "image/webp" } },
+    ]),
+    [
+      { data: "AAA", mimeType: "image/jpeg" },
+      { data: "BBB", mimeType: "image/webp" },
+    ],
+  );
+  assert.deepEqual(toolResultImages([{ type: "image", data: "CCC" }]), [{ data: "CCC", mimeType: "image/png" }]);
+  // 没有字节的(url 来源、空串)一律跳过 —— 落盘和卡片都只认字节
+  assert.deepEqual(toolResultImages([{ type: "image", data: "" }, { type: "image", source: { type: "url", url: "x" } }]), []);
+  for (const junk of [undefined, null, "", 42, [null, "x", { type: "text" }]]) {
+    assert.deepEqual(toolResultImages(junk), [], String(junk));
+  }
+});
+
+test("两代 dsh 的 tool/result 结构都认 —— 升级时图不会悄悄消失", () => {
+  const blocks = [{ type: "image", data: "AAA" }];
+  assert.equal(toolResultOf(toolResultEvent("c1", blocks))?.toolCallId, "c1", "0.1.6 的 content[0]");
+  assert.equal(toolResultOf(toolResultEvent("c1", blocks, { nested: false }))?.toolCallId, "c1", "0.2.x 的 message");
+  for (const junk of [undefined, null, {}, { data: {} }, { data: { message: { content: [] } } }]) {
+    assert.equal(toolResultOf(junk), undefined, JSON.stringify(junk));
+  }
+});
+
+test("文件名必须和 codeg 的 tool_image_path 逐字一致(sha256 of base64 文本, 前 32 位)", () => {
+  // 写死的值:codeg 的 Rust 侧对同一份输入算出同一个名字(connection.rs 有对应断言)。
+  // 两边任何一侧改了摘要算法,这里立刻红 —— 否则卡片会指向一个不存在的文件。
+  assert.equal(
+    toolImageFileName("iVBORw0KGgo=", "image/png"),
+    "929e08d597feae564ce98003c4a47ff5.png",
+    "摘要 = sha256(base64 文本) 的前 32 位十六进制",
+  );
+  // 扩展名跟 mime 走,`/file?path=` 那头据它决定 Content-Type
+  assert.ok(toolImageFileName("AAA", "image/jpeg").endsWith(".jpg"));
+  assert.ok(toolImageFileName("AAA", "image/webp").endsWith(".webp"));
+  assert.ok(toolImageFileName("AAA", "image/gif").endsWith(".gif"));
+  assert.ok(toolImageFileName("AAA", "application/octet-stream").endsWith(".png"), "认不出的 mime 回落 png");
+  // 同样的字节 → 同一个文件;不同的图不能互相覆盖
+  assert.equal(toolImageFileName("AAA", "image/png"), toolImageFileName("AAA", "image/png"));
+  assert.notEqual(toolImageFileName("AAA", "image/png"), toolImageFileName("BBB", "image/png"));
+});
+
+test("图落在会话目录的隐藏子目录里,行上只留路径(不把 100KB base64 塞进 32KiB 的流)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codeg-media-"));
+  const data = Buffer.from("hello-png").toString("base64");
+  const session = fakeSession([toolResultEvent("c1", [{ type: "image", data, mimeType: "image/png" }])]);
+  const written = [];
+  const sink = imageAttachingSink({ write: (chunk) => written.push(chunk) }, session, (n) => n, dir);
+
+  sink.write(`${JSON.stringify({ type: "tool_call", callId: "c1", tool: "screenshot" })}\n`);
+  sink.write(`${JSON.stringify({ type: "tool_result", callId: "c1", status: "completed", result: "" })}\n`);
+
+  assert.equal(JSON.parse(written[0]).images, undefined, "tool_call 行不该被改");
+  const out = JSON.parse(written[1]);
+  assert.equal(out.images.length, 1);
+  assert.equal(out.images[0].mimeType, "image/png");
+  assert.equal(out.images[0].path, join(dir, ".codeg-media", toolImageFileName(data, "image/png")));
+  assert.equal(readFileSync(out.images[0].path, "utf8"), "hello-png", "字节真的落盘了");
+  assert.ok(!written[1].includes(data), "行上不该出现 base64");
+});
+
+test("只改写带图的 tool_result 行,其余逐字节原样透传", () => {
+  const lookup = (callId) => (callId === "c1" ? [{ path: "/x/a.png", mimeType: "image/png" }] : undefined);
+  const noImages = `${JSON.stringify({ type: "tool_result", callId: "c2", result: "ok" })}\n`;
+  assert.equal(attachImagesToLine(noImages, lookup), noImages);
+  const other = `${JSON.stringify({ type: "tool_call", callId: "c1" })}\n`;
+  assert.equal(attachImagesToLine(other, lookup), other);
+  assert.equal(attachImagesToLine('{"type":"tool_result" oops\n', lookup), '{"type":"tool_result" oops\n');
+  assert.equal(attachImagesToLine("", lookup), "");
+  const ok = JSON.parse(attachImagesToLine(`${JSON.stringify({ type: "tool_result", callId: "c1", status: "completed" })}\n`, lookup));
+  assert.equal(ok.status, "completed", "原有字段必须保留");
+});
+
+test("写盘失败不打断一轮,只是那张图没有", () => {
+  const session = fakeSession([toolResultEvent("c1", [{ type: "image", data: "AAA" }])]);
+  const into = new Map();
+  // 指向一个普通文件,mkdir 必失败
+  const file = join(mkdtempSync(join(tmpdir(), "codeg-media-")), "not-a-dir");
+  writeFileSync(file, "x");
+  assert.doesNotThrow(() => indexToolImages(session, (n) => n, 0, into, file));
+  assert.equal(into.size, 0, "失败的图不留半条记录");
 });

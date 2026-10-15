@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::stream_json::{
-    CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_END_TURN, STOP_UNKNOWN,
+    tool_result_images, CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_END_TURN,
+    STOP_UNKNOWN,
 };
 use super::tool_info::ToolInfo;
-use crate::acp::types::AcpEvent;
+use crate::acp::types::{AcpEvent, ToolCallImageInfo};
 
 pub struct CodexStreamMapper {
     cwd: Option<PathBuf>,
@@ -212,7 +213,7 @@ impl CodexStreamMapper {
                     raw_output_append: None,
                     locations: None,
                     meta: None,
-                    images: None,
+                    images: codex_item_images(item),
                 });
                 events
             }
@@ -335,6 +336,24 @@ fn tool_input(item: &Value) -> Value {
         "webSearch" => json!({ "query": item["query"] }),
         _ => json!({}),
     }
+}
+
+/// Images a completed tool item produced.
+///
+/// Only `mcpToolCall` carries any: codex hands the MCP result through untouched,
+/// so `result.content` is the server's own block list and the shared
+/// `tool_result_images` reads it exactly as it does for pi. Unlike dsh there is
+/// nothing to work around here — the bytes were always on the wire, we simply
+/// never picked them up, so a screenshot's card and history came up empty.
+///
+/// `imageGeneration` items are deliberately left out: codex delivers those as a
+/// saved file, not as inline bytes, and the card already links it.
+fn codex_item_images(item: &Value) -> Option<Vec<ToolCallImageInfo>> {
+    if item["type"].as_str() != Some("mcpToolCall") {
+        return None;
+    }
+    let images = tool_result_images(&item["result"]["content"]);
+    (!images.is_empty()).then_some(images)
 }
 
 /// What the card shows as the call's result.
@@ -671,5 +690,37 @@ mod tests {
         );
         assert!(tool_failed(&item));
         assert_eq!(tool_output(&item), Value::String("boom".into()));
+    }
+
+    /// MCP 工具的截图:codex 把 MCP 结果原样转交,`result.content` 就是服务端自己的
+    /// 块列表,所以和 pi 用同一个提取函数。以前这里写死 None,图在卡片和历史里都丢了。
+    #[test]
+    fn mcp_tool_call_keeps_its_images() {
+        let item = serde_json::json!({
+            "type": "mcpToolCall",
+            "result": {"content": [
+                {"type": "text", "text": "window state"},
+                {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+            ]},
+        });
+        let images = codex_item_images(&item).expect("images kept");
+        assert_eq!(images.len(), 2, "只认 base64 且非空的图");
+        assert_eq!((images[0].data.as_str(), images[0].mime_type.as_str()), ("iVBORw0KGgo=", "image/png"));
+        assert_eq!((images[1].data.as_str(), images[1].mime_type.as_str()), ("/9j/4AAQ", "image/jpeg"));
+    }
+
+    /// 别的工具种类不碰:命令执行没有图,imageGeneration 走存盘文件、卡片已经给了链接。
+    #[test]
+    fn non_mcp_items_have_no_images() {
+        for item in [
+            serde_json::json!({"type": "commandExecution", "aggregatedOutput": "ok"}),
+            serde_json::json!({"type": "imageGeneration", "result": {"content": [{"type": "image", "data": "AAA"}]}}),
+            serde_json::json!({"type": "mcpToolCall", "result": {"content": [{"type": "text", "text": "ok"}]}}),
+            serde_json::json!({"type": "mcpToolCall", "error": {"message": "boom"}}),
+        ] {
+            assert!(codex_item_images(&item).is_none(), "{item}");
+        }
     }
 }

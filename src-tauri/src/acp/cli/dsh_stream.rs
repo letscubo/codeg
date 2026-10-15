@@ -16,7 +16,7 @@ use super::dsh_tool_info::dsh_tool_info;
 use super::stream_json::{
     CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_END_TURN, STOP_UNKNOWN,
 };
-use crate::acp::types::AcpEvent;
+use crate::acp::types::{AcpEvent, ToolCallImageInfo};
 
 /// `turn_end.reason.error.code` values that mean the credential was refused.
 const AUTH_CODES: &[&str] = &[
@@ -247,8 +247,44 @@ fn on_tool_result(v: &Value) -> Vec<AcpEvent> {
         raw_output_append: None,
         locations: None,
         meta: None,
-        images: None,
+        images: dsh_result_images(v),
     }]
+}
+
+/// Images our headless runner saved beside the turn and named on the line.
+///
+/// Stock dsh never sends them: its projection runs the result blocks through
+/// `resultText`, which keeps `type: "text"` only, so a screenshot reached us as
+/// `result: ""` — the model had seen it, the card and the history never did.
+///
+/// The runner we ship in its place writes the bytes under the session directory
+/// and puts `images: [{path, mimeType}]` on the line. **Paths, not bytes**: that
+/// stream is bounded on purpose (8 KiB per string, 32 KiB per event), and one
+/// screenshot is 100 KiB+. The driver reads the file back for the live card;
+/// the self-recorded transcript keeps only the path. See
+/// `resources/dsh/codeg-headless-runner.mjs`.
+///
+/// `CODEG_DSH_RUNNER=stock` (or an older runner beside a newer codeg) simply
+/// omits the field, and this returns `None` exactly as before.
+fn dsh_result_images(v: &Value) -> Option<Vec<ToolCallImageInfo>> {
+    let images: Vec<ToolCallImageInfo> = v["images"]
+        .as_array()?
+        .iter()
+        .filter_map(|img| {
+            let path = img["path"].as_str().filter(|p| p.starts_with('/'))?;
+            Some(ToolCallImageInfo {
+                // Bytes stay on disk; `uri` is how a path-only image travels.
+                data: String::new(),
+                mime_type: img["mimeType"]
+                    .as_str()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("image/png")
+                    .to_string(),
+                uri: Some(format!("file://{path}")),
+            })
+        })
+        .collect();
+    (!images.is_empty()).then_some(images)
 }
 
 /// Stop reasons use the strings `acp::lifecycle` maps to conversation status.
@@ -540,5 +576,55 @@ mod tests {
         )
         .is_empty());
         assert!(events(m.map_line(&json!({"type":"something_new"}).to_string())).is_empty());
+    }
+
+    /// 我们换上的 runner 把截图落在会话目录、行上只报路径(dsh 的流单条上限 32 KiB,
+    /// 塞不进 base64)。这里只认路径,字节由 driver 的 hydrate_disk_images 读回来。
+    #[test]
+    fn tool_result_picks_up_image_paths_our_runner_wrote() {
+        let mut m = mapper();
+        let line = json!({
+            "type": "tool_result",
+            "callId": "c1",
+            "status": "completed",
+            "result": "",
+            "images": [
+                {"path": "/home/ubuntu/.myclaw/sessions/s1/.codeg-media/abc.png", "mimeType": "image/png"},
+                {"path": "/home/ubuntu/.myclaw/sessions/s1/.codeg-media/def.jpg", "mimeType": "image/jpeg"},
+                {"path": "relative/nope.png", "mimeType": "image/png"},
+                {"mimeType": "image/png"},
+            ],
+        });
+        let evs = events(m.map_line(&line.to_string()));
+        let AcpEvent::ToolCallUpdate { images, raw_output, .. } = &evs[0] else {
+            panic!("not a tool_call_update");
+        };
+        let images = images.as_ref().expect("images kept");
+        assert_eq!(images.len(), 2, "相对路径和没有路径的都要跳过");
+        assert_eq!(
+            images[0].uri.as_deref(),
+            Some("file:///home/ubuntu/.myclaw/sessions/s1/.codeg-media/abc.png"),
+        );
+        assert_eq!(images[0].mime_type, "image/png");
+        assert!(images[0].data.is_empty(), "字节留在盘上,不走这条流");
+        assert_eq!(images[1].mime_type, "image/jpeg");
+        assert_eq!(raw_output.as_deref(), Some("\"\""), "纯图结果的文本仍是空串");
+    }
+
+    /// 没有 images 字段(stock runner、或比 codeg 旧的 runner)时照旧,不是错误。
+    #[test]
+    fn tool_result_without_images_stays_none() {
+        let mut m = mapper();
+        for line in [
+            json!({"type":"tool_result","callId":"c1","status":"completed","result":"ok"}),
+            json!({"type":"tool_result","callId":"c1","status":"completed","result":"ok","images":[]}),
+            json!({"type":"tool_result","callId":"c1","status":"completed","result":"ok","images":"nope"}),
+        ] {
+            let evs = events(m.map_line(&line.to_string()));
+            let AcpEvent::ToolCallUpdate { images, .. } = &evs[0] else {
+                panic!("not a tool_call_update");
+            };
+            assert!(images.is_none(), "{line}");
+        }
     }
 }

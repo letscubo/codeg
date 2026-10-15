@@ -418,7 +418,7 @@ impl PiDriver {
             ..
         } = &event
         {
-            crate::acp::connection::persist_tool_images(images);
+            crate::acp::connection::persist_tool_images(images, Some(&self.working_dir));
         }
         if let AcpEvent::SessionStarted { session_id } = &event {
             record.session_id = Some(session_id.clone());
@@ -427,7 +427,7 @@ impl PiDriver {
                     .await;
                 record.prompt_recorded = true;
             }
-        } else if let (Some(sid), Some(update)) = (&record.session_id, transcript_update_for(&event))
+        } else if let (Some(sid), Some(update)) = (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
         {
             record_transcript_update(self.agent_type, sid, &update);
         }

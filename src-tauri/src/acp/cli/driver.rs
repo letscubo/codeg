@@ -507,7 +507,7 @@ impl CliDriver {
             ..
         } = &event
         {
-            crate::acp::connection::persist_tool_images(images);
+            crate::acp::connection::persist_tool_images(images, Some(&self.working_dir));
         }
         let sidechain_prose = matches!(
             &event,
@@ -520,7 +520,7 @@ impl CliDriver {
             }
         );
         if !sidechain_prose {
-            if let Some(update) = super::dsh_driver::transcript_update_for(&event) {
+            if let Some(update) = super::dsh_driver::transcript_update_for(&event, Some(&self.working_dir)) {
                 record_transcript_update(self.agent_type, session_id, &update);
             }
         }

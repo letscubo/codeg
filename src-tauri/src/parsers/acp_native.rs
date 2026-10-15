@@ -113,7 +113,12 @@ impl AgentParser for AcpNativeParser {
                 conversation_id.to_string(),
             ));
         }
-        let turns = project_turns(&transcript.entries);
+        // 工具截图落在会话自己的目录下 —— 表头的 cwd 就是实时那侧写盘时用的那个
+        let session_dir = transcript
+            .header
+            .as_ref()
+            .map(|h| std::path::Path::new(h.cwd.as_str()));
+        let turns = project_turns_in(&transcript.entries, session_dir);
         let (used, size) = latest_context_window(&transcript.entries);
         let session_stats =
             crate::parsers::merge_context_window_stats(session_stats(&turns), used, size);
@@ -384,7 +389,25 @@ fn latest_context_window(entries: &[TranscriptEntry]) -> (Option<u64>, Option<u6
 }
 
 /// Project recorded transcript entries into turns.
+///
+/// Tool images replay from the shared pool — the pre-session layout. Callers
+/// that know which session this transcript belongs to should use
+/// [`project_turns_in`] so a screenshot resolves inside that session's own
+/// directory (see `tool_image_path`).
 pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
+    project_turns_in(entries, None)
+}
+
+/// [`project_turns`], told where the session's own directory is.
+///
+/// `session_dir` is the transcript header's `cwd` — the working directory the
+/// session was created in. It only steers where tool images are REPORTED from;
+/// the live side wrote them under the same directory from the connection's cwd,
+/// so both sides still agree without talking to each other.
+pub fn project_turns_in(
+    entries: &[TranscriptEntry],
+    session_dir: Option<&std::path::Path>,
+) -> Vec<MessageTurn> {
     let mut turns: Vec<MessageTurn> = Vec::new();
     let mut pending: Option<PendingTurn> = None;
     // True between a recorded outgoing prompt and the first agent output: the
@@ -477,6 +500,7 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                 apply_update(
                     update,
                     entry.t,
+                    session_dir,
                     &mut pending,
                     &mut turns,
                     &mut seq,
@@ -579,6 +603,7 @@ fn parse_usage(value: &serde_json::Value) -> Option<TurnUsage> {
 fn apply_update(
     update: SessionUpdate,
     at_ms: u64,
+    session_dir: Option<&std::path::Path>,
     pending: &mut Option<PendingTurn>,
     turns: &mut Vec<MessageTurn>,
     seq: &mut usize,
@@ -667,6 +692,7 @@ fn apply_update(
             let id = tc.tool_call_id.to_string();
             let status = format!("{:?}", tc.status).to_lowercase();
             upsert_tool_call(
+                session_dir,
                 p,
                 &id,
                 Some(tc.title.clone()),
@@ -684,6 +710,7 @@ fn apply_update(
             let id = tcu.tool_call_id.to_string();
             let status = tcu.fields.status.map(|s| format!("{s:?}").to_lowercase());
             upsert_tool_call(
+                session_dir,
                 p,
                 &id,
                 tcu.fields.title.clone(),
@@ -730,6 +757,7 @@ fn content_block_text(block: &sacp::schema::ContentBlock) -> String {
 /// looks identical whether it is streaming or reloaded from disk.
 #[allow(clippy::too_many_arguments)]
 fn upsert_tool_call(
+    session_dir: Option<&std::path::Path>,
     pending: &mut PendingTurn,
     id: &str,
     title: Option<String>,
@@ -778,7 +806,7 @@ fn upsert_tool_call(
     // pi 的代理工具把同一张图从 ACP 图片块和 details.mcpResult 各送一份
     let images: Vec<ImageData> = dedupe_tool_images(all_images)
         .into_iter()
-        .map(|img| match tool_image_path(&img) {
+        .map(|img| match tool_image_path(&img, session_dir) {
             Some(path) => ImageData {
                 data: String::new(),
                 mime_type: img.mime_type,
@@ -1464,6 +1492,7 @@ mod tests {
                 meta: None,
                 images: Some(vec![img.clone()]),
             },
+            None,
         )
         .expect("recorded");
         let mut entries = pi_mcp_call(serde_json::json!(null));
@@ -1473,7 +1502,7 @@ mod tests {
         assert_eq!(output_preview.as_deref(), Some("window state"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "", "历史只报路径");
-        let expected = format!("file://{}", crate::acp::connection::tool_image_path(&img).unwrap().display());
+        let expected = format!("file://{}", crate::acp::connection::tool_image_path(&img, None).unwrap().display());
         assert_eq!(images[0].uri.as_deref(), Some(expected.as_str()));
     }
 

@@ -11337,6 +11337,13 @@ pub(crate) fn content_duplicates_raw_output_images(
     serde_json::from_str::<serde_json::Value>(content_text).is_ok_and(|parsed| &parsed == raw)
 }
 
+/// Sub-directory of a session's own directory holding what its tools produced.
+///
+/// Hidden on purpose: it is codeg's bookkeeping, and the session directory is
+/// also where the agent puts the files the user asked for. A dot-directory keeps
+/// a dozen hash-named PNGs out of that listing.
+pub(crate) const SESSION_TOOL_MEDIA_DIR: &str = ".codeg-media";
+
 /// Where this image's bytes live on disk — derived from the bytes themselves.
 ///
 /// Both halves of the system need the same answer without talking to each other:
@@ -11345,9 +11352,23 @@ pub(crate) fn content_duplicates_raw_output_images(
 /// the path when the transcript is replayed, possibly on another day. A digest of
 /// the payload is the only thing both of them already hold.
 ///
-/// `None` for anything that is not base64 image data, so a malformed block can
-/// never steer a write somewhere unexpected.
-pub(crate) fn tool_image_path(img: &ToolCallImageInfo) -> Option<std::path::PathBuf> {
+/// `session_dir` is the turn's working directory — for MyClaw, the session's own
+/// directory. Passing it keeps a session's output together with everything else
+/// that session produced, so deleting the session takes its screenshots with it.
+/// The live and replay sides both derive it from the same place (the connection's
+/// cwd / the transcript header's `cwd`), so they still agree without talking.
+///
+/// `None` falls back to the shared pool. That is the pre-session layout: images
+/// written before this change stay reachable at the path already recorded in
+/// MyClaw's message rows, and a transcript whose header predates `cwd` still
+/// replays somewhere real.
+///
+/// Returns `None` for anything that is not base64 image data, so a malformed
+/// block can never steer a write somewhere unexpected.
+pub(crate) fn tool_image_path(
+    img: &ToolCallImageInfo,
+    session_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     if img.data.is_empty() {
         return None;
     }
@@ -11359,7 +11380,44 @@ pub(crate) fn tool_image_path(img: &ToolCallImageInfo) -> Option<std::path::Path
     };
     use sha2::{Digest as _, Sha256};
     let digest = format!("{:x}", Sha256::digest(img.data.as_bytes()));
-    Some(crate::paths::codeg_tool_media_root().join(format!("{}.{ext}", &digest[..32])))
+    let root = match session_dir {
+        Some(dir) => dir.join(SESSION_TOOL_MEDIA_DIR),
+        None => crate::paths::codeg_tool_media_root(),
+    };
+    Some(root.join(format!("{}.{ext}", &digest[..32])))
+}
+
+/// A path-only image → its bytes, read back from disk.
+///
+/// dsh's runner writes the file itself and sends only the path: its JSON stream
+/// is bounded on purpose (32 KiB an event) and a screenshot is far past that.
+/// Two consumers need the bytes anyway:
+///   · the live card — MyClaw renders a `data:` URI and skips an image with no
+///     bytes, since the browser cannot reach a file inside the container;
+///   · the self-recorded transcript — `tool_image_path` derives the file name
+///     FROM the bytes, so without them it cannot name the very file we just read.
+///
+/// Images that already carry their bytes (claude / pi / the ACP channel) are
+/// left alone. Best effort: an unreadable file only costs that one picture.
+pub(crate) fn hydrate_disk_images(images: &mut [ToolCallImageInfo]) {
+    use base64::Engine as _;
+    for img in images.iter_mut() {
+        if !img.data.is_empty() {
+            continue;
+        }
+        let Some(path) = img
+            .uri
+            .as_deref()
+            .and_then(|uri| uri.strip_prefix("file://"))
+            .filter(|p| p.starts_with('/'))
+        else {
+            continue;
+        };
+        match std::fs::read(path) {
+            Ok(bytes) => img.data = base64::engine::general_purpose::STANDARD.encode(bytes),
+            Err(e) => tracing::debug!("tool image unreadable at {path}: {e}"),
+        }
+    }
 }
 
 /// Put a tool result's images on disk, once, next to every other one.
@@ -11367,9 +11425,12 @@ pub(crate) fn tool_image_path(img: &ToolCallImageInfo) -> Option<std::path::Path
 /// Best effort by contract: a failed write only means the history card has no
 /// picture, and a turn must never fail over that. Skips a file that already
 /// exists — the same screenshot in two turns is one file.
-pub(crate) fn persist_tool_images(images: &[ToolCallImageInfo]) {
+pub(crate) fn persist_tool_images(
+    images: &[ToolCallImageInfo],
+    session_dir: Option<&std::path::Path>,
+) {
     for img in images {
-        let Some(path) = tool_image_path(img) else { continue };
+        let Some(path) = tool_image_path(img, session_dir) else { continue };
         if path.exists() {
             continue;
         }
@@ -14709,7 +14770,7 @@ async fn emit_conversation_update(
             );
             // 落盘一次,历史重放时只报路径(见 tool_image_path)
             if let Some(imgs) = images.as_deref() {
-                persist_tool_images(imgs);
+                persist_tool_images(imgs, cwd.map(std::path::Path::new));
             }
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
@@ -14982,7 +15043,7 @@ async fn emit_conversation_update(
                 tcu.fields.raw_output.as_ref(),
             );
             if let Some(imgs) = images.as_deref() {
-                persist_tool_images(imgs);
+                persist_tool_images(imgs, cwd.map(std::path::Path::new));
             }
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
@@ -25009,20 +25070,114 @@ mod tests {
             mime_type: mime.to_string(),
             uri: None,
         };
-        let a = tool_image_path(&img("iVBORw0KGgo=", "image/png")).expect("有路径");
-        let b = tool_image_path(&img("iVBORw0KGgo=", "image/png")).expect("有路径");
+        let a = tool_image_path(&img("iVBORw0KGgo=", "image/png"), None).expect("有路径");
+        let b = tool_image_path(&img("iVBORw0KGgo=", "image/png"), None).expect("有路径");
         assert_eq!(a, b, "同样的字节必须落同一个文件");
 
-        let other = tool_image_path(&img("R0lGODlhAQ==", "image/png")).expect("有路径");
+        let other = tool_image_path(&img("R0lGODlhAQ==", "image/png"), None).expect("有路径");
         assert_ne!(a, other, "不同的图不能互相覆盖");
 
         // 扩展名跟着 mime 走,`/file?path=` 那头据它决定 Content-Type
-        let jpg = tool_image_path(&img("iVBORw0KGgo=", "image/jpeg")).expect("有路径");
+        let jpg = tool_image_path(&img("iVBORw0KGgo=", "image/jpeg"), None).expect("有路径");
         assert_eq!(jpg.extension().and_then(|e| e.to_str()), Some("jpg"));
         assert_eq!(a.extension().and_then(|e| e.to_str()), Some("png"));
 
         // 不是图片数据就绝不给出写入位置
-        assert!(tool_image_path(&img("", "image/png")).is_none());
+        assert!(tool_image_path(&img("", "image/png"), None).is_none());
+    }
+
+    /// 跨语言锁:dsh 的 runner 是 JS,它自己落盘、自己命名,codeg 这边重放时要**算出同一个名字**
+    /// 而不读磁盘。两边任何一侧动了摘要算法,这里和 codeg-headless-runner.test.mjs 同时红。
+    #[test]
+    fn the_js_runner_and_rust_agree_on_the_file_name() {
+        let img = ToolCallImageInfo {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+            uri: None,
+        };
+        let path = tool_image_path(&img, Some(std::path::Path::new("/s1"))).expect("有路径");
+        assert_eq!(
+            path,
+            std::path::Path::new("/s1/.codeg-media/929e08d597feae564ce98003c4a47ff5.png"),
+            "摘要 = sha256(base64 文本) 前 32 位;目录名与 runner 的 SESSION_TOOL_MEDIA_DIR 一致",
+        );
+    }
+
+    /// 只报路径的图(dsh runner 落的盘)要能把字节读回来 —— 实时卡片和自录线路都要它。
+    #[test]
+    fn a_path_only_image_is_read_back_from_disk() {
+        let dir = std::env::temp_dir().join(format!("codeg-hydrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let file = dir.join("shot.png");
+        std::fs::write(&file, b"hello-png").expect("写文件");
+
+        let mut images = vec![
+            // 只有路径:要被读回来
+            ToolCallImageInfo {
+                data: String::new(),
+                mime_type: "image/png".into(),
+                uri: Some(format!("file://{}", file.display())),
+            },
+            // 本来就带字节(claude / pi / ACP 通道):一个字都不能动
+            ToolCallImageInfo {
+                data: "QUFB".into(),
+                mime_type: "image/png".into(),
+                uri: None,
+            },
+            // 读不到的、相对路径的:跳过,不炸
+            ToolCallImageInfo {
+                data: String::new(),
+                mime_type: "image/png".into(),
+                uri: Some("file:///nope/missing.png".into()),
+            },
+            ToolCallImageInfo {
+                data: String::new(),
+                mime_type: "image/png".into(),
+                uri: Some("file://relative.png".into()),
+            },
+        ];
+        hydrate_disk_images(&mut images);
+
+        use base64::Engine as _;
+        assert_eq!(
+            images[0].data,
+            base64::engine::general_purpose::STANDARD.encode(b"hello-png"),
+        );
+        assert_eq!(images[1].data, "QUFB", "已有字节的不碰");
+        assert!(images[2].data.is_empty(), "读不到只是没图,不是错误");
+        assert!(images[3].data.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 会话目录版:同一张图在**自己会话的目录下**落盘,删会话就一起没了。
+    /// 两侧仍然不通信 —— 实时侧用连接的 cwd,历史侧用 transcript 表头的 cwd,同一个值。
+    #[test]
+    fn a_session_directory_keeps_its_own_tool_images() {
+        let img = ToolCallImageInfo {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+            uri: None,
+        };
+        let sess = std::path::Path::new("/home/ubuntu/.myclaw/sessions/s1");
+        let a = tool_image_path(&img, Some(sess)).expect("有路径");
+        let b = tool_image_path(&img, Some(sess)).expect("有路径");
+        assert_eq!(a, b, "同一个会话里,同样的字节还是同一个文件");
+        assert!(a.starts_with(sess), "必须落在会话目录内:{}", a.display());
+        assert_eq!(
+            a.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            Some(SESSION_TOOL_MEDIA_DIR),
+            "放在隐藏子目录里,不污染用户在会话里建的文件",
+        );
+
+        // 换个会话 → 换个位置。这正是「产物跟着会话走」的意思
+        let other = std::path::Path::new("/home/ubuntu/.myclaw/sessions/s2");
+        assert_ne!(a, tool_image_path(&img, Some(other)).expect("有路径"));
+
+        // 没有会话目录(存量 transcript、表头早于 cwd)照旧回落共享池,老图仍然打得开
+        let shared = tool_image_path(&img, None).expect("有路径");
+        assert!(!shared.starts_with(sess));
+        assert_eq!(shared, tool_image_path(&img, None).expect("有路径"));
     }
 
     /// Text riding alongside the image still reaches the card, and a result with
