@@ -265,7 +265,7 @@ async fn put(upload_url: &str, mime: &str, body: Vec<u8>) -> Result<(), String> 
 /// 让 delegation listener 通过 trait 调到本模块 —— listener 不直接依赖 commands。
 ///
 /// 名字沿用最早的上传用途,实际上它是「用本实例凭证访问 MyClaw 平台」的那个口子:平台工具
-/// (`platform_catalog` / `platform_call`,见 commands/myclaw_platform.rs)也挂在这里,
+/// (`platform_*` / `agent_tool_*`,见 commands/myclaw_platform.rs)也挂在这里,
 /// 免得为同一份凭证再往 DelegationListener 的构造函数里加一个参数。两者都有默认实现
 /// (= 不可用),测试里的桩不用改。
 #[async_trait::async_trait]
@@ -292,6 +292,23 @@ pub trait ArtifactUploadAccess: Send + Sync {
         _identity: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err("platform tools are unavailable".to_string())
+    }
+
+    /// 动态授权的 Agent 工具目录。identity 必须来自认证 transport,不能实例级缓存。
+    async fn agent_tool_catalog(
+        &self,
+        _identity: serde_json::Value,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+        Ok((Vec::new(), None))
+    }
+
+    async fn agent_tool_call(
+        &self,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _identity: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("agent tools are unavailable".to_string())
     }
 }
 
@@ -330,6 +347,22 @@ impl ArtifactUploadAccess for DbArtifactUpload {
         identity: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         crate::commands::myclaw_platform::call(&self.db, name, arguments, identity).await
+    }
+
+    async fn agent_tool_catalog(
+        &self,
+        identity: serde_json::Value,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+        crate::commands::myclaw_platform::agent_catalog(&self.db, identity).await
+    }
+
+    async fn agent_tool_call(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        identity: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        crate::commands::myclaw_platform::agent_call(&self.db, name, arguments, identity).await
     }
 }
 

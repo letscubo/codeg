@@ -11,6 +11,10 @@
 //!
 //! 以后加工具只发平台,不用发 codeg。
 //!
+//! 动态授权的 Agent 工具(如 3D)使用另外两条签名 POST:`/api/codeg/agent-tools`
+//! 与 `/api/codeg/agent-tools/call`。目录不使用实例级缓存;身份和显式会话 selector
+//! 都在签名 body 中,由平台检查实时权限及精确归属。旧实例不读取上面的管理工具目录。
+//!
 //! ## 签名
 //!
 //! 不再把密钥放在查询串里(`?vmId&s=` 会被反代日志原样记下)。用同一把密钥做 HMAC:
@@ -46,6 +50,9 @@ use crate::db::AppDatabase;
 const EVENTS_PATH: &str = "/api/codeg/events";
 pub const CATALOG_PATH: &str = "/api/codeg/tools";
 pub const CALL_PATH: &str = "/api/codeg/tools/call";
+/// 身份相关的 Agent 工具走独立通道,不与 all 实例的管理工具目录混用。
+pub const AGENT_CATALOG_PATH: &str = "/api/codeg/agent-tools";
+pub const AGENT_CALL_PATH: &str = "/api/codeg/agent-tools/call";
 
 /// 清单缓存:成功 5 分钟,失败 30 秒(不是平台托管 / 平台暂时不可达时别每次都打)。
 const CATALOG_TTL_OK: Duration = Duration::from_secs(300);
@@ -269,6 +276,41 @@ pub async fn overview(db: &AppDatabase) -> Result<Option<String>, String> {
     Ok(overview_of(&catalog_data(db).await?))
 }
 
+/// Agent 工具授权可能随用户、会话或 App grant 改变,不能使用实例级清单缓存。
+/// identity 在 JSON body 内,因此与整个请求一并签名。
+pub async fn agent_catalog(
+    db: &AppDatabase,
+    identity: Value,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    let data = post_signed(
+        db,
+        AGENT_CATALOG_PATH,
+        serde_json::json!({ "identity": identity }),
+        CATALOG_TIMEOUT,
+    )
+    .await?;
+    Ok((tools_of(&data), overview_of(&data)))
+}
+
+pub async fn agent_call(
+    db: &AppDatabase,
+    name: &str,
+    arguments: Value,
+    identity: Value,
+) -> Result<Value, String> {
+    let data = post_signed(
+        db,
+        AGENT_CALL_PATH,
+        serde_json::json!({ "name": name, "arguments": arguments, "identity": identity }),
+        CALL_TIMEOUT,
+    )
+    .await?;
+    data.get("result")
+        .cloned()
+        .filter(|r| r.get("content").is_some())
+        .ok_or_else(|| "the platform returned no tool result".to_string())
+}
+
 fn tools_of(data: &Value) -> Vec<Value> {
     data.get("tools")
         .and_then(|t| t.as_array())
@@ -385,6 +427,55 @@ mod tests {
         assert_eq!(
             sign("test-webhook-secret", 1790000000, "GET", CATALOG_PATH, ""),
             "YtOx5Ry7-R9n1HW6OYxk56K6sYem7zNKpLdBrnIU3Zg"
+        );
+    }
+
+    #[test]
+    fn agent_catalog_signature_covers_identity_and_uses_its_own_path() {
+        let body = r#"{"identity":{"agentKey":"legacy-openclaw"}}"#;
+        assert_eq!(signature_payload(1790000000, "POST", AGENT_CATALOG_PATH, body),
+            "1790000000\nPOST\n/api/codeg/agent-tools\n88f933371d08b55b732397396d6285d57649133001c5780c9ab07cc9e0a95b0d");
+        assert_eq!(
+            sign(
+                "test-webhook-secret",
+                1790000000,
+                "POST",
+                AGENT_CATALOG_PATH,
+                body
+            ),
+            "j2Yk8mAHGuuFrvF-Y13gNdT8VvIBIXrLZ14_7KWmlMk",
+        );
+        assert_ne!(
+            sign(
+                "test-webhook-secret",
+                1790000000,
+                "POST",
+                AGENT_CATALOG_PATH,
+                body
+            ),
+            sign(
+                "test-webhook-secret",
+                1790000000,
+                "POST",
+                CATALOG_PATH,
+                body
+            ),
+        );
+        assert_ne!(
+            sign(
+                "test-webhook-secret",
+                1790000000,
+                "POST",
+                AGENT_CATALOG_PATH,
+                body
+            ),
+            sign(
+                "test-webhook-secret",
+                1790000000,
+                "POST",
+                AGENT_CATALOG_PATH,
+                r#"{"identity":{"agentKey":"legacy-hermes"}}"#
+            ),
         );
     }
 
