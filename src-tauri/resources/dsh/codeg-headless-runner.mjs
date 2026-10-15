@@ -219,13 +219,46 @@ export function summarize(session, firstSeq, SessionSeq = (n) => n) {
 // file without ever reading the disk. Keep `toolImageFileName` and
 // `SESSION_TOOL_MEDIA_DIR` in lockstep with `acp::connection::tool_image_path`.
 
-/** Image blocks of one tool result → `{data, mimeType}[]`. Base64 bytes only. */
-export function toolResultImages(blocks) {
+/** The `<path>…</path>` a dsh file result puts in its text block. */
+function pathFromTextBlock(block) {
+  if (block === null || typeof block !== "object" || block.type !== "text") return undefined;
+  if (typeof block.text !== "string") return undefined;
+  const found = /<path>([^<]+)<\/path>/.exec(block.text);
+  const path = found?.[1]?.trim();
+  return path !== undefined && path.startsWith("/") ? path : undefined;
+}
+
+/**
+ * Images of one tool result, each as either `{path}` (already a file) or
+ * `{data}` (base64 we still have to write).
+ *
+ * dsh does NOT put bytes in the event. Its image block is an attachment
+ * reference — `{type:"image", attachment:{attachmentId, mediaType, …}}` — and
+ * the tool has already written the file into the session directory. The path
+ * rides along in the sibling text block (`<path>…</path>`), with the event's
+ * `meta.path` as a fallback for a single-file result (2026-10-15, verified
+ * against a real screenshot turn).
+ *
+ * The base64 shapes (MCP's `{data, mimeType}` and the Messages API's
+ * `source.base64`) stay supported: a different MCP server reached through dsh
+ * may still answer that way, and then we are the ones who must write the file.
+ */
+export function toolResultImages(blocks, metaPath) {
   if (!Array.isArray(blocks)) return [];
+  const filePaths = blocks.map(pathFromTextBlock).filter((p) => p !== undefined);
+  let nextPath = 0;
   const out = [];
   for (const block of blocks) {
     if (block === null || typeof block !== "object" || block.type !== "image") continue;
-    // MCP sends `{data, mimeType}`; the Messages API shape nests it under `source`.
+    // dsh: the bytes are already a file; carry its path, do not copy it.
+    if (block.attachment !== null && typeof block.attachment === "object") {
+      const path = filePaths[nextPath++] ?? (typeof metaPath === "string" ? metaPath : undefined);
+      if (typeof path !== "string" || !path.startsWith("/")) continue;
+      const mimeType = block.attachment.mediaType;
+      out.push({ path, mimeType: typeof mimeType === "string" && mimeType ? mimeType : "image/png" });
+      continue;
+    }
+    // MCP / Messages API: the bytes are inline, so we write the file ourselves.
     const base64 = block.source?.type === "base64" ? block.source : undefined;
     const data = typeof block.data === "string" ? block.data : base64?.data;
     if (typeof data !== "string" || data === "") continue;
@@ -308,7 +341,12 @@ export function indexToolImages(session, SessionSeq, from, into, sessionDir) {
     const result = toolResultOf(event);
     if (result === undefined) continue;
     const written = [];
-    for (const image of toolResultImages(result.content)) {
+    for (const image of toolResultImages(result.content, event.data?.meta?.path)) {
+      // Already a file (dsh's own attachments): carry the path as is.
+      if (image.path !== undefined) {
+        written.push({ path: image.path, mimeType: image.mimeType });
+        continue;
+      }
       try {
         written.push({ path: writeToolImage(sessionDir, image), mimeType: image.mimeType });
       } catch (err) {

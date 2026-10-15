@@ -1,7 +1,7 @@
 // Run: node --test src-tauri/resources/dsh/codeg-headless-runner.test.mjs
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -156,7 +156,38 @@ function toolResultEvent(callId, content, { nested = true } = {}) {
   };
 }
 
-test("两种图片块形状都认: MCP 的 {data,mimeType} 和 Messages API 的 source.base64", () => {
+test("dsh 的 image 块是附件引用,字节早就是磁盘上的文件了 —— 带上它的路径,不复制", () => {
+  // 这是 2026-10-15 从 C10 一轮真实截图里抄下来的形状
+  const blocks = [
+    {
+      type: "text",
+      text: "<path>/home/ubuntu/.myclaw/sessions/s1/example_com.png</path>\n<type>image</type>\n<content>\nimage/png image, 780x493 px, 51727 bytes\n</content>",
+    },
+    {
+      type: "image",
+      attachment: {
+        attachmentId: "sha256:4aa3df4405ba6fa5",
+        mediaType: "image/png",
+        bytes: 51727,
+        width: 780,
+        height: 493,
+        name: "example_com.png",
+      },
+    },
+  ];
+  assert.deepEqual(toolResultImages(blocks), [
+    { path: "/home/ubuntu/.myclaw/sessions/s1/example_com.png", mimeType: "image/png" },
+  ]);
+  // 文本块没给路径时,回落到事件的 meta.path
+  assert.deepEqual(toolResultImages([blocks[1]], "/home/ubuntu/.myclaw/sessions/s1/shot.png"), [
+    { path: "/home/ubuntu/.myclaw/sessions/s1/shot.png", mimeType: "image/png" },
+  ]);
+  // 两者都没有、或路径不是绝对路径 → 跳过,绝不瞎编一个位置
+  assert.deepEqual(toolResultImages([blocks[1]]), []);
+  assert.deepEqual(toolResultImages([blocks[1]], "relative/x.png"), []);
+});
+
+test("带 base64 的两种形状仍然认(别的 MCP server 可能这么答),这时字节由我们落盘", () => {
   assert.deepEqual(
     toolResultImages([
       { type: "text", text: "ok" },
@@ -169,7 +200,7 @@ test("两种图片块形状都认: MCP 的 {data,mimeType} 和 Messages API 的 
     ],
   );
   assert.deepEqual(toolResultImages([{ type: "image", data: "CCC" }]), [{ data: "CCC", mimeType: "image/png" }]);
-  // 没有字节的(url 来源、空串)一律跳过 —— 落盘和卡片都只认字节
+  // 没有字节也没有附件的(url 来源、空串)一律跳过
   assert.deepEqual(toolResultImages([{ type: "image", data: "" }, { type: "image", source: { type: "url", url: "x" } }]), []);
   for (const junk of [undefined, null, "", 42, [null, "x", { type: "text" }]]) {
     assert.deepEqual(toolResultImages(junk), [], String(junk));
@@ -220,6 +251,33 @@ test("图落在会话目录的隐藏子目录里,行上只留路径(不把 100KB
   assert.equal(out.images[0].path, join(dir, ".codeg-media", toolImageFileName(data, "image/png")));
   assert.equal(readFileSync(out.images[0].path, "utf8"), "hello-png", "字节真的落盘了");
   assert.ok(!written[1].includes(data), "行上不该出现 base64");
+});
+
+test("dsh 附件形状: 路径原样上行,一个字节都不复制", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codeg-media-"));
+  const shot = join(dir, "example_com.png");
+  writeFileSync(shot, "png-bytes");
+  const event = {
+    type: "tool/result",
+    data: {
+      meta: { path: shot },
+      message: {
+        content: [
+          {
+            toolCallId: "c9",
+            content: [
+              { type: "text", text: `<path>${shot}</path>\n<type>image</type>` },
+              { type: "image", attachment: { mediaType: "image/png", name: "example_com.png" } },
+            ],
+          },
+        ],
+      },
+    },
+  };
+  const into = new Map();
+  indexToolImages(fakeSession([event]), (n) => n, 0, into, dir);
+  assert.deepEqual(into.get("c9"), [{ path: shot, mimeType: "image/png" }]);
+  assert.ok(!existsSync(join(dir, ".codeg-media")), "附件已经是文件,不该再抄一份进 .codeg-media");
 });
 
 test("只改写带图的 tool_result 行,其余逐字节原样透传", () => {
