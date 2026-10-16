@@ -70,11 +70,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   jq/ripgrep/less/vim-tiny   → agent 在容器内自助操作的高频工具;
 #   sudo                       → 下面的免密提权;
 #   supervisor                 → 通用进程守护 (PID1,见文件头);
-#   libicu74                   → OfficeCLI(.NET 单二进制)缺它直接 FailFast。
+#   libicu74                   → OfficeCLI(.NET 单二进制)缺它直接 FailFast;
+#   poppler-utils              → codeg 内置 pdf_read / pdf_render(pdftotext / pdftoppm)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git git-lfs jq ripgrep unzip zip less vim-tiny \
       python3 python3-pip python3-venv build-essential sudo tini locales tzdata \
-      supervisor libicu74 \
+      supervisor libicu74 poppler-utils \
  && locale-gen en_US.UTF-8 \
  && rm -rf /var/lib/apt/lists/*
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8

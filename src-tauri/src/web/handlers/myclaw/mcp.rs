@@ -88,10 +88,11 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use crate::acp::delegation::companion::{
-    instructions_with_overview, is_embedded_tool_name, render_platform_result,
-    render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME, TOOL_SCHEMA_JSON,
+    enabled_embedded_tools, instructions_with_overview, is_embedded_tool_name,
+    render_platform_result, render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME,
 };
 use crate::app_state::AppState;
+use crate::commands::myclaw_office::{self, OfficeGroup};
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
 use crate::web::handlers::myclaw::download::ServerToken;
 
@@ -99,6 +100,21 @@ use crate::web::handlers::myclaw::download::ServerToken;
 /// fork: `platform` = 平台工具(名字与 schema 由 MyClaw 平台下发,见 commands::myclaw_platform)。
 /// 它们只需要 agent 级身份(URL 末段),不需要会话级的 parent_connection_id,所以这条传输也能开。
 const HTTP_FEATURES: &str = "uploads,platform";
+
+/// 实际开启的组:[`HTTP_FEATURES`] + 内置 Office 工具(同样只要 agent 级身份)。
+/// documents / presentations / spreadsheets 只在装了 officecli 时开,与 stdio 注入同一判据;
+/// pdf 常开,缺什么由各工具自己报。这条传输没有会话目录,Office 工具只认绝对路径或 `~`。
+fn http_features() -> String {
+    let office = myclaw_office::host_office_features();
+    let mut groups: Vec<&str> = HTTP_FEATURES.split(',').collect();
+    groups.extend(
+        OfficeGroup::ALL
+            .into_iter()
+            .filter(|g| office.enabled(*g))
+            .map(OfficeGroup::feature),
+    );
+    groups.join(",")
+}
 
 /// 与 companion 自报的一致(companion.rs 的 `initialize`)。两处必须同版本,否则同一个
 /// 伴生在两条传输上自称不同协议版本。
@@ -195,14 +211,14 @@ fn envelope_err(id: Value, code: i32, message: impl Into<String>) -> Value {
     })
 }
 
-fn initialize_result(overview: Option<&str>) -> Value {
+fn initialize_result(overview: Option<&str>, features: CompanionFeatures) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "serverInfo": { "name": COMPANION_SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
         "capabilities": { "tools": {} },
         // 与 stdio 那条同一段文字 —— 交付义务只写一处,见 COMPANION_INSTRUCTIONS;
         // 后面接平台下发的工具总览(见 instructions_with_overview)。
-        "instructions": instructions_with_overview(overview),
+        "instructions": instructions_with_overview(overview, features.office),
     })
 }
 
@@ -220,23 +236,7 @@ async fn platform_overview_for_init(uploads: &dyn ArtifactUploadAccess) -> Optio
 /// 嵌入的 schema 是**全部**伴生工具的数组;按本传输开启的组过滤,关掉的组一律不
 /// 露面。与 companion 的 `tools/list` 同一份数据、同一个判据(`allows_tool`)。
 fn tools_list_result(features: CompanionFeatures) -> Result<Value, String> {
-    let all: Value =
-        serde_json::from_str(TOOL_SCHEMA_JSON).map_err(|e| format!("embedded schema invalid: {e}"))?;
-    let tools = match all.as_array() {
-        Some(arr) => Value::Array(
-            arr.iter()
-                .filter(|t| {
-                    t.get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|n| features.allows_tool(n))
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect(),
-        ),
-        None => all,
-    };
-    Ok(json!({ "tools": tools }))
+    Ok(json!({ "tools": enabled_embedded_tools(&features)? }))
 }
 
 /// 一次 `tools/call`。`uploads` 是注入进来的,测试据此不必起真实 DB。
@@ -300,6 +300,10 @@ async fn call_tool(
             };
             // 成功只回链接一行、失败回 isError + 原因 —— 渲染与 stdio 共用同一函数。
             envelope_ok(id, render_upload_result(&outcome))
+        }
+        // 内置 Office 工具:与 stdio 同一份实现;这条传输没有会话目录(working_dir = None)。
+        office if OfficeGroup::of_tool(office).is_some() => {
+            envelope_ok(id, myclaw_office::call(office, &arguments, None).await)
         }
         other => envelope_err(id, -32602, format!("unknown tool: {other}")),
     }
@@ -390,11 +394,11 @@ pub async fn rpc(
     let Some(id) = req.id else {
         return StatusCode::ACCEPTED.into_response();
     };
-    let features = CompanionFeatures::parse(Some(HTTP_FEATURES));
+    let features = CompanionFeatures::parse(Some(&http_features()));
     let body = match req.method.as_str() {
         "initialize" => {
             let overview = platform_overview_for_init(&StateUpload(&state.db)).await;
-            envelope_ok(id, initialize_result(overview.as_deref()))
+            envelope_ok(id, initialize_result(overview.as_deref(), features))
         }
         "tools/list" => match tools_list_with_platform(&StateUpload(&state.db), features).await {
             Ok(result) => envelope_ok(id, result),
@@ -453,7 +457,8 @@ pub async fn entry(
     if !valid_agent_segment(&agent) {
         return (StatusCode::BAD_REQUEST, "invalid agent segment").into_response();
     }
-    let features = CompanionFeatures::parse(Some(HTTP_FEATURES));
+    let enabled = http_features();
+    let features = CompanionFeatures::parse(Some(&enabled));
     let tools = match tools_list_result(features) {
         Ok(v) => v["tools"]
             .as_array()
@@ -485,7 +490,7 @@ pub async fn entry(
         // 127.0.0.1:同容器内的 openclaw / pi 直连,不出网、不经公网路由。
         url: format!("http://127.0.0.1:{}/api/myclaw/mcp/{agent}", codeg_port()),
         headers: hdrs,
-        features: HTTP_FEATURES.split(',').map(str::to_string).collect(),
+        features: enabled.split(',').map(str::to_string).collect(),
         tools,
     })
     .into_response()
@@ -545,6 +550,41 @@ mod tests {
             assert_eq!(out["error"]["code"], -32602, "{name} must be refused");
             assert_eq!(out["error"]["message"], format!("unknown tool: {name}"));
         }
+    }
+
+    /// fork: 内置 Office 工具走同一个端点;这条传输没有会话目录,相对路径要明确报错。
+    #[tokio::test]
+    async fn office_tools_are_served_here_and_need_absolute_paths() {
+        let with_pdf = CompanionFeatures::parse(Some("uploads,platform,pdf"));
+        let listed = tool_names(&tools_list_result(with_pdf).unwrap());
+        assert_eq!(
+            listed,
+            vec!["upload_file", "pdf_guide", "pdf_export", "pdf_read", "pdf_render"]
+        );
+        let out = call_tool(
+            &StubUpload(Ok(String::new())),
+            "va-abc",
+            json!(9),
+            with_pdf,
+            Some(json!({ "name": "pdf_read", "arguments": { "path": "report.pdf" } })),
+        )
+        .await;
+        assert!(out.get("error").is_none(), "must not be a JSON-RPC error");
+        assert_eq!(out["result"]["isError"], true);
+        assert!(out["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("absolute"));
+        // 组没开:与不存在的工具同一句
+        let off = call_tool(
+            &StubUpload(Ok(String::new())),
+            "va-abc",
+            json!(10),
+            features(),
+            Some(json!({ "name": "pdf_read", "arguments": { "path": "/tmp/x.pdf" } })),
+        )
+        .await;
+        assert_eq!(off["error"]["message"], "unknown tool: pdf_read");
     }
 
     #[tokio::test]
@@ -718,7 +758,7 @@ mod tests {
 
     #[test]
     fn initialize_matches_the_stdio_companion() {
-        let r = initialize_result(None);
+        let r = initialize_result(None, features());
         assert_eq!(r["protocolVersion"], "2024-11-05");
         assert_eq!(r["serverInfo"]["name"], COMPANION_SERVER_NAME);
         // 交付义务只写一处:两条传输自报同一段 instructions
@@ -762,8 +802,19 @@ mod tests {
             .unwrap();
         let entry: Value = serde_json::from_slice(&body).unwrap();
         assert!(entry.get("agentToolsProtocolVersion").is_none());
-        assert_eq!(entry["features"], json!(["uploads", "platform"]));
-        assert_eq!(entry["tools"], json!(["upload_file"]));
+        // 前两组固定;其后是本机开着的内置 Office 组(pdf 常开,另三组看有没有 officecli)
+        let features: Vec<String> = serde_json::from_value(entry["features"].clone()).unwrap();
+        assert_eq!(&features[..2], ["uploads", "platform"]);
+        assert!(features.contains(&"pdf".to_string()));
+        assert!(features[2..]
+            .iter()
+            .all(|f| ["documents", "pdf", "presentations", "spreadsheets"].contains(&f.as_str())));
+        assert_eq!(entry["tools"][0], json!("upload_file"));
+        assert!(entry["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "pdf_read"));
         assert_eq!(
             entry["headers"]["Authorization"],
             format!("Bearer {}", agent_token(SECRET, AGENT).unwrap())
@@ -777,12 +828,12 @@ mod tests {
     /// 平台给了工具总览就接在交付说明后面;没给就原样。
     #[test]
     fn initialize_appends_the_platform_overview() {
-        let r = initialize_result(Some("MyClaw platform tools …\n- apps: …"));
+        let r = initialize_result(Some("MyClaw platform tools …\n- apps: …"), features());
         let text = r["instructions"].as_str().unwrap();
         assert!(text.starts_with(COMPANION_INSTRUCTIONS));
         assert!(text.ends_with("- apps: …"));
         assert_eq!(
-            initialize_result(Some("   "))["instructions"],
+            initialize_result(Some("   "), features())["instructions"],
             COMPANION_INSTRUCTIONS
         );
     }

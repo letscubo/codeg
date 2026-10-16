@@ -1047,6 +1047,8 @@ impl ConnectionManager {
         let injected = if blocks.is_empty() {
             None
         } else {
+            // fork(letscubo): 用户 `@` 了内置 Office 能力 → 这一轮直接带上指南(commands::myclaw_office)
+            crate::commands::myclaw_office::preload_mentioned_guides(&mut blocks).await;
             self.plan_myclaw_memory(conn_id, &mut blocks).await
         };
         let result = self

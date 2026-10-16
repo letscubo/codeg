@@ -564,6 +564,11 @@ impl DelegationListener {
                 // 一次有界的平台请求;高风险工具在平台侧只建待确认记录,不在这里阻塞等人
                 platform_call_response(self.process_platform_call(req).await)?
             }
+            BrokerMessage::OfficeTool(req) => {
+                // 本机跑一次 officecli / poppler / chromium,各自有超时(commands::myclaw_office),
+                // 不长轮询、无可取消的副作用
+                platform_call_response(self.process_office(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -874,6 +879,18 @@ impl DelegationListener {
         self.uploads
             .platform_call(&req.name, req.arguments, identity)
             .await
+    }
+
+    /// fork(letscubo)专属: 内置 Office 工具。相对路径按 token 登记时的会话目录解析 ——
+    /// 与 authoring_context 同一条规则,不信 companion 自报。
+    async fn process_office(
+        &self,
+        req: crate::acp::delegation::transport::BrokerOfficeRequest,
+    ) -> Result<Value, String> {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return Err("invalid token".to_string());
+        };
+        Ok(crate::commands::myclaw_office::call(&req.name, &req.arguments, Some(&entry.working_dir)).await)
     }
 
     /// 校验 token 后把上传交给实现。失败原因原样回给模型 —— 它要据此决定重试还是收手。

@@ -47,18 +47,20 @@ use crate::acp::chat_authoring::{
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_create_automation_round_trip, client_create_work_task_round_trip,
-    client_feedback_round_trip, client_platform_call_round_trip,
+    client_feedback_round_trip, client_office_round_trip, client_platform_call_round_trip,
     client_platform_catalog_round_trip, client_resume_task_round_trip, client_round_trip,
     client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
     client_task_progress_round_trip, client_upload_round_trip, BrokerAskRequest,
     BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
     BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
-    BrokerPlatformCallRequest, BrokerPlatformCatalogRequest, BrokerRequest, BrokerResponse,
+    BrokerOfficeRequest, BrokerPlatformCallRequest, BrokerPlatformCatalogRequest, BrokerRequest,
+    BrokerResponse,
     BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerTaskCompleteRequest,
     BrokerTaskProgressRequest, BrokerUploadRequest,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
+use crate::commands::myclaw_office::{self, OfficeGroup};
 use crate::models::AutomationAction;
 
 /// Upper bound on one broker-side cancel round-trip. Bounds both
@@ -211,6 +213,50 @@ pub struct CompanionFeatures {
     /// commands::myclaw_platform),`tools/list` 时向父进程取清单合并,内置表里没有的名字
     /// 在 `tools/call` 时转给平台。
     pub platform: bool,
+    /// fork(letscubo)专属: 内置 Office 工具四组(commands::myclaw_office)。
+    pub office: OfficeFeatures,
+}
+
+/// fork(letscubo)专属: documents / pdf / presentations / spreadsheets 各自的开关。
+/// `--features` 里的 token 就是组名,也是工具名前缀。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OfficeFeatures {
+    pub documents: bool,
+    pub pdf: bool,
+    pub presentations: bool,
+    pub spreadsheets: bool,
+}
+
+impl OfficeFeatures {
+    pub const NONE: OfficeFeatures = OfficeFeatures {
+        documents: false,
+        pdf: false,
+        presentations: false,
+        spreadsheets: false,
+    };
+
+    pub fn enabled(&self, group: OfficeGroup) -> bool {
+        match group {
+            OfficeGroup::Documents => self.documents,
+            OfficeGroup::Pdf => self.pdf,
+            OfficeGroup::Presentations => self.presentations,
+            OfficeGroup::Spreadsheets => self.spreadsheets,
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.documents || self.pdf || self.presentations || self.spreadsheets
+    }
+
+    fn set(&mut self, token: &str) {
+        match token {
+            "documents" => self.documents = true,
+            "pdf" => self.pdf = true,
+            "presentations" => self.presentations = true,
+            "spreadsheets" => self.spreadsheets = true,
+            _ => {}
+        }
+    }
 }
 
 impl CompanionFeatures {
@@ -232,6 +278,7 @@ impl CompanionFeatures {
                 taskboard: false,
                 uploads: false,
                 platform: false,
+                office: OfficeFeatures::NONE,
             };
         };
         let mut f = Self {
@@ -244,6 +291,7 @@ impl CompanionFeatures {
             taskboard: false,
             uploads: false,
             platform: false,
+            office: OfficeFeatures::NONE,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -256,7 +304,7 @@ impl CompanionFeatures {
                 "taskboard" => f.taskboard = true,
                 "uploads" => f.uploads = true,
                 "platform" => f.platform = true,
-                _ => {}
+                other => f.office.set(other),
             }
         }
         f
@@ -274,9 +322,32 @@ impl CompanionFeatures {
             "upload_file" => self.uploads,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation"
             | "resume_delegation" => self.delegation,
-            _ => false,
+            other => OfficeGroup::of_tool(other).is_some_and(|g| self.office.enabled(g)),
         }
     }
+}
+
+/// 内置工具的全部定义:伴生自己的 schema + 内置 Office 工具,顺序固定。
+/// `tools/list`(stdio 与 HTTP)与「平台工具不得同名」的判定都以它为准。
+pub fn embedded_tools() -> Result<Vec<Value>, String> {
+    let base: Value = serde_json::from_str(TOOL_SCHEMA_JSON)
+        .map_err(|e| format!("embedded schema invalid: {e}"))?;
+    let mut tools = base.as_array().cloned().unwrap_or_default();
+    tools.extend(myclaw_office::tools_for(|_| true));
+    Ok(tools)
+}
+
+/// 按开启的组过滤后的内置工具(不含平台工具、不改委派枚举)。
+pub fn enabled_embedded_tools(features: &CompanionFeatures) -> Result<Vec<Value>, String> {
+    Ok(embedded_tools()?
+        .into_iter()
+        .filter(|t| {
+            t.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| features.allows_tool(n))
+                .unwrap_or(false)
+        })
+        .collect())
 }
 
 /// Process arguments threaded through every `tools/call` so the dispatcher
@@ -368,9 +439,7 @@ pub fn request_id_key(id: &Value) -> String {
 fn embedded_tool_names() -> &'static HashSet<String> {
     static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        serde_json::from_str::<Value>(TOOL_SCHEMA_JSON)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
+        embedded_tools()
             .unwrap_or_default()
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
@@ -423,11 +492,46 @@ async fn append_platform_tools(ctx: &CompanionContext, tools: &mut Value) {
 /// fork(letscubo)专属: 伴生的 MCP `instructions` —— 自己的交付说明,后面接平台下发的工具总览。
 /// 按需加载工具的 runtime(claude_code、hermes)起初只看得到工具名,靠这段才知道平台工具能做什么。
 /// 没有总览(不是平台托管 / 平台不可达 / 老平台)时就是原来那段。stdio 与 HTTP 两条传输共用。
-pub fn instructions_with_overview(overview: Option<&str>) -> String {
-    match overview.map(str::trim).filter(|o| !o.is_empty()) {
-        Some(o) => format!("{COMPANION_INSTRUCTIONS}\n\n{o}"),
-        None => COMPANION_INSTRUCTIONS.to_string(),
+pub fn instructions_with_overview(overview: Option<&str>, office: OfficeFeatures) -> String {
+    let mut out = COMPANION_INSTRUCTIONS.to_string();
+    if let Some(section) = office_instructions(office) {
+        out.push_str("\n\n");
+        out.push_str(&section);
     }
+    if let Some(o) = overview.map(str::trim).filter(|o| !o.is_empty()) {
+        out.push_str("\n\n");
+        out.push_str(o);
+    }
+    out
+}
+
+/// fork(letscubo)专属: 开了 Office 组时追加的一段 —— 只列开着的格式。工具名写的是不带前缀的
+/// 后半截,与上面 `upload_file` 同一写法(各 runtime 的前缀不同,模型照工具表上的全名调)。
+pub fn office_instructions(office: OfficeFeatures) -> Option<String> {
+    if !office.any() {
+        return None;
+    }
+    let mut lines = vec![
+        "OFFICE FILES. This server also carries the tools for making Office files and PDFs. Before you build \
+or edit one, call the matching guide tool and follow it:"
+            .to_string(),
+    ];
+    for (on, line) in [
+        (office.presentations, "- decks (.pptx): presentations_guide, then presentations_check + presentations_render"),
+        (office.documents, "- Word documents (.docx): documents_guide, then documents_check + documents_render"),
+        (office.spreadsheets, "- workbooks (.xlsx): spreadsheets_guide, then spreadsheets_check + spreadsheets_render"),
+        (office.pdf, "- PDFs: pdf_guide; pdf_export / pdf_read / pdf_render"),
+    ] {
+        if on {
+            lines.push(line.to_string());
+        }
+    }
+    lines.push(
+        "Run the check and render tools and LOOK at the images before you deliver — a file that was \
+never rendered has not been verified. Then deliver it with upload_file."
+            .to_string(),
+    );
+    Some(lines.join("\n"))
 }
 
 /// 向父进程取平台工具总览(与 tools/list 同一个封顶;父进程有缓存)。
@@ -548,7 +652,7 @@ pub async fn dispatch_line(
                     },
                     "capabilities": { "tools": {} },
                     // 服务器自述,客户端并进系统提示 —— 见 COMPANION_INSTRUCTIONS 的注释。
-                    "instructions": instructions_with_overview(overview.as_deref()),
+                    "instructions": instructions_with_overview(overview.as_deref(), ctx.features.office),
                 }),
             ))
         }
@@ -556,29 +660,9 @@ pub async fn dispatch_line(
             // The embedded schema is a JSON array of every tool the companion
             // can carry; filter to the groups enabled for this launch so a
             // disabled feature's tools never surface to the LLM.
-            let all: Value = match serde_json::from_str(TOOL_SCHEMA_JSON) {
-                Ok(v) => v,
-                Err(e) => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32603,
-                        format!("embedded schema invalid: {e}"),
-                    ));
-                }
-            };
-            let mut tools = match all.as_array() {
-                Some(arr) => Value::Array(
-                    arr.iter()
-                        .filter(|t| {
-                            t.get("name")
-                                .and_then(|v| v.as_str())
-                                .map(|n| ctx.features.allows_tool(n))
-                                .unwrap_or(false)
-                        })
-                        .cloned()
-                        .collect(),
-                ),
-                None => all,
+            let mut tools = match enabled_embedded_tools(&ctx.features) {
+                Ok(list) => Value::Array(list),
+                Err(e) => return LineAction::Respond(err(id, -32603, e)),
             };
             remove_disabled_agents_from_delegate_enum(&mut tools, &ctx.disabled_agents);
             append_custom_agents_to_delegate_enum(&mut tools, &ctx.custom_agents);
@@ -981,6 +1065,17 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_create_work_task_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_authoring_result).await
+        }
+        office if OfficeGroup::of_tool(office).is_some() => {
+            // fork(letscubo)专属: 参数校验与执行都在父进程(commands::myclaw_office)——
+            // 那里才知道会话目录,失败原因也要原样回给模型。结果是完整的 CallToolResult。
+            let req = BrokerOfficeRequest {
+                token: ctx.token.clone(),
+                name: office.to_string(),
+                arguments,
+            };
+            let round_trip = Box::pin(async move { client_office_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_platform_result).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -1824,6 +1919,7 @@ mod tests {
             taskboard: false,
             uploads: false,
             platform: false,
+            office: OfficeFeatures::NONE,
         })
     }
 
@@ -2417,6 +2513,7 @@ mod tests {
         taskboard: false,
         uploads: false,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2428,6 +2525,7 @@ mod tests {
         taskboard: false,
         uploads: false,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2439,6 +2537,7 @@ mod tests {
         taskboard: false,
         uploads: false,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2450,6 +2549,7 @@ mod tests {
         taskboard: false,
         uploads: false,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -2790,6 +2890,7 @@ mod tests {
         taskboard: false,
         uploads: true,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
 
     #[tokio::test]
@@ -2843,6 +2944,94 @@ mod tests {
             .contains("300000000"));
     }
 
+    // -- fork(letscubo): 内置 Office 工具 -----------------------------------
+
+    const UPLOADS_AND_DECKS: CompanionFeatures = CompanionFeatures {
+        uploads: true,
+        office: OfficeFeatures {
+            documents: false,
+            pdf: false,
+            presentations: true,
+            spreadsheets: false,
+        },
+        ..UPLOADS_ONLY
+    };
+
+    #[test]
+    fn office_groups_parse_from_features() {
+        let f = CompanionFeatures::parse(Some("uploads,presentations,pdf"));
+        assert!(f.uploads && f.office.presentations && f.office.pdf);
+        assert!(!f.office.documents && !f.office.spreadsheets);
+        assert!(f.allows_tool("presentations_render"));
+        assert!(f.allows_tool("pdf_read"));
+        assert!(!f.allows_tool("documents_guide"));
+        assert!(!f.allows_tool("presentations_nope"));
+    }
+
+    #[tokio::test]
+    async fn office_tools_listed_only_for_enabled_groups() {
+        let line = json!({ "jsonrpc": "2.0", "id": 70, "method": "tools/list" }).to_string();
+        let names = list_tool_names(dispatch_with_features(UPLOADS_AND_DECKS, &line).await);
+        assert_eq!(
+            names,
+            vec![
+                "upload_file",
+                "presentations_guide",
+                "presentations_render",
+                "presentations_check"
+            ]
+        );
+        // 内置 Office 工具名属于内置:平台工具不能冒充
+        assert!(is_embedded_tool_name("documents_check"));
+    }
+
+    #[tokio::test]
+    async fn disabled_office_tool_is_an_unknown_tool() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 71, "method": "tools/call",
+            "params": { "name": "documents_render", "arguments": { "path": "a.docx" } }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_with_features(UPLOADS_AND_DECKS, &line).await);
+        assert_eq!(resp.error.unwrap().message, "unknown tool: documents_render");
+    }
+
+    /// 调用经 UDS 交给父进程,父进程回的 CallToolResult(含 image 块)原样转给模型。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn office_call_relays_the_parent_result_with_images() {
+        let result = json!({ "content": [
+            { "type": "text", "text": "Rendered slides 1 of deck.pptx" },
+            { "type": "image", "data": "UE5H", "mimeType": "image/png" }
+        ] });
+        let (_dir, sock) = fake_parent(json!({ "ok": true, "result": result.clone() })).await;
+        let mut ctx = ctx_with(UPLOADS_AND_DECKS);
+        ctx.socket_path = sock;
+        let line = json!({
+            "jsonrpc": "2.0", "id": 72, "method": "tools/call",
+            "params": { "name": "presentations_render", "arguments": { "path": "deck.pptx", "pages": "1" } }
+        })
+        .to_string();
+        let LineAction::Spawn(call) =
+            dispatch_line(&ctx, Arc::new(InflightCalls::new()), &line).await
+        else {
+            panic!("expected a spawned round-trip");
+        };
+        let resp = call.future.await.response.unwrap();
+        assert_eq!(resp.result.unwrap(), result);
+    }
+
+    #[tokio::test]
+    async fn initialize_mentions_only_the_enabled_office_groups() {
+        let line = json!({ "jsonrpc": "2.0", "id": 3, "method": "initialize" }).to_string();
+        let resp = unwrap_respond(dispatch_with_features(UPLOADS_AND_DECKS, &line).await);
+        let text = resp.result.unwrap()["instructions"].as_str().unwrap().to_string();
+        assert!(text.starts_with(COMPANION_INSTRUCTIONS));
+        assert!(text.contains("presentations_guide"));
+        assert!(!text.contains("documents_guide"));
+        assert!(!text.contains("mcp__myclaw__"));
+    }
+
     // -- fork(letscubo): 平台工具 -------------------------------------------
 
     const UPLOADS_AND_PLATFORM: CompanionFeatures = CompanionFeatures {
@@ -2855,6 +3044,7 @@ mod tests {
         taskboard: false,
         uploads: true,
         platform: true,
+        office: OfficeFeatures::NONE,
     };
 
     /// 一次性假父进程:接一个连接,读一帧,回给定的 outcome。
@@ -2938,7 +3128,7 @@ mod tests {
             );
         }
         assert_eq!(
-            instructions_with_overview(Some("  ")),
+            instructions_with_overview(Some("  "), OfficeFeatures::NONE),
             COMPANION_INSTRUCTIONS
         );
     }
@@ -3005,6 +3195,7 @@ mod tests {
         taskboard: false,
         uploads: false,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
     const TASKBOARD_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -3016,6 +3207,7 @@ mod tests {
         taskboard: true,
         uploads: false,
         platform: false,
+        office: OfficeFeatures::NONE,
     };
 
     /// The two authoring groups gate independently: enabling one must not

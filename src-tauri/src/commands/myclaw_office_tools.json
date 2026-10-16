@@ -1,0 +1,169 @@
+[
+  {
+    "name": "presentations_guide",
+    "description": "Read this BEFORE building or editing a .pptx deck. Returns the officecli guide for the deck type (commands, design floor, quality gates) plus the platform's delivery rules. Load once per deck; the rules persist for the conversation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scene": {
+          "type": "string",
+          "enum": ["pptx", "pitch-deck", "morph-ppt", "morph-ppt-3d"],
+          "description": "pptx for any ordinary deck (default); pitch-deck for a fundraising / investor deck; morph-ppt for smooth cross-slide Morph animation; morph-ppt-3d for Morph with 3D models."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "presentations_render",
+    "description": "Screenshot a .pptx so you can SEE it. Without `pages` you get one contact sheet of the whole deck; with `pages` you get one image per slide (up to 8). Look at every image for overflowing or clipped text, overlapping or off-slide boxes, empty slides and low contrast, fix them, and render again. Never deliver a deck you have not rendered. Unsaved officecli edits are flushed first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The .pptx file. Absolute, or relative to the session directory." },
+        "pages": { "type": "string", "description": "Slides to render one by one, e.g. \"1\", \"2-4\", \"1,3,5\". At most 8." },
+        "grid": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Columns of the contact sheet when `pages` is omitted. Default: automatic." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "presentations_check",
+    "description": "Inspect a .pptx before delivering it: OpenXML schema validation, officecli's issue scan (empty slides, overflow, off-slide shapes, low contrast, broken references) and the slide outline. Fix every issue it reports, then check again until it comes back clean.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The .pptx file. Absolute, or relative to the session directory." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "documents_guide",
+    "description": "Read this BEFORE writing or editing a .docx Word document. Returns the officecli guide for the document type plus the platform's delivery rules. Load once per document; the rules persist for the conversation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scene": {
+          "type": "string",
+          "enum": ["word", "academic-paper", "word-form"],
+          "description": "word for reports, memos, letters, proposals, contracts (default); academic-paper for papers, theses and anything with citations; word-form for fillable forms."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "documents_render",
+    "description": "Screenshot a .docx so you can SEE it. Without `pages` you get one contact sheet of the whole document; with `pages` you get one image per page (up to 8). Look for broken layout, overflowing tables, wrong fonts and empty pages, fix them, and render again. Never deliver a document you have not rendered. Unsaved officecli edits are flushed first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The .docx file. Absolute, or relative to the session directory." },
+        "pages": { "type": "string", "description": "Pages to render one by one, e.g. \"1\", \"2-4\", \"1,3,5\". At most 8." },
+        "grid": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Columns of the contact sheet when `pages` is omitted. Default: automatic." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "documents_check",
+    "description": "Inspect a .docx before delivering it: OpenXML schema validation, officecli's issue scan (unevaluated fields, stale caches, broken references) and the document outline. Fix every issue it reports, then check again until it comes back clean.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The .docx file. Absolute, or relative to the session directory." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "spreadsheets_guide",
+    "description": "Read this BEFORE building or editing a .xlsx workbook. Returns the officecli guide for the workbook type plus the platform's delivery rules. Load once per workbook; the rules persist for the conversation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scene": {
+          "type": "string",
+          "enum": ["excel", "financial-model", "data-dashboard"],
+          "description": "excel for workbooks, trackers, budgets and tables (default); financial-model for 3-statement, DCF, LBO or projections; data-dashboard for a KPI / chart dashboard built from tabular data."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "spreadsheets_render",
+    "description": "Screenshot a .xlsx so you can SEE it. Pass `pages` for sheets one by one (up to 8); without it you get the first sheet. `range` (e.g. \"Sheet1!A1:H30\") crops to one region where the instance supports it. Look for ##### columns, cut-off labels, unreadable charts and wrong number formats, fix them, and render again. Never deliver a workbook you have not rendered. Unsaved officecli edits are flushed first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The .xlsx file. Absolute, or relative to the session directory." },
+        "range": { "type": "string", "description": "A cell range to capture, e.g. \"Sheet1!A1:H30\"." },
+        "pages": { "type": "string", "description": "Sheets to render one by one, e.g. \"1\", \"1-3\". At most 8." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "spreadsheets_check",
+    "description": "Inspect a .xlsx before delivering it: OpenXML schema validation, officecli's issue scan (unevaluated or broken formulas, missing sheets, broken names, numeric overflow) and the workbook outline. Fix every issue it reports, then check again until it comes back clean.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The .xlsx file. Absolute, or relative to the session directory." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "pdf_guide",
+    "description": "Read this BEFORE producing or working with a PDF. Explains how to make one here (write it as .docx or HTML, then export), how to read and inspect an existing PDF, and the platform's delivery rules.",
+    "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+  },
+  {
+    "name": "pdf_export",
+    "description": "Turn a .docx, .pptx, .xlsx or .html file into a PDF. Writes next to the source unless `out` is given. Render the result with pdf_render before delivering it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The source file (.docx / .pptx / .xlsx / .html). Absolute, or relative to the session directory." },
+        "out": { "type": "string", "description": "Where to write the PDF (must end in .pdf). Default: the source path with a .pdf extension." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "pdf_read",
+    "description": "Extract the text of a PDF, keeping its layout. Use it to read a PDF the user gave you, or to proof-read one you exported.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The PDF. Absolute, or relative to the session directory." },
+        "pages": { "type": "string", "description": "A page span, e.g. \"1\" or \"3-7\". Default: the whole document (long output is truncated)." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "pdf_render",
+    "description": "Screenshot pages of a PDF so you can SEE them: one image per page, up to 8 (default: the first 4). Use it to check an exported PDF before delivering it, or to look at figures and layout in a PDF the user gave you.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "The PDF. Absolute, or relative to the session directory." },
+        "pages": { "type": "string", "description": "A page span, e.g. \"1\" or \"2-5\". At most 8 pages." }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  }
+]

@@ -268,6 +268,16 @@ pub struct BrokerPlatformCallRequest {
     pub arguments: Value,
 }
 
+/// fork(letscubo)专属: 调一个内置 Office 工具(commands::myclaw_office)。相对路径按 token
+/// 登记的会话目录解析,companion 不自报目录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerOfficeRequest {
+    pub token: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
@@ -292,6 +302,8 @@ pub enum BrokerMessage {
     /// fork(letscubo)专属: 平台工具清单 / 调用(commands::myclaw_platform)。
     PlatformCatalog(BrokerPlatformCatalogRequest),
     PlatformCall(BrokerPlatformCallRequest),
+    /// fork(letscubo)专属: 内置 Office 工具。
+    OfficeTool(BrokerOfficeRequest),
     /// Liveness probe. Unlike every other variant this one is NOT sent by a
     /// companion — it comes from codeg's own service-status check
     /// (`acp::delegation::service`), which is why it carries no `token`: a
@@ -481,6 +493,15 @@ pub async fn client_platform_call_round_trip(
     req: &BrokerPlatformCallRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::PlatformCall(req.clone())).await
+}
+
+/// fork(letscubo)专属: 调一个内置 Office 工具。outcome = `{ ok, result | error }`,
+/// `result` 是完整的 MCP `CallToolResult`(可能带 `image` 块)。
+pub async fn client_office_round_trip(
+    socket_path: &str,
+    req: &BrokerOfficeRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::OfficeTool(req.clone())).await
 }
 
 /// Dispatch a `task_progress` report and read back the `{ recorded }` ack.

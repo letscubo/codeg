@@ -5184,6 +5184,9 @@ struct CompanionFeatureFlags {
     /// fork(letscubo)专属: 平台工具(commands::myclaw_platform)。实例不是平台托管时
     /// 清单为空,等于没有 —— 所以与 uploads 一样常开。
     platform: bool,
+    /// fork(letscubo)专属: 内置 Office 工具四组(commands::myclaw_office)。documents /
+    /// presentations / spreadsheets 只在装了 officecli 时开;pdf 常开,缺依赖由工具自报。
+    office: crate::acp::delegation::companion::OfficeFeatures,
 }
 
 /// The `--features` value for a companion launch, or `None` when no group is
@@ -5220,11 +5223,17 @@ fn companion_features_arg(flags: CompanionFeatureFlags) -> Option<String> {
     if flags.platform {
         features.push("platform");
     }
+    for group in crate::commands::myclaw_office::OfficeGroup::ALL {
+        if flags.office.enabled(group) {
+            features.push(group.feature());
+        }
+    }
     if features.is_empty() {
         return None;
     }
     Some(features.join(","))
 }
+
 
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
 /// stash for revocation, plus whether the `check_user_feedback` tool was exposed
@@ -5367,6 +5376,7 @@ where
         taskboard: authoring.work_tasks_enabled,
         uploads: true,
         platform: true,
+        office: crate::commands::myclaw_office::host_office_features(),
     };
     // `None` (no feature enabled) short-circuits BEFORE the binary lookup, the
     // token registration and the server append: there is no companion to launch,
@@ -24571,14 +24581,23 @@ mod tests {
                 taskboard: true,
                 uploads: true,
                 platform: true,
+                office: crate::acp::delegation::companion::OfficeFeatures {
+                    documents: true,
+                    pdf: true,
+                    presentations: true,
+                    spreadsheets: true,
+                },
             }),
             Some(
-                "delegation,feedback,ask,sessions,tasks,automations,taskboard,uploads,platform"
+                "delegation,feedback,ask,sessions,tasks,automations,taskboard,uploads,platform,\
+                 documents,pdf,presentations,spreadsheets"
                     .to_string()
             )
         );
         // fork: 平台工具组单开也注入伴生
         assert_eq!(only(|f| f.platform = true), Some("platform".to_string()));
+        // fork: Office 组单开也注入伴生,且只列开着的组
+        assert_eq!(only(|f| f.office.pdf = true), Some("pdf".to_string()));
     }
 
     // ── Boolean config options (cline 3.0.50 `auto_approve`) ──

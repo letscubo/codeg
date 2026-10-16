@@ -38,7 +38,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::acp::delegation::companion::COMPANION_INSTRUCTIONS;
+use crate::acp::delegation::companion::{office_instructions, COMPANION_INSTRUCTIONS};
+use crate::commands::myclaw_office::host_office_features;
 
 /// 写入的文件名。优先级最高的那个名字 —— 其余候选存在时我们本来就不写。
 pub const CONTEXT_FILE: &str = ".hermes.md";
@@ -85,6 +86,13 @@ list. Find it with `tool_search` (query: \"upload_file\") and invoke it with `to
 name is `mcp__myclaw__upload_file`. Do this for every file you deliver, and never conclude that \
 you cannot upload without searching first.\n"
     );
+    if let Some(section) = office_instructions(host_office_features()) {
+        // fork(letscubo)专属: 内置 Office 工具同在 myclaw 上,同样按需加载
+        out.push_str(&format!(
+            "\n{section}\n\nThese tools also load on demand: find one with `tool_search` (query: its name, \
+e.g. \"presentations_guide\") and call it with `tool_call` (e.g. `mcp__myclaw__presentations_guide`).\n"
+        ));
+    }
     if let Some(o) = overview.map(str::trim).filter(|o| !o.is_empty()) {
         out.push_str(&format!(
             "\n{o}\n\nThese tools are on the same `myclaw` server and also load on demand: find one with \
