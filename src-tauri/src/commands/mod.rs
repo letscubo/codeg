@@ -30,6 +30,7 @@ pub mod office_tools;
 pub mod myclaw_upload;
 // fork(letscubo)专属: 伴生「平台工具」—— tools/list、tools/call 转给 MyClaw 平台(签名请求)。
 pub mod myclaw_platform;
+pub mod myclaw_agent_tools;
 pub mod open_in;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;

@@ -66,8 +66,9 @@
 //! "功能存在但关着")。
 //!
 //! 平台工具(`platform`,清单与实现都在 MyClaw 平台,见 `commands::myclaw_platform`)
-//! 只要 agent 级身份:调用时把 URL 末段作 `{ agentKey }` 交给平台。内置工具名(哪怕所在
-//! 组没开)一律不转平台 —— 平台工具不能冒充内置工具。
+//! 把认证过的 URL 末段作 `{ agentKey }` 交给平台。3D 等 Agent 工具走独立的签名通道;
+//! 显式 `arguments.platformSessionId` 只是会话选择器,Web 仍须精确检查其归属和启用状态,
+//! 不能把它当作 HTTP 已证明 native 来源会话。内置工具名(哪怕所在组没开)一律不转。
 //!
 //! ## 无状态
 //!
@@ -92,12 +93,13 @@ use crate::acp::delegation::companion::{
     render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME, TOOL_SCHEMA_JSON,
 };
 use crate::app_state::AppState;
+use crate::commands::myclaw_agent_tools;
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
 use crate::web::handlers::myclaw::download::ServerToken;
 
 /// 这条传输暴露的工具组 —— 见模块头「只开 uploads + platform」。
 /// fork: `platform` = 平台工具(名字与 schema 由 MyClaw 平台下发,见 commands::myclaw_platform)。
-/// 它们只需要 agent 级身份(URL 末段),不需要会话级的 parent_connection_id,所以这条传输也能开。
+/// HTTP 的 URL 身份 + 显式会话 selector 由 Web 分别校验,不推测 parent_connection_id。
 const HTTP_FEATURES: &str = "uploads,platform";
 
 /// 与 companion 自报的一致(companion.rs 的 `initialize`)。两处必须同版本,否则同一个
@@ -207,14 +209,18 @@ fn initialize_result(overview: Option<&str>) -> Value {
 }
 
 /// 平台工具总览;封顶等待,取不到就不带(initialize 不能因平台而慢 / 失败)。
-async fn platform_overview_for_init(uploads: &dyn ArtifactUploadAccess) -> Option<String> {
+async fn platform_overview_for_init(
+    uploads: &dyn ArtifactUploadAccess,
+    agent: &str,
+) -> Option<String> {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        uploads.platform_overview(),
+        myclaw_agent_tools::catalog(uploads, json!({ "agentKey": agent })),
     )
     .await
     .ok()
-    .flatten()
+    .and_then(Result::ok)
+    .and_then(|(_, overview)| overview)
 }
 
 /// 嵌入的 schema 是**全部**伴生工具的数组;按本传输开启的组过滤,关掉的组一律不
@@ -264,7 +270,8 @@ async fn call_tool(
         if features.platform && !name.is_empty() && !is_embedded_tool_name(&name) {
             let identity = json!({ "agentKey": agent });
             // 渲染与 stdio 共用 render_platform_result:形状不对的结果同样变 isError,不原样转给模型
-            let outcome = match uploads.platform_call(&name, arguments, identity).await {
+            let outcome = match myclaw_agent_tools::call(uploads, &name, arguments, identity).await
+            {
                 Ok(result) => json!({ "ok": true, "result": result }),
                 Err(e) => {
                     tracing::warn!("[MyclawMcp] platform tool {name} failed for {agent}: {e}");
@@ -334,38 +341,40 @@ impl ArtifactUploadAccess for StateUpload<'_> {
     ) -> Result<Value, String> {
         crate::commands::myclaw_platform::call(self.0, name, arguments, identity).await
     }
+
+    async fn agent_tool_catalog(
+        &self,
+        identity: Value,
+    ) -> Result<(Vec<Value>, Option<String>), String> {
+        crate::commands::myclaw_platform::agent_catalog(self.0, identity).await
+    }
+
+    async fn agent_tool_call(
+        &self,
+        name: &str,
+        arguments: Value,
+        identity: Value,
+    ) -> Result<Value, String> {
+        crate::commands::myclaw_platform::agent_call(self.0, name, arguments, identity).await
+    }
 }
 
 /// 内置工具表 + (开了平台组时)平台工具清单。平台取不到就只给内置 —— tools/list 不能因平台失败。
 async fn tools_list_with_platform(
     uploads: &dyn ArtifactUploadAccess,
     features: CompanionFeatures,
+    agent: &str,
 ) -> Result<Value, String> {
     let mut result = tools_list_result(features)?;
     if !features.platform {
         return Ok(result);
     }
-    let Ok(extra) = uploads.platform_catalog().await else {
+    let Ok((extra, _)) = myclaw_agent_tools::catalog(uploads, json!({ "agentKey": agent })).await
+    else {
         return Ok(result);
     };
     if let Some(arr) = result["tools"].as_array_mut() {
-        for tool in extra {
-            let Some(name) = tool
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            if is_embedded_tool_name(&name)
-                || arr
-                    .iter()
-                    .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
-            {
-                continue;
-            }
-            arr.push(tool);
-        }
+        myclaw_agent_tools::append_tools(arr, extra);
     }
     Ok(result)
 }
@@ -393,16 +402,16 @@ pub async fn rpc(
     let features = CompanionFeatures::parse(Some(HTTP_FEATURES));
     let body = match req.method.as_str() {
         "initialize" => {
-            let overview = platform_overview_for_init(&StateUpload(&state.db)).await;
+            let overview = platform_overview_for_init(&StateUpload(&state.db), &agent).await;
             envelope_ok(id, initialize_result(overview.as_deref()))
         }
-        "tools/list" => match tools_list_with_platform(&StateUpload(&state.db), features).await {
-            Ok(result) => envelope_ok(id, result),
-            Err(e) => envelope_err(id, -32603, e),
-        },
-        "tools/call" => {
-            call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await
+        "tools/list" => {
+            match tools_list_with_platform(&StateUpload(&state.db), features, &agent).await {
+                Ok(result) => envelope_ok(id, result),
+                Err(e) => envelope_err(id, -32603, e),
+            }
         }
+        "tools/call" => call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await,
         other => envelope_err(id, -32601, format!("method not found: {other}")),
     };
     Json(body).into_response()
@@ -427,6 +436,9 @@ pub struct McpEntry {
     /// 这条传输开启的工具组与工具名,给平台做投影自检用(不影响 openclaw 读配置)。
     pub features: Vec<String>,
     pub tools: Vec<String>,
+    /// Signed identity-scoped Agent catalog/call support; independent of whether
+    /// this instance has configured its platform webhook yet.
+    pub agent_tools_protocol_version: u8,
 }
 
 /// 条目名里用的**短**标识。
@@ -487,6 +499,7 @@ pub async fn entry(
         headers: hdrs,
         features: HTTP_FEATURES.split(',').map(str::to_string).collect(),
         tools,
+        agent_tools_protocol_version: 1,
     })
     .into_response()
 }
@@ -640,7 +653,7 @@ mod tests {
     /// 平台清单并在内置之后;与内置同名、清单内重复的都丢掉。
     #[tokio::test]
     async fn tools_list_appends_the_platform_catalog() {
-        let result = tools_list_with_platform(&platform_stub(), features())
+        let result = tools_list_with_platform(&platform_stub(), features(), AGENT)
             .await
             .unwrap();
         assert_eq!(
@@ -653,7 +666,7 @@ mod tests {
     /// 平台不可用(默认实现回 Err):tools/list 照常只给内置。
     #[tokio::test]
     async fn tools_list_survives_an_unavailable_platform() {
-        let result = tools_list_with_platform(&StubUpload(Ok(String::new())), features())
+        let result = tools_list_with_platform(&StubUpload(Ok(String::new())), features(), AGENT)
             .await
             .unwrap();
         assert_eq!(tool_names(&result), vec!["upload_file".to_string()]);
@@ -728,6 +741,89 @@ mod tests {
         assert!(text.contains("upload_file"));
         // 不写具体工具名前缀 —— 各 runtime 不同,写死会把模型带错
         assert!(!text.contains("mcp__myclaw__upload_file"));
+    }
+
+    struct AgentToolsStub {
+        identities: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactUploadAccess for AgentToolsStub {
+        async fn upload(&self, _: &str) -> Result<String, String> {
+            panic!("not used")
+        }
+
+        async fn agent_tool_catalog(
+            &self,
+            identity: Value,
+        ) -> Result<(Vec<Value>, Option<String>), String> {
+            self.identities.lock().unwrap().push(identity);
+            Ok((
+                vec![json!({"name": "creative_3d_list_assets", "inputSchema": {"type": "object"}})],
+                None,
+            ))
+        }
+
+        async fn agent_tool_call(
+            &self,
+            _: &str,
+            _: Value,
+            identity: Value,
+        ) -> Result<Value, String> {
+            self.identities.lock().unwrap().push(identity);
+            Ok(json!({"content": [{"type": "text", "text": "scoped result"}]}))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_http_tools_use_authenticated_principal_and_explicit_selector() {
+        let stub = AgentToolsStub {
+            identities: std::sync::Mutex::new(Vec::new()),
+        };
+        let list = tools_list_with_platform(&stub, features(), "legacy-openclaw")
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_names(&list),
+            ["upload_file", "creative_3d_list_assets"]
+        );
+        let result = call_tool(&stub, "legacy-openclaw", json!(3), features(), Some(json!({
+            "name": "creative_3d_list_assets",
+            "arguments": {"platformSessionId": "exact-session", "agentKey": "va-spoofed", "conversationId": 999}
+        }))).await;
+        assert_eq!(result["result"]["content"][0]["text"], "scoped result");
+        let identities = stub.identities.lock().unwrap();
+        assert_eq!(
+            identities.as_slice(),
+            &[
+                json!({"agentKey": "legacy-openclaw"}),
+                json!({"agentKey": "legacy-openclaw", "platformSessionId": "exact-session"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_advertises_agent_tools_without_reading_platform_config() {
+        let response = entry(
+            Path("legacy-hermes".into()),
+            Extension(ServerToken(SECRET.into())),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let entry: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entry["agentToolsProtocolVersion"], 1);
+        assert_eq!(entry["features"], json!(["uploads", "platform"]));
+        assert_eq!(entry["tools"], json!(["upload_file"]));
+        assert!(entry["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/api/myclaw/mcp/legacy-hermes"));
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            format!("Bearer {}", agent_token(SECRET, "legacy-hermes").unwrap())
+        );
     }
 
     /// 平台给了工具总览就接在交付说明后面;没给就原样。
