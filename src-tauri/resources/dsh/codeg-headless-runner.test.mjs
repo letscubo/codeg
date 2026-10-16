@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   attachImagesToLine,
+  attachmentPath,
   descendantsOf,
   entryOf,
   imageAttachingSink,
@@ -156,6 +157,49 @@ function toolResultEvent(callId, content, { nested = true } = {}) {
   };
 }
 
+test("attachmentId → dsh 附件库的路径(按摘要前两位分片)", () => {
+  // 规则在一个真实的附件库上核过 5 个对象(2026-10-16)
+  const id = "sha256:197a9257b60c772898a64f3640f69829fa6e0a33fd9f1f6406caa95d78c2dbf3";
+  assert.equal(
+    attachmentPath("/dsh", id),
+    "/dsh/attachments/v1/objects/19/197a9257b60c772898a64f3640f69829fa6e0a33fd9f1f6406caa95d78c2dbf3",
+  );
+  // 不是规规矩矩的小写 sha256 就不认 —— 绝不让一个怪 id 把读操作引到别处
+  for (const bad of [
+    undefined, null, 42, "", "197a9257", "sha256:", "sha256:XYZ",
+    "sha256:" + "A".repeat(64), "sha256:" + "0".repeat(63), "sha256:../../etc/passwd",
+    "md5:" + "0".repeat(64),
+  ]) {
+    assert.equal(attachmentPath("/dsh", bad), undefined, String(bad));
+  }
+  // 没有 DSH_HOME 就算不出位置
+  for (const home of [undefined, null, "", 7]) assert.equal(attachmentPath(home, id), undefined, String(home));
+});
+
+test("只有 attachmentId、没有任何路径时也能定位(2026-10-16 实测的那一轮)", () => {
+  const blocks = [
+    {
+      type: "image",
+      attachment: {
+        attachmentId: "sha256:197a9257b60c772898a64f3640f69829fa6e0a33fd9f1f6406caa95d78c2dbf3",
+        mediaType: "image/png",
+        width: 780,
+        height: 493,
+        bytes: 50898,
+      },
+    },
+  ];
+  // meta 为 null、没有 <path> 文本块 —— 只剩附件库这一条路
+  assert.deepEqual(toolResultImages(blocks, undefined, "/dsh"), [
+    {
+      path: "/dsh/attachments/v1/objects/19/197a9257b60c772898a64f3640f69829fa6e0a33fd9f1f6406caa95d78c2dbf3",
+      mimeType: "image/png",
+    },
+  ]);
+  // 连 DSH_HOME 都没有(stock 环境)时跳过,不瞎猜
+  assert.deepEqual(toolResultImages(blocks, undefined, undefined), []);
+});
+
 test("dsh 的 image 块是附件引用,字节早就是磁盘上的文件了 —— 带上它的路径,不复制", () => {
   // 这是 2026-10-15 从 C10 一轮真实截图里抄下来的形状
   const blocks = [
@@ -166,7 +210,7 @@ test("dsh 的 image 块是附件引用,字节早就是磁盘上的文件了 —�
     {
       type: "image",
       attachment: {
-        attachmentId: "sha256:4aa3df4405ba6fa5",
+        attachmentId: "sha256:4aa3df4405ba6fa5eead5ef5dfbd0f14a4f0fdab3781250a35d08150badeefa2",
         mediaType: "image/png",
         bytes: 51727,
         width: 780,
@@ -175,8 +219,16 @@ test("dsh 的 image 块是附件引用,字节早就是磁盘上的文件了 —�
       },
     },
   ];
+  // 没有 DSH_HOME 时退到文本块给的文件名
   assert.deepEqual(toolResultImages(blocks), [
     { path: "/home/ubuntu/.myclaw/sessions/s1/example_com.png", mimeType: "image/png" },
+  ]);
+  // 两者都有时,附件库优先 —— 那个地址一定在,文件名未必
+  assert.deepEqual(toolResultImages(blocks, undefined, "/dsh"), [
+    {
+      path: "/dsh/attachments/v1/objects/4a/4aa3df4405ba6fa5eead5ef5dfbd0f14a4f0fdab3781250a35d08150badeefa2",
+      mimeType: "image/png",
+    },
   ]);
   // 文本块没给路径时,回落到事件的 meta.path
   assert.deepEqual(toolResultImages([blocks[1]], "/home/ubuntu/.myclaw/sessions/s1/shot.png"), [

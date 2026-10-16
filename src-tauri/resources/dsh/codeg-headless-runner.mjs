@@ -219,6 +219,26 @@ export function summarize(session, firstSeq, SessionSeq = (n) => n) {
 // file without ever reading the disk. Keep `toolImageFileName` and
 // `SESSION_TOOL_MEDIA_DIR` in lockstep with `acp::connection::tool_image_path`.
 
+/**
+ * Where dsh keeps an attachment's bytes: a content-addressed store under
+ * `$DSH_HOME`, sharded by the digest's first two hex digits.
+ *
+ *     sha256:197a9257b60c…  →  $DSH_HOME/attachments/v1/objects/19/197a9257b60c…
+ *
+ * This is the ONLY source that is always present. A tool result may or may not
+ * also name a file (`<path>` / `meta.path`) — the first screenshot turn we
+ * looked at had both, the next had neither — but every image block carries its
+ * `attachmentId`. Verified against five objects in a live store (2026-10-16).
+ */
+export function attachmentPath(dshHome, attachmentId) {
+  if (typeof dshHome !== "string" || dshHome === "") return undefined;
+  if (typeof attachmentId !== "string") return undefined;
+  const digest = attachmentId.startsWith("sha256:") ? attachmentId.slice("sha256:".length) : undefined;
+  // Exactly a sha256 in lowercase hex: anything else must not steer a read.
+  if (digest === undefined || !/^[0-9a-f]{64}$/.test(digest)) return undefined;
+  return join(dshHome, "attachments", "v1", "objects", digest.slice(0, 2), digest);
+}
+
 /** The `<path>…</path>` a dsh file result puts in its text block. */
 function pathFromTextBlock(block) {
   if (block === null || typeof block !== "object" || block.type !== "text") return undefined;
@@ -243,7 +263,7 @@ function pathFromTextBlock(block) {
  * `source.base64`) stay supported: a different MCP server reached through dsh
  * may still answer that way, and then we are the ones who must write the file.
  */
-export function toolResultImages(blocks, metaPath) {
+export function toolResultImages(blocks, metaPath, dshHome) {
   if (!Array.isArray(blocks)) return [];
   const filePaths = blocks.map(pathFromTextBlock).filter((p) => p !== undefined);
   let nextPath = 0;
@@ -252,8 +272,13 @@ export function toolResultImages(blocks, metaPath) {
     if (block === null || typeof block !== "object" || block.type !== "image") continue;
     // dsh: the bytes are already a file; carry its path, do not copy it.
     if (block.attachment !== null && typeof block.attachment === "object") {
-      const path = filePaths[nextPath++] ?? (typeof metaPath === "string" ? metaPath : undefined);
-      if (typeof path !== "string" || !path.startsWith("/")) continue;
+      // The attachment store first — it is the one address that is always
+      // there. A named file, when the result has one, is the fallback.
+      const named = filePaths[nextPath++] ?? (typeof metaPath === "string" ? metaPath : undefined);
+      const path =
+        attachmentPath(dshHome, block.attachment.attachmentId) ??
+        (typeof named === "string" && named.startsWith("/") ? named : undefined);
+      if (path === undefined) continue;
       const mimeType = block.attachment.mediaType;
       out.push({ path, mimeType: typeof mimeType === "string" && mimeType ? mimeType : "image/png" });
       continue;
@@ -333,7 +358,7 @@ function writeToolImage(sessionDir, image) {
  * Best effort by contract: a failed write only means that card has no picture,
  * and a turn must never fail over it.
  */
-export function indexToolImages(session, SessionSeq, from, into, sessionDir) {
+export function indexToolImages(session, SessionSeq, from, into, sessionDir, dshHome) {
   let seq = from;
   for (; seq < session.seq; seq++) {
     const event = session.eventAt(SessionSeq(seq));
@@ -341,7 +366,7 @@ export function indexToolImages(session, SessionSeq, from, into, sessionDir) {
     const result = toolResultOf(event);
     if (result === undefined) continue;
     const written = [];
-    for (const image of toolResultImages(result.content, event.data?.meta?.path)) {
+    for (const image of toolResultImages(result.content, event.data?.meta?.path, dshHome)) {
       // Already a file (dsh's own attachments): carry the path as is.
       if (image.path !== undefined) {
         written.push({ path: image.path, mimeType: image.mimeType });
@@ -385,14 +410,14 @@ export function attachImagesToLine(line, lookup) {
  * independent of listener order: by the time the projection has written a line,
  * the event it describes is already in the session.
  */
-export function imageAttachingSink(out, session, SessionSeq, sessionDir) {
+export function imageAttachingSink(out, session, SessionSeq, sessionDir, dshHome) {
   const byCallId = new Map();
   let cursor = 0;
   return {
     write(chunk) {
       return out.write(
         attachImagesToLine(chunk, (callId) => {
-          cursor = indexToolImages(session, SessionSeq, cursor, byCallId, sessionDir);
+          cursor = indexToolImages(session, SessionSeq, cursor, byCallId, sessionDir, dshHome);
           return byCallId.get(callId);
         }),
       );
@@ -487,7 +512,7 @@ async function run(ctx, config, internals) {
       ? internals.projectJsonRun(
           ctx,
           agent,
-          imageAttachingSink(process.stdout, agent.session, internals.SessionSeq, cwd),
+          imageAttachingSink(process.stdout, agent.session, internals.SessionSeq, cwd, process.env.DSH_HOME),
           { cwd },
         )
       : undefined;
