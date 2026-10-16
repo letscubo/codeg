@@ -28,10 +28,19 @@
 // Verified on A3 (2026-09-18): background subagent → parent idle at 12s →
 // follow-up turns at 39–50s → final at 51s; resume after it; SIGTERM cancel.
 
-import { realpathSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import {
+  realpathSync,
+  readdirSync,
+  readFileSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 
 export const name = "codeg-headless-runner";
 export const inject = ["agentDefaultModel", "agents", "sessions"];
@@ -40,6 +49,14 @@ const DEFAULT_BACKGROUND_WAIT_SECS = 20 * 60;
 const DEFAULT_EXIT_GRACE_MS = 3000;
 /** Let a just-settled child's report land in the parent inbox before judging. */
 const SETTLE_QUIET_MS = 500;
+/**
+ * Where a turn's tool images land, under the session's own working directory.
+ *
+ * MUST stay in sync with `SESSION_TOOL_MEDIA_DIR` in codeg's `acp::connection`:
+ * codeg computes the very same path when it replays history, and the two never
+ * talk to each other.
+ */
+const SESSION_TOOL_MEDIA_DIR = ".codeg-media";
 
 const log = (message) => process.stderr.write(`codeg-runner: ${message}\n`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -186,6 +203,228 @@ export function summarize(session, firstSeq, SessionSeq = (n) => n) {
   return { text, reason };
 }
 
+// ── tool-result images ─────────────────────────────────────────────────────
+//
+// dsh's JSON projection drops them: `resultText` keeps `type: "text"` blocks
+// only, so a screenshot reaches codeg as `{"type":"tool_result","result":""}` —
+// the model saw the image, the card and the history never did (2026-10-13).
+//
+// We put them back, but NOT as bytes on the line. That stream is deliberately
+// bounded (8 KiB per string, 32 KiB per event, see `boundJsonLine`): it is an
+// event stream, not a data channel, and one screenshot is 100 KiB+. So the
+// bytes go to disk here and the line carries only the path.
+//
+// The path is the one codeg would have computed itself (same digest, same
+// directory), because codeg's history replay is a pure function that must name the
+// file without ever reading the disk. Keep `toolImageFileName` and
+// `SESSION_TOOL_MEDIA_DIR` in lockstep with `acp::connection::tool_image_path`.
+
+/**
+ * Where dsh keeps an attachment's bytes: a content-addressed store under
+ * `$DSH_HOME`, sharded by the digest's first two hex digits.
+ *
+ *     sha256:197a9257b60c…  →  $DSH_HOME/attachments/v1/objects/19/197a9257b60c…
+ *
+ * This is the ONLY source that is always present. A tool result may or may not
+ * also name a file (`<path>` / `meta.path`) — the first screenshot turn we
+ * looked at had both, the next had neither — but every image block carries its
+ * `attachmentId`. Verified against five objects in a live store (2026-10-16).
+ */
+export function attachmentPath(dshHome, attachmentId) {
+  if (typeof dshHome !== "string" || dshHome === "") return undefined;
+  if (typeof attachmentId !== "string") return undefined;
+  const digest = attachmentId.startsWith("sha256:") ? attachmentId.slice("sha256:".length) : undefined;
+  // Exactly a sha256 in lowercase hex: anything else must not steer a read.
+  if (digest === undefined || !/^[0-9a-f]{64}$/.test(digest)) return undefined;
+  return join(dshHome, "attachments", "v1", "objects", digest.slice(0, 2), digest);
+}
+
+/** The `<path>…</path>` a dsh file result puts in its text block. */
+function pathFromTextBlock(block) {
+  if (block === null || typeof block !== "object" || block.type !== "text") return undefined;
+  if (typeof block.text !== "string") return undefined;
+  const found = /<path>([^<]+)<\/path>/.exec(block.text);
+  const path = found?.[1]?.trim();
+  return path !== undefined && path.startsWith("/") ? path : undefined;
+}
+
+/**
+ * Images of one tool result, each as either `{path}` (already a file) or
+ * `{data}` (base64 we still have to write).
+ *
+ * dsh does NOT put bytes in the event. Its image block is an attachment
+ * reference — `{type:"image", attachment:{attachmentId, mediaType, …}}` — and
+ * the tool has already written the file into the session directory. The path
+ * rides along in the sibling text block (`<path>…</path>`), with the event's
+ * `meta.path` as a fallback for a single-file result (2026-10-15, verified
+ * against a real screenshot turn).
+ *
+ * The base64 shapes (MCP's `{data, mimeType}` and the Messages API's
+ * `source.base64`) stay supported: a different MCP server reached through dsh
+ * may still answer that way, and then we are the ones who must write the file.
+ */
+export function toolResultImages(blocks, metaPath, dshHome) {
+  if (!Array.isArray(blocks)) return [];
+  const filePaths = blocks.map(pathFromTextBlock).filter((p) => p !== undefined);
+  let nextPath = 0;
+  const out = [];
+  for (const block of blocks) {
+    if (block === null || typeof block !== "object" || block.type !== "image") continue;
+    // dsh: the bytes are already a file; carry its path, do not copy it.
+    if (block.attachment !== null && typeof block.attachment === "object") {
+      // The attachment store first — it is the one address that is always
+      // there. A named file, when the result has one, is the fallback.
+      const named = filePaths[nextPath++] ?? (typeof metaPath === "string" ? metaPath : undefined);
+      const path =
+        attachmentPath(dshHome, block.attachment.attachmentId) ??
+        (typeof named === "string" && named.startsWith("/") ? named : undefined);
+      if (path === undefined) continue;
+      const mimeType = block.attachment.mediaType;
+      out.push({ path, mimeType: typeof mimeType === "string" && mimeType ? mimeType : "image/png" });
+      continue;
+    }
+    // MCP / Messages API: the bytes are inline, so we write the file ourselves.
+    const base64 = block.source?.type === "base64" ? block.source : undefined;
+    const data = typeof block.data === "string" ? block.data : base64?.data;
+    if (typeof data !== "string" || data === "") continue;
+    const mimeType = block.mimeType ?? block.mime_type ?? base64?.media_type ?? "image/png";
+    out.push({ data, mimeType: typeof mimeType === "string" ? mimeType : "image/png" });
+  }
+  return out;
+}
+
+/**
+ * File name codeg will look for: SHA-256 of the base64 TEXT, first 32 hex
+ * digits, extension from the mime type. Mirrors `tool_image_path` exactly — a
+ * drift here means the card points at a file that is not there.
+ */
+export function toolImageFileName(data, mimeType) {
+  const ext =
+    mimeType === "image/jpeg" || mimeType === "image/jpg"
+      ? "jpg"
+      : mimeType === "image/webp"
+        ? "webp"
+        : mimeType === "image/gif"
+          ? "gif"
+          : "png";
+  const digest = createHash("sha256").update(data, "utf8").digest("hex");
+  return `${digest.slice(0, 32)}.${ext}`;
+}
+
+/**
+ * The tool result a `tool/result` event carries, across dsh versions.
+ *
+ * 0.1.6 wraps it: `message.content[0]` is `{toolCallId, content}`. 0.2.x drops
+ * that level and puts both on `message`. Reading both keeps a dsh bump from
+ * silently losing images again (it would not throw — just stop finding any).
+ */
+export function toolResultOf(event) {
+  const message = event?.data?.message;
+  if (message === null || typeof message !== "object") return undefined;
+  if (typeof message.toolCallId === "string") return message;
+  const first = Array.isArray(message.content) ? message.content[0] : undefined;
+  return first !== null && typeof first === "object" && typeof first.toolCallId === "string"
+    ? first
+    : undefined;
+}
+
+/** Write one image under the session directory; returns the path it lives at. */
+function writeToolImage(sessionDir, image) {
+  const dir = join(sessionDir, SESSION_TOOL_MEDIA_DIR);
+  const path = join(dir, toolImageFileName(image.data, image.mimeType));
+  // The same screenshot in two turns is one file — content-addressed.
+  if (existsSync(path)) return path;
+  mkdirSync(dir, { recursive: true });
+  // Write-then-rename: a reader must never see a half-written PNG under a name
+  // that says "this is the whole picture".
+  const tmp = `${path}.part`;
+  try {
+    writeFileSync(tmp, Buffer.from(image.data, "base64"));
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {}
+    throw err;
+  }
+  return path;
+}
+
+/**
+ * Scan forward from `from`, writing every tool result's images and recording
+ * their paths by call id. Returns the new cursor, so each line only costs the
+ * events since the last one.
+ *
+ * Best effort by contract: a failed write only means that card has no picture,
+ * and a turn must never fail over it.
+ */
+export function indexToolImages(session, SessionSeq, from, into, sessionDir, dshHome) {
+  let seq = from;
+  for (; seq < session.seq; seq++) {
+    const event = session.eventAt(SessionSeq(seq));
+    if (event === undefined || event.type !== "tool/result") continue;
+    const result = toolResultOf(event);
+    if (result === undefined) continue;
+    const written = [];
+    for (const image of toolResultImages(result.content, event.data?.meta?.path, dshHome)) {
+      // Already a file (dsh's own attachments): carry the path as is.
+      if (image.path !== undefined) {
+        written.push({ path: image.path, mimeType: image.mimeType });
+        continue;
+      }
+      try {
+        written.push({ path: writeToolImage(sessionDir, image), mimeType: image.mimeType });
+      } catch (err) {
+        log(`tool image not saved: ${String(err)}`);
+      }
+    }
+    if (written.length > 0) into.set(result.toolCallId, written);
+  }
+  return seq;
+}
+
+/**
+ * Add `images` to a `tool_result` line. Anything else passes through byte for
+ * byte — an unparseable or unrelated line is never rewritten.
+ */
+export function attachImagesToLine(line, lookup) {
+  if (typeof line !== "string" || !line.includes('"tool_result"')) return line;
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return line;
+  }
+  if (value === null || typeof value !== "object") return line;
+  if (value.type !== "tool_result" || typeof value.callId !== "string") return line;
+  const images = lookup(value.callId);
+  if (images === undefined || images.length === 0) return line;
+  return `${JSON.stringify({ ...value, images })}\n`;
+}
+
+/**
+ * The projection's sink, with tool-result images saved and their paths put back
+ * on the way out.
+ *
+ * Reading the session (rather than listening for the event) is what makes this
+ * independent of listener order: by the time the projection has written a line,
+ * the event it describes is already in the session.
+ */
+export function imageAttachingSink(out, session, SessionSeq, sessionDir, dshHome) {
+  const byCallId = new Map();
+  let cursor = 0;
+  return {
+    write(chunk) {
+      return out.write(
+        attachImagesToLine(chunk, (callId) => {
+          cursor = indexToolImages(session, SessionSeq, cursor, byCallId, sessionDir, dshHome);
+          return byCallId.get(callId);
+        }),
+      );
+    },
+  };
+}
+
 // ── the run ────────────────────────────────────────────────────────────────
 
 function* liveEvents(session, SessionSeq) {
@@ -265,7 +504,18 @@ async function run(ctx, config, internals) {
   await agent.whenIdle();
   if (wantSession !== undefined) assertAdoptable(agent.session.header, wantSession, cwd);
   const firstSeq = agent.session.seq;
-  const projection = config.json === true ? internals.projectJsonRun(ctx, agent, process.stdout, { cwd }) : undefined;
+  // Same projection as stock, through a sink that saves tool-result images under
+  // the session directory and puts their paths back on the line (dsh's own
+  // `resultText` keeps text blocks only, and its stream is capped at 32 KiB).
+  const projection =
+    config.json === true
+      ? internals.projectJsonRun(
+          ctx,
+          agent,
+          imageAttachingSink(process.stdout, agent.session, internals.SessionSeq, cwd, process.env.DSH_HOME),
+          { cwd },
+        )
+      : undefined;
   try {
     agent.followup(
       internals.createUserMessage({ content: [{ type: "text", text: task }], source: { kind: "user" } }),

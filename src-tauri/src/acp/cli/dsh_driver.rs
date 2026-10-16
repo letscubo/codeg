@@ -369,7 +369,17 @@ impl DshDriver {
     /// Emit one mapped event, recording it to codeg's transcript. A
     /// `SessionStarted` on the first turn lands header + prompt on disk before
     /// it is emitted, so the lifecycle bind never precedes the recorded prompt.
-    async fn emit_recorded(&self, event: AcpEvent, record: &mut TurnRecord) {
+    async fn emit_recorded(&self, mut event: AcpEvent, record: &mut TurnRecord) {
+        // 我们换上的 runner 把工具产出的图落在会话目录里、行上只报路径(dsh 的 JSON 流
+        // 单条上限 32 KiB,塞不下一张截图)。字节在这里读回来:实时卡片要它,
+        // 自录线路的 tool_image_path 也要它来算文件名。
+        if let AcpEvent::ToolCallUpdate {
+            images: Some(images),
+            ..
+        } = &mut event
+        {
+            crate::acp::connection::hydrate_disk_images(images);
+        }
         if let AcpEvent::SessionStarted { session_id } = &event {
             record.session_id = Some(session_id.clone());
             if !record.prompt_recorded {
@@ -378,7 +388,7 @@ impl DshDriver {
                 record.prompt_recorded = true;
             }
         } else if let (Some(sid), Some(update)) =
-            (&record.session_id, transcript_update_for(&event))
+            (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
         {
             record_transcript_update(self.agent_type, sid, &update);
         }
@@ -478,7 +488,10 @@ fn set_tool_name_meta(v: &mut Value, tool_name: Option<&str>) {
     v["_meta"]["codeg.toolName"] = Value::String(name.to_string());
 }
 
-pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::SessionUpdate> {
+pub(crate) fn transcript_update_for(
+    event: &AcpEvent,
+    session_dir: Option<&std::path::Path>,
+) -> Option<sacp::schema::SessionUpdate> {
     let value = match event {
         AcpEvent::ContentDelta { text, .. } => json!({
             "sessionUpdate": "agent_message_chunk",
@@ -566,7 +579,7 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
                 let blocks: Vec<Value> = images
                     .iter()
                     .filter_map(|img| {
-                        let path = crate::acp::connection::tool_image_path(img)?;
+                        let path = crate::acp::connection::tool_image_path(img, session_dir)?;
                         Some(json!({
                             "type": "content",
                             "content": {
@@ -598,6 +611,12 @@ pub(crate) fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::Se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试只关心事件 → SessionUpdate 的形状,不关心图落在哪;
+    /// `None` = 共享池(会话目录另有专门的用例覆盖)。
+    fn transcript_update_for(event: &AcpEvent) -> Option<sacp::schema::SessionUpdate> {
+        super::transcript_update_for(event, None)
+    }
 
     #[test]
     fn live_events_round_trip_into_recorded_session_updates() {

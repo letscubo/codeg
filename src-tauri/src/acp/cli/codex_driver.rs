@@ -501,7 +501,7 @@ impl CodexDriver {
                 record.prompt_recorded = true;
             }
         } else if let (Some(sid), Some(update)) =
-            (&record.session_id, transcript_update_for(&event))
+            (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
         {
             record_transcript_update(self.agent_type, sid, &update);
         }
