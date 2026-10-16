@@ -557,7 +557,7 @@ impl DelegationListener {
                 upload_response(self.process_upload(req).await)?
             }
             BrokerMessage::PlatformCatalog(req) => {
-                // 管理目录有缓存;动态授权的 Agent 目录按当前 token 会话重新读取。
+                // 有缓存的一次小往返(commands::myclaw_platform::catalog)
                 platform_catalog_response(self.process_platform_catalog(req).await)?
             }
             BrokerMessage::PlatformCall(req) => {
@@ -844,23 +844,17 @@ impl DelegationListener {
         self.authoring.create_automation(ctx, req.spec).await
     }
 
-    /// 平台管理工具和动态授权 Agent 工具共用传输,后者目录按真实会话身份读取。
+    /// fork(letscubo)专属: 平台工具清单。只做 token 校验 —— 清单与会话无关。
     async fn process_platform_catalog(
         &self,
         req: crate::acp::delegation::transport::BrokerPlatformCatalogRequest,
     ) -> Result<(Vec<Value>, Option<String>), String> {
-        let Some(entry) = self.tokens.lookup(&req.token).await else {
+        if self.tokens.lookup(&req.token).await.is_none() {
             return Err("invalid token".to_string());
-        };
-        let conversation_id = self
-            .parent_lookup
-            .current_conversation_id(&entry.parent_connection_id)
-            .await;
-        crate::commands::myclaw_agent_tools::catalog(
-            self.uploads.as_ref(),
-            serde_json::json!({ "conversationId": conversation_id }),
-        )
-        .await
+        }
+        let tools = self.uploads.platform_catalog().await?;
+        // 总览与清单同一次请求、同一份缓存,这里不会多打平台
+        Ok((tools, self.uploads.platform_overview().await))
     }
 
     /// fork(letscubo)专属: 调一个平台工具。调用方线索由 token 反查(→ 父连接 → 当前
@@ -877,13 +871,9 @@ impl DelegationListener {
             .current_conversation_id(&entry.parent_connection_id)
             .await;
         let identity = serde_json::json!({ "conversationId": conversation_id });
-        crate::commands::myclaw_agent_tools::call(
-            self.uploads.as_ref(),
-            &req.name,
-            req.arguments,
-            identity,
-        )
-        .await
+        self.uploads
+            .platform_call(&req.name, req.arguments, identity)
+            .await
     }
 
     /// 校验 token 后把上传交给实现。失败原因原样回给模型 —— 它要据此决定重试还是收手。
@@ -1597,51 +1587,48 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct ScopedTools {
-        identities: tokio::sync::Mutex<Vec<Value>>,
+    struct PlatformTools {
+        calls: tokio::sync::Mutex<Vec<(String, Value)>>,
     }
 
     #[async_trait]
-    impl crate::commands::myclaw_upload::ArtifactUploadAccess for ScopedTools {
+    impl crate::commands::myclaw_upload::ArtifactUploadAccess for PlatformTools {
         async fn upload(&self, _: &str) -> Result<String, String> {
             panic!("not used")
         }
-
-        async fn agent_tool_catalog(
-            &self,
-            identity: Value,
-        ) -> Result<(Vec<Value>, Option<String>), String> {
-            self.identities.lock().await.push(identity);
-            Ok((vec![json!({"name": "creative_3d_list_assets"})], None))
+        async fn platform_catalog(&self) -> Result<Vec<Value>, String> {
+            Ok(vec![json!({"name": "list_agents"})])
         }
-
-        async fn agent_tool_call(
+        async fn platform_overview(&self) -> Option<String> {
+            Some("Manage this instance".into())
+        }
+        async fn platform_call(
             &self,
-            _: &str,
+            name: &str,
             _: Value,
             identity: Value,
         ) -> Result<Value, String> {
-            self.identities.lock().await.push(identity);
+            self.calls.lock().await.push((name.into(), identity));
             Ok(json!({"content": []}))
         }
     }
 
     #[tokio::test]
-    async fn agent_tools_stdio_identity_comes_from_launch_token_parent() {
+    async fn management_tools_keep_the_launch_token_parent_identity() {
         use crate::acp::delegation::transport::{
             BrokerPlatformCallRequest, BrokerPlatformCatalogRequest,
         };
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
-                "scoped-token".into(),
+                "management-token".into(),
                 TokenEntry {
                     parent_connection_id: "actual-parent".into(),
                     working_dir: PathBuf::from("/tmp"),
                 },
             )
             .await;
-        let uploads = Arc::new(ScopedTools::default());
+        let uploads = Arc::new(PlatformTools::default());
         let listener = DelegationListener::new(
             make_broker(Arc::new(MockSpawner::new())).await,
             tokens.clone(),
@@ -1653,34 +1640,36 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             uploads.clone(),
         );
-        let (tools, _) = listener
+        let (tools, overview) = listener
             .process_platform_catalog(BrokerPlatformCatalogRequest {
-                token: "scoped-token".into(),
+                token: "management-token".into(),
             })
             .await
             .unwrap();
-        assert_eq!(tools[0]["name"], "creative_3d_list_assets");
-        listener.process_platform_call(BrokerPlatformCallRequest {
-            token: "scoped-token".into(),
-            name: "creative_3d_list_assets".into(),
-            arguments: json!({"platformSessionId": "exact-session", "conversationId": 999, "agentKey": "fake"}),
-        }).await.unwrap();
-        assert_eq!(
-            uploads.identities.lock().await.as_slice(),
-            &[
-                json!({"conversationId": 42}),
-                json!({"conversationId": 42, "platformSessionId": "exact-session"}),
-            ]
-        );
-        tokens.revoke("scoped-token").await;
-        let invalid = listener
-            .process_platform_catalog(BrokerPlatformCatalogRequest {
-                token: "scoped-token".into(),
+        assert_eq!(tools[0]["name"], "list_agents");
+        assert_eq!(overview.as_deref(), Some("Manage this instance"));
+        listener
+            .process_platform_call(BrokerPlatformCallRequest {
+                token: "management-token".into(),
+                name: "list_agents".into(),
+                arguments: json!({"conversationId": 999, "agentKey": "fake"}),
             })
             .await
-            .unwrap_err();
-        assert_eq!(invalid, "invalid token");
-        assert_eq!(uploads.identities.lock().await.len(), 2);
+            .unwrap();
+        assert_eq!(
+            uploads.calls.lock().await.as_slice(),
+            &[("list_agents".into(), json!({"conversationId": 42}))]
+        );
+        tokens.revoke("management-token").await;
+        let result = listener
+            .process_platform_call(BrokerPlatformCallRequest {
+                token: "management-token".into(),
+                name: "list_agents".into(),
+                arguments: json!({}),
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), "invalid token");
+        assert_eq!(uploads.calls.lock().await.len(), 1);
     }
 
     #[tokio::test]

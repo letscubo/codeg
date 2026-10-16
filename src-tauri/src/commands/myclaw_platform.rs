@@ -9,11 +9,8 @@
 //! 2. 带签名打 `GET /api/codeg/tools`(清单,带缓存)与 `POST /api/codeg/tools/call`;
 //! 3. 把调用方线索(会话 / agent)一并带上,平台据此定「自己」是谁。
 //!
-//! 以后加工具只发平台,不用发 codeg。
-//!
-//! 动态授权的 Agent 工具(如 3D)使用另外两条签名 POST:`/api/codeg/agent-tools`
-//! 与 `/api/codeg/agent-tools/call`。目录不使用实例级缓存;身份和显式会话 selector
-//! 都在签名 body 中,由平台检查实时权限及精确归属。旧实例不读取上面的管理工具目录。
+//! 以后加平台管理工具只发平台,不用发 codeg。
+//! 3D 使用运行时直连 MyClaw MCP;这里不发现或中转 3D 工具。
 //!
 //! ## 签名
 //!
@@ -50,9 +47,6 @@ use crate::db::AppDatabase;
 const EVENTS_PATH: &str = "/api/codeg/events";
 pub const CATALOG_PATH: &str = "/api/codeg/tools";
 pub const CALL_PATH: &str = "/api/codeg/tools/call";
-/// 身份相关的 Agent 工具走独立通道,不与 all 实例的管理工具目录混用。
-pub const AGENT_CATALOG_PATH: &str = "/api/codeg/agent-tools";
-pub const AGENT_CALL_PATH: &str = "/api/codeg/agent-tools/call";
 
 /// 清单缓存:成功 5 分钟,失败 30 秒(不是平台托管 / 平台暂时不可达时别每次都打)。
 const CATALOG_TTL_OK: Duration = Duration::from_secs(300);
@@ -276,46 +270,24 @@ pub async fn overview(db: &AppDatabase) -> Result<Option<String>, String> {
     Ok(overview_of(&catalog_data(db).await?))
 }
 
-/// Agent 工具授权可能随用户、会话或 App grant 改变,不能使用实例级清单缓存。
-/// identity 在 JSON body 内,因此与整个请求一并签名。
-pub async fn agent_catalog(
-    db: &AppDatabase,
-    identity: Value,
-) -> Result<(Vec<Value>, Option<String>), String> {
-    let data = post_signed(
-        db,
-        AGENT_CATALOG_PATH,
-        serde_json::json!({ "identity": identity }),
-        CATALOG_TIMEOUT,
-    )
-    .await?;
-    Ok((tools_of(&data), overview_of(&data)))
-}
-
-pub async fn agent_call(
-    db: &AppDatabase,
-    name: &str,
-    arguments: Value,
-    identity: Value,
-) -> Result<Value, String> {
-    let data = post_signed(
-        db,
-        AGENT_CALL_PATH,
-        serde_json::json!({ "name": name, "arguments": arguments, "identity": identity }),
-        CALL_TIMEOUT,
-    )
-    .await?;
-    data.get("result")
-        .cloned()
-        .filter(|r| r.get("content").is_some())
-        .ok_or_else(|| "the platform returned no tool result".to_string())
-}
-
 fn tools_of(data: &Value) -> Vec<Value> {
     data.get("tools")
         .and_then(|t| t.as_array())
         .cloned()
         .unwrap_or_default()
+        .into_iter()
+        // Old platform responses/caches must not republish the retired proxy.
+        .filter(|tool| {
+            !tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_retired_3d_tool)
+        })
+        .collect()
+}
+
+fn is_retired_3d_tool(name: &str) -> bool {
+    name.starts_with("creative_3d_")
 }
 
 fn overview_of(data: &Value) -> Option<String> {
@@ -333,6 +305,13 @@ pub async fn call(
     arguments: Value,
     identity: Value,
 ) -> Result<Value, String> {
+    // Cached MCP clients may still call a 3D name. Refuse before consulting
+    // credentials/network; never fall back to the platform-management ingress.
+    if is_retired_3d_tool(name) {
+        return Err(
+            "CREATIVE_3D_DIRECT_MCP_REQUIRED: use the direct MyClaw 3D MCP connection".into(),
+        );
+    }
     let ep = endpoint(db).await?;
     let body = serde_json::json!({ "name": name, "arguments": arguments, "identity": identity });
     let data = signed_request(
@@ -412,6 +391,47 @@ mod tests {
         assert!(tools_of(&serde_json::json!({})).is_empty());
     }
 
+    #[test]
+    fn management_catalog_does_not_rediscover_retired_3d_tools() {
+        let tools = tools_of(&serde_json::json!({ "tools": [
+            { "name": "creative_3d_text_to_model" },
+            { "name": "list_agents" },
+            { "name": "creative_3d_create_model" },
+            { "name": "mcp_servers" },
+            { "name": "creative_3d_get_job" }
+        ] }));
+        let names: Vec<_> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["list_agents", "mcp_servers"]);
+    }
+
+    #[tokio::test]
+    async fn cached_3d_calls_are_refused_before_platform_credentials_or_fallback() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        // There is deliberately no webhook/endpoint: the retirement error must
+        // win before any credential lookup, rather than a management fallback.
+        for name in [
+            "creative_3d_text_to_model",
+            "creative_3d_create_model",
+            "creative_3d_get_job",
+        ] {
+            let error = call(
+                &db,
+                name,
+                serde_json::json!({}),
+                serde_json::json!({"conversationId": 42}),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.starts_with("CREATIVE_3D_DIRECT_MCP_REQUIRED:"),
+                "{error}"
+            );
+        }
+    }
+
     /// 与平台 `platform-tools.behavior.test.ts` 同一组向量 —— 两边任何一边改了拼法都会先红。
     #[test]
     fn signature_vector_matches_the_platform() {
@@ -427,55 +447,6 @@ mod tests {
         assert_eq!(
             sign("test-webhook-secret", 1790000000, "GET", CATALOG_PATH, ""),
             "YtOx5Ry7-R9n1HW6OYxk56K6sYem7zNKpLdBrnIU3Zg"
-        );
-    }
-
-    #[test]
-    fn agent_catalog_signature_covers_identity_and_uses_its_own_path() {
-        let body = r#"{"identity":{"agentKey":"legacy-openclaw"}}"#;
-        assert_eq!(signature_payload(1790000000, "POST", AGENT_CATALOG_PATH, body),
-            "1790000000\nPOST\n/api/codeg/agent-tools\n88f933371d08b55b732397396d6285d57649133001c5780c9ab07cc9e0a95b0d");
-        assert_eq!(
-            sign(
-                "test-webhook-secret",
-                1790000000,
-                "POST",
-                AGENT_CATALOG_PATH,
-                body
-            ),
-            "j2Yk8mAHGuuFrvF-Y13gNdT8VvIBIXrLZ14_7KWmlMk",
-        );
-        assert_ne!(
-            sign(
-                "test-webhook-secret",
-                1790000000,
-                "POST",
-                AGENT_CATALOG_PATH,
-                body
-            ),
-            sign(
-                "test-webhook-secret",
-                1790000000,
-                "POST",
-                CATALOG_PATH,
-                body
-            ),
-        );
-        assert_ne!(
-            sign(
-                "test-webhook-secret",
-                1790000000,
-                "POST",
-                AGENT_CATALOG_PATH,
-                body
-            ),
-            sign(
-                "test-webhook-secret",
-                1790000000,
-                "POST",
-                AGENT_CATALOG_PATH,
-                r#"{"identity":{"agentKey":"legacy-hermes"}}"#
-            ),
         );
     }
 
