@@ -347,64 +347,55 @@ async fn office_render(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // (输出文件, 额外参数)
-    let mut shots: Vec<(PathBuf, Vec<String>)> = Vec::new();
-    if let Some(range) = range {
-        shots.push((
-            media.join(format!("{stem}-range.png")),
-            vec!["--range".into(), range.to_string()],
-        ));
-    } else if let Some(pages) = &pages {
-        for p in pages {
-            shots.push((
-                media.join(format!("{stem}-p{p}.png")),
-                vec!["--page".into(), p.to_string()],
-            ));
-        }
-    } else if group == OfficeGroup::Spreadsheets {
-        shots.push((media.join(format!("{stem}.png")), Vec::new()));
-    } else {
-        let grid = match args.get("grid").and_then(|v| v.as_u64()) {
-            Some(n) if (1..=8).contains(&n) => n.to_string(),
-            _ => "auto".to_string(),
-        };
-        shots.push((
-            media.join(format!("{stem}-overview.png")),
-            vec!["--grid".into(), grid],
-        ));
-    }
-
     let mut total_pages: Option<u32> = None;
     let mut images = Vec::new();
-    for (out_path, extra) in &shots {
-        let _ = std::fs::remove_file(out_path);
-        let mut cmd = tokio_command(&officecli);
-        cmd.arg("view")
-            .arg(&file)
-            .arg("screenshot")
-            .args(extra)
-            .arg("-o")
-            .arg(out_path)
-            .arg("--json");
-        let out = run(cmd, RENDER_TIMEOUT).await?;
-        let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
-        if total_pages.is_none() {
-            total_pages = pages_total(&envelope);
-        }
-        let ok = envelope.get("success").and_then(|v| v.as_bool()) == Some(true);
-        if !ok || !out_path.is_file() {
-            let reason = envelope_error(&envelope)
-                .or_else(|| envelope_warnings(&envelope))
-                .unwrap_or_else(|| stderr_tail(&out));
+    if let Some(range) = range {
+        let out = media.join(format!("{stem}-range.png"));
+        let shot = screenshot(&officecli, &file, &["--range", range], &out).await.map_err(|reason| {
             // 容器实测:区域截图(clip)要 Chrome 系浏览器,officecli 在镜像里找不到;整表 / 按页可用
-            let hint = if range.is_some() {
-                " Rendering a cell range is not available here; call it again without `range` (use `pages` for a sheet)."
-            } else {
-                ""
-            };
-            return Err(format!("officecli could not render {}: {reason}{hint}", file.display()));
+            format!(
+                "{reason} Rendering a cell range is not available here; call it again without `range` \
+                 (use `pages` for a sheet)."
+            )
+        })?;
+        total_pages = shot;
+        images.push(out);
+    } else if let Some(pages) = &pages {
+        for p in pages {
+            let out = media.join(format!("{stem}-p{p}.png"));
+            let shot = screenshot(&officecli, &file, &["--page", &p.to_string()], &out).await?;
+            total_pages = total_pages.or(shot);
+            images.push(out);
         }
-        images.push(out_path.clone());
+    } else if group == OfficeGroup::Spreadsheets {
+        let out = media.join(format!("{stem}.png"));
+        total_pages = screenshot(&officecli, &file, &[], &out).await?;
+        images.push(out);
+    } else {
+        // 接触表。`--grid auto` 实测对 3 页的 deck 只给一列、画布固定 1600×1200 会把后面的页裁掉,
+        // 所以列数和画布高度自己算:先按缺省列数出一张拿到总页数,不合适再按算好的尺寸重出一次。
+        let requested = args
+            .get("grid")
+            .and_then(|v| v.as_u64())
+            .filter(|n| (1..=8).contains(n))
+            .map(|n| n as u32);
+        let out = media.join(format!("{stem}-overview.png"));
+        let first_cols = requested.unwrap_or(DEFAULT_GRID_COLUMNS);
+        total_pages =
+            screenshot(&officecli, &file, &["--grid", &first_cols.to_string()], &out).await?;
+        if let Some(total) = total_pages {
+            let (cols, height) = grid_layout(group, total, requested);
+            if cols != first_cols || height > DEFAULT_SCREENSHOT_HEIGHT {
+                screenshot(
+                    &officecli,
+                    &file,
+                    &["--grid", &cols.to_string(), "--screenshot-height", &height.to_string()],
+                    &out,
+                )
+                .await?;
+            }
+        }
+        images.push(out);
     }
 
     let what = match (range, &pages) {
@@ -436,6 +427,53 @@ fn unit(group: OfficeGroup, n: usize) -> &'static str {
         (_, true) => "page",
         (_, false) => "pages",
     }
+}
+
+const DEFAULT_GRID_COLUMNS: u32 = 3;
+/// officecli 截图画布的缺省尺寸。
+const DEFAULT_SCREENSHOT_WIDTH: u32 = 1600;
+const DEFAULT_SCREENSHOT_HEIGHT: u32 = 1200;
+/// 接触表画布最高多高 —— 再高图片太大,页数多时让模型按 `pages` 分批看。
+const MAX_GRID_HEIGHT: u32 = 4800;
+
+/// 接触表的列数与画布高度。缩略图宽 = 画布宽 / 列数,高按页面比例(幻灯片 16:9、文档 A4 竖版);
+/// 行间再留 35% 给页间距与页码,上下各 12px 边(容器实测:2 列时缩略图 782×440、行距 594)。
+fn grid_layout(group: OfficeGroup, total: u32, requested: Option<u32>) -> (u32, u32) {
+    let cols = requested.unwrap_or(match total {
+        0..=4 => 2,
+        5..=12 => 3,
+        _ => 4,
+    });
+    let aspect = if group == OfficeGroup::Documents { 1.414 } else { 0.5625 };
+    let tile_w = (DEFAULT_SCREENSHOT_WIDTH as f64 - 12.0 * (cols as f64 + 1.0)) / cols as f64;
+    let tile_h = tile_w * aspect;
+    let rows = total.div_ceil(cols).max(1) as f64;
+    let height = (24.0 + rows * tile_h + (rows - 1.0) * 0.35 * tile_h).ceil() as u32;
+    (cols, height.clamp(DEFAULT_SCREENSHOT_HEIGHT, MAX_GRID_HEIGHT))
+}
+
+/// 跑一次 `officecli view <file> screenshot <extra> -o <out> --json`,成功返回封包里的总页数。
+/// `-o` 必须是绝对路径:officecli 的常驻进程按它自己的工作目录解析相对路径(容器实测)。
+async fn screenshot(officecli: &Path, file: &Path, extra: &[&str], out: &Path) -> Result<Option<u32>, String> {
+    let _ = std::fs::remove_file(out);
+    let mut cmd = tokio_command(officecli);
+    cmd.arg("view")
+        .arg(file)
+        .arg("screenshot")
+        .args(extra)
+        .arg("-o")
+        .arg(out)
+        .arg("--json");
+    let res = run(cmd, RENDER_TIMEOUT).await?;
+    let envelope: Value = serde_json::from_slice(&res.stdout).unwrap_or(Value::Null);
+    let ok = envelope.get("success").and_then(|v| v.as_bool()) == Some(true);
+    if !ok || !out.is_file() {
+        let reason = envelope_error(&envelope)
+            .or_else(|| envelope_warnings(&envelope))
+            .unwrap_or_else(|| stderr_tail(&res));
+        return Err(format!("officecli could not render {}: {reason}", file.display()));
+    }
+    Ok(pages_total(&envelope))
 }
 
 /// officecli 的 `--json` 封包把总页数放在 warning 里:`[pages] total=3`。
@@ -972,17 +1010,45 @@ Say so in one sentence; the instance needs a newer image.";
 const DEFAULT_BROWSERS_PATH: &str = "/opt/pw-browsers";
 
 /// 用 playwright 的 chromium 把一个 HTML 文件打印成 PDF。参数:HTML 路径、PDF 路径。
-const PRINT_PDF_SCRIPT: &str = r#"
+///
+/// officecli 的 `view html` 是**预览页**不是打印稿(容器实测,直接打印的结果):pptx 是 100vh、
+/// 内部滚动的查看器 → 只印出一页 Letter、幻灯片里没字;docx 有 body 内边距 → 第一页空白。
+/// 所以先认出结构(`.slide` / `.page`),按它的尺寸设 `@page`、去掉查看器外壳、每页分页,再打印。
+/// 认不出就原样打印(普通 HTML)。`#screenshot` 让预览页进 headless 模式(藏侧栏)。
+const PRINT_PDF_SCRIPT: &str = r##"
 import pathlib, sys
 from playwright.sync_api import sync_playwright
 src, out = sys.argv[1], sys.argv[2]
+SLIDES = """@page {{ size: {w}px {h}px; margin: 0 }}
+html, body {{ height: auto !important; overflow: visible !important; display: block !important; background: #fff !important; padding: 0 !important; margin: 0 !important }}
+.sidebar, .sidebar-toggle, .toggle-zone, .page-counter, .slide-label {{ display: none !important }}
+.main {{ display: block !important; overflow: visible !important; padding: 0 !important; gap: 0 !important }}
+.slide-container, .slide-wrapper {{ display: block !important; margin: 0 !important; gap: 0 !important }}
+.slide {{ box-shadow: none !important; border-radius: 0 !important; transform: none !important; break-after: page; margin: 0 !important }}"""
+PAGES = """@page {{ size: {w}px {h}px; margin: 0 }}
+html, body {{ background: #fff !important; padding: 0 !important; margin: 0 !important }}
+.page-wrapper {{ margin: 0 !important; box-shadow: none !important; transform: none !important }}
+.page {{ box-shadow: none !important; margin: 0 !important; break-after: page }}"""
 with sync_playwright() as p:
     browser = p.chromium.launch()
-    page = browser.new_page()
-    page.goto(pathlib.Path(src).resolve().as_uri(), wait_until="networkidle")
+    page = browser.new_page(viewport={"width": 1600, "height": 1200})
+    page.goto(pathlib.Path(src).resolve().as_uri() + "#screenshot", wait_until="networkidle")
+    page.wait_for_timeout(500)
+    info = page.evaluate("""() => {
+      const first = (sel) => document.querySelector(sel);
+      const box = (el) => { const r = el.getBoundingClientRect(); return [r.width, r.height]; };
+      const slide = first('.slide'); if (slide) return ['slides', box(slide)];
+      const pg = first('.page'); if (pg) return ['pages', box(pg)];
+      return ['flow', null];
+    }""")
+    kind, size = info
+    if size:
+        css = (SLIDES if kind == 'slides' else PAGES).format(w=size[0], h=size[1])
+        page.add_style_tag(content=css)
+    page.emulate_media(media="print")
     page.pdf(path=out, print_background=True, prefer_css_page_size=True)
     browser.close()
-"#;
+"##;
 
 /// 每份指南末尾都接这一段 —— officecli 自己不知道的、只属于这个平台的规矩。
 pub const PLATFORM_RULES: &str = "\
@@ -1094,6 +1160,43 @@ mod tests {
         let mut blocks = vec![PromptInputBlock::Text { text: "hello".into() }];
         preload_mentioned_guides(&mut blocks).await;
         assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn grid_layout_grows_the_canvas_instead_of_cropping() {
+        // 3 页 deck:2 列,一张缺省画布放得下
+        assert_eq!(grid_layout(OfficeGroup::Presentations, 3, None), (2, 1200));
+        // 20 页 deck:4 列 5 行,画布加高
+        let (cols, h) = grid_layout(OfficeGroup::Presentations, 20, None);
+        assert_eq!(cols, 4);
+        assert!(h > 1200 && h <= MAX_GRID_HEIGHT, "{h}");
+        // A4 竖版比幻灯片高得多
+        assert!(
+            grid_layout(OfficeGroup::Documents, 6, None).1
+                > grid_layout(OfficeGroup::Presentations, 6, None).1
+        );
+        // 显式列数优先,画布有上限
+        assert_eq!(
+            grid_layout(OfficeGroup::Documents, 200, Some(2)),
+            (2, MAX_GRID_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn print_script_is_valid_python() {
+        let Some(python) = resolve_command_on_path("python3") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("print_pdf.py");
+        std::fs::write(&path, PRINT_PDF_SCRIPT).unwrap();
+        let ok = std::process::Command::new(python)
+            .args(["-m", "py_compile"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "PRINT_PDF_SCRIPT does not compile");
     }
 
     #[test]
