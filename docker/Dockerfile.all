@@ -41,7 +41,7 @@
 #   的打包弹窗选了哪个 codeg 版本,就拉**那个 tag 下的这份文件**原样构建;弹窗里展示的
 #   依赖版本也是解析这份文件的 `ARG V_*` 得来。所以:
 #   · 这里的 `V_*` 就是镜像装的版本,构建时不会被覆盖;
-#   · 由 codeg 固定的那几个(openclaw / claude-code / pi-acp / dsh / hermes-agent)
+#   · 由 codeg 固定的那几个(openclaw / claude-code / pi-coding-agent / dsh / hermes-agent)
 #     必须与 src-tauri/src/acp/registry.rs 一致 —— `acp::image_pins_tests` 会校验,
 #     改 registry 的 pin 时同一个提交里一起改这里;
 #   · 不需要任何 COPY,构建上下文可以是空目录。
@@ -243,31 +243,23 @@ RUN test -n "${CODEG_VERSION}" && test -n "${CODEG_SHA256}" \
 # 与 registry.rs 的 pin 一致(image_pins_tests 校验)。
 # claude_code 2026-09-18 起走 codeg 的 CLI 通道(每轮 `claude -p`),**不再装 ACP 外壳**
 # claude-agent-acp,直接装本体。
-# V_PI_RUNTIME 是 pi 本体,registry 只 pin pi-acp 适配器,本体版本由这里定。
+# pi 2026-10-18 起同样只装本体(`@earendil-works/pi-coding-agent`,codeg 走 CLI 通道每轮
+# `pi --print --mode json`),不再装 ACP 外壳 pi-acp;V_PI 即本体版本。
 ARG V_OPENCLAW=2026.9.4
 ARG V_CLAUDE_CODE=2.1.276
-ARG V_PI=0.0.33
-ARG V_PI_RUNTIME=0.84.2
+ARG V_PI=1.3.0
 RUN su ubuntu -c "npm install -g \
       --allow-scripts=@anthropic-ai/claude-code \
       openclaw@${V_OPENCLAW} \
       @anthropic-ai/claude-code@${V_CLAUDE_CODE} \
-      pi-acp@${V_PI} \
-      @earendil-works/pi-coding-agent@${V_PI_RUNTIME}" \
+      @earendil-works/pi-coding-agent@${V_PI}" \
  && su ubuntu -c "npm cache clean --force" \
  && rm -rf /home/ubuntu/.npm/_logs
 
-# pi 的 MCP:本体没有 MCP、pi-acp 也不转发 mcpServers,由扩展 pi-mcp-adapter 读每个 agent
-# 自己的 `$PI_CODING_AGENT_DIR/mcp.json`(MyClaw 投影写)去连。装进共享 ~/.pi/agent
-# (settings.json 的 packages + npm/),每个 agent 的 overlay 经软链共用。
-# 版本与 MyClaw overlay-agent-sync.ts 的 PI_MCP_ADAPTER_VERSION 同步 —— 存量实例由投影
-# 按那个版本补装。它只声明兼容 pi-ai ^0.84.1 / ^0.85.0,升 V_PI_RUNTIME 时要一起看。
-# registry 不管它(不是 ACP),版本由这里定。
-ARG V_PI_MCP_ADAPTER=2.34.0
-RUN su ubuntu -c "PATH=/home/ubuntu/.npm-global/bin:\$PATH pi install npm:pi-mcp-adapter@${V_PI_MCP_ADAPTER}" \
- && su ubuntu -c "grep -q '\"version\": \"${V_PI_MCP_ADAPTER}\"' /home/ubuntu/.pi/agent/npm/node_modules/pi-mcp-adapter/package.json" \
- && su ubuntu -c "npm cache clean --force" \
- && rm -rf /home/ubuntu/.npm/_logs
+# pi 的 MCP 用本体自带的(pi ≥ 0.99):读每个 agent 自己的 `$PI_CODING_AGENT_DIR/mcp.json`
+# (MyClaw 投影写,按服务器设 exposure)。**不要**再装扩展 pi-mcp-adapter —— 装了就整体替换
+# 本体的 MCP,它把工具藏在一个 `mcp` 网关后、不给服务器说明,不点名时模型不用我们的工具
+# (2026-10-18 C10 实测,见 MyClaw overlay-agent-sync.ts 的 piMcpJson)。
 
 # deepseek_harness_acp:官方 DeepSeek Harness 启动器 `@deepseek-ai/dsh`。
 # 2026-09-18 起**不再装 ACP 外壳 deepseek-acp**:codeg 直接驱动 `dsh --profile headless
@@ -344,7 +336,7 @@ RUN set -e \
  && test -x /home/ubuntu/.local/bin/officecli \
  && test -d /opt/pw-browsers \
  && test -x /opt/codeg/codeg-server \
- && for agent_cmd in openclaw claude pi-acp hermes dsh; do \
+ && for agent_cmd in openclaw claude pi hermes dsh; do \
       if ! test -x "/home/ubuntu/.npm-global/bin/$agent_cmd"; then \
         echo "ERROR: 预装 npm agent 缺失: $agent_cmd (注意不能用 su ubuntu -c command -v 探测 —— su 会按 login.defs 重置 PATH,npm-global 不在其中,overlay 测试构建实测假阴性)"; exit 1; \
       fi; \

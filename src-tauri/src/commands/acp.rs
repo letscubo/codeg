@@ -13207,11 +13207,19 @@ pub async fn acp_uninstall_agent(
     acp_uninstall_agent_core(agent_type, task_id, &db, &emitter).await
 }
 
-/// The npm package that ships the `pi` binary pi-acp spawns as `pi --mode rpc`.
-/// Installed unpinned ("latest"): pi releases frequently and pi-acp resolves
-/// `pi` from PATH, so the binary's version floats independently of the pinned
-/// `pi-acp` adapter (which `acp_prepare_npx_agent` installs separately).
+/// The npm package that ships the `pi` binary the CLI transport runs
+/// (`acp::cli::pi_driver`, `pi --print --mode json`).
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+
+/// fork(letscubo): 装 registry 钉住的那个 pi 本体(`AgentType::Pi` 的 distribution),不跟 npm
+/// latest —— CLI 通道的事件映射与本体 MCP 的 exposure 都是按这个版本验证的(2026-10-18 起;
+/// 之前装 unpinned latest,本体版本在实例间漂移)。
+fn pinned_pi_package() -> String {
+    match crate::acp::registry::get_agent_meta(AgentType::Pi).distribution {
+        crate::acp::registry::AgentDistribution::Npx { package, .. } => package.to_string(),
+        _ => PI_CODING_AGENT_PACKAGE.to_string(),
+    }
+}
 
 /// Install the `pi` binary globally via npm, streaming progress on the shared
 /// `app://agent-install` topic. This is the prerequisite the missing-pi launch
@@ -13225,7 +13233,7 @@ pub(crate) async fn acp_install_pi_binary_core(
     emit_agent_install_event(emitter, &task_id, AgentInstallEventKind::Started, "");
 
     let result =
-        install_npm_global_package_streaming(PI_CODING_AGENT_PACKAGE, &task_id, emitter).await;
+        install_npm_global_package_streaming(&pinned_pi_package(), &task_id, emitter).await;
 
     match &result {
         Ok(()) => emit_agent_install_event(

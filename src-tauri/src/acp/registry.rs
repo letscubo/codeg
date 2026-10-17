@@ -1889,29 +1889,25 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Pi => AcpAgentMeta {
             agent_type,
-            // pi-acp accepts ACP-wire `mcpServers` but drops them (does not
-            // forward to pi), and pi has no native MCP. supports_mcp stays
-            // `true` only to satisfy the `only_openclaw_opts_out_of_mcp`
-            // invariant — actual wire forwarding is short-circuited in
-            // `connection.rs` (see the skip-list), so neither user servers nor
-            // the codeg-mcp companion are futilely forwarded.
+            // fork(letscubo): pi 走 codeg 的 CLI 通道(每轮 `pi --print --mode json`,见
+            // acp::cli::pi_driver),不经 ACP;MCP 由 pi 本体自带的 MCP 读
+            // `$PI_CODING_AGENT_DIR/mcp.json`(MyClaw 投影写),codeg 不经 wire 下发 ——
+            // `connection.rs` 的 `agent_delivers_wire_mcp` 把 Pi 排除在外。supports_mcp 保持
+            // `true` 只为满足 `only_openclaw_opts_out_of_mcp` 不变量。
             supports_mcp: true,
             name: "Pi",
-            description: "Self-extensible coding agent (ACP via pi-acp)",
-            // pi-acp 0.0.33 spawns `pi --mode rpc` as a child, so `pi` (npm
-            // `@earendil-works/pi-coding-agent`) must be resolvable on PATH —
-            // or pointed at a custom build via the `PI_ACP_PI_COMMAND` env
-            // (see BYO-pi). Args are empty: the ACP server is the default mode
-            // (`npx -y pi-acp`, no subcommand). `node_required` follows pi's
-            // 22+ requirement (pi-acp's own engines say >=20). The embedded
-            // context env lets pi-acp advertise `promptCapabilities.embeddedContext`.
+            description: "Self-extensible coding agent (pi CLI)",
+            // 与 claude_code / deepseek 一样,分发即本体:安装、版本、升级都以
+            // `@earendil-works/pi-coding-agent` 为准(2026-10-18 起不再装 ACP 外壳 pi-acp,
+            // 也不再装扩展 pi-mcp-adapter —— 它会整体替换本体的 MCP)。1.3.0 起用本体 MCP
+            // 的 exposure(deferred / direct),本体 MCP 需 ≥ 0.99。engines 要 node >=22.19。
             distribution: AgentDistribution::Npx {
-                version: "0.0.33",
-                package: "pi-acp@0.0.33",
-                cmd: "pi-acp",
+                version: "1.3.0",
+                package: "@earendil-works/pi-coding-agent@1.3.0",
+                cmd: "pi",
                 args: &[],
-                env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
-                node_required: Some("22.0.0"),
+                env: &[],
+                node_required: Some("22.19.0"),
             },
         },
         AgentType::Grok => AcpAgentMeta {
@@ -2689,7 +2685,12 @@ mod tests {
             "@openai/codex@0.155.0",
             Some("16.0.0"),
         );
-        assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
+        assert_npx_version(
+            AgentType::Pi,
+            "1.3.0",
+            "@earendil-works/pi-coding-agent@1.3.0",
+            Some("22.19.0"),
+        );
         assert_npx_version(
             AgentType::Grok,
             "1.0.34",
