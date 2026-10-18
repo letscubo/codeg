@@ -74,6 +74,12 @@ pub enum ClientMsg {
         #[serde(default)]
         body: serde_json::Value,
     },
+    /// MyClaw fork ext: the user just interacted with the page (keyboard /
+    /// mouse / touch while the page is visible). Fire-and-forget, no reply.
+    /// Only stamps a clock (`acp::presence`) that `GET /api/myclaw/activity`
+    /// reports as `user_active_ago_s`, so the platform can tell "someone is
+    /// using it" apart from "a tab is merely connected".
+    UserActivity,
 }
 
 #[derive(Debug, Clone, Serialize)]

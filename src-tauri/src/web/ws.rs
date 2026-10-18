@@ -437,6 +437,9 @@ async fn handle_client_msg(
         ClientMsg::Ping => {
             let _ = outbound_tx.send(ServerMsg::Pong).await;
         }
+        ClientMsg::UserActivity => {
+            crate::acp::presence::note_user_activity();
+        }
     }
 }
 
@@ -452,6 +455,13 @@ mod tests {
             std::future::pending::<()>().await;
         });
         ActiveSubscription { handle, epoch }
+    }
+
+    /// fork(letscubo):前端「用户在页面上操作了」的上报是一条无参数消息。
+    #[test]
+    fn user_activity_parses_as_a_client_msg() {
+        let msg: ClientMsg = serde_json::from_str(r#"{"action":"user_activity"}"#).unwrap();
+        assert!(matches!(msg, ClientMsg::UserActivity));
     }
 
     #[tokio::test]

@@ -805,6 +805,10 @@ impl SessionState {
     /// 单一分发器：把一个 AcpEvent 应用到 self。注意此方法**不**自增 event_seq——
     /// seq 由 emit_with_state 在外层管理（这样 apply_event 可独立单元测试）。
     pub fn apply_event(&mut self, payload: &AcpEvent) {
+        // fork(letscubo):一轮结束(Prompting → 别的状态)时给 myclaw/activity 的
+        // `turn_ended_ago_s` 打点(见 acp/presence.rs)。放在这个单一分发器里而不是某个
+        // 事件分支:轮次可以经 TurnComplete、StatusChanged、Error 等多条路结束。
+        let was_prompting = self.status == ConnectionStatus::Prompting;
         match payload {
             AcpEvent::SessionStarted { session_id } => {
                 if self.external_id.as_deref() != Some(session_id.as_str()) {
@@ -1478,6 +1482,9 @@ impl SessionState {
             }
         }
         self.last_activity_at = Utc::now();
+        if was_prompting && self.status != ConnectionStatus::Prompting {
+            crate::acp::presence::note_turn_ended();
+        }
     }
 
     /// Whether this connection has launched background work (async sub-agent /
@@ -3237,6 +3244,21 @@ mod tests {
     /// Parent → subagent → parent interleave must produce three blocks: the
     /// merge predicate requires the SAME `parent_tool_use_id`, so subagent
     /// prose can never concatenate onto the main thread (and vice versa).
+    #[test]
+    fn turn_settling_stamps_the_presence_clock() {
+        // fork(letscubo):Prompting → Connected 时给 myclaw/activity 的 turn_ended_ago_s 打点
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sid".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+            duration_ms: None,
+        });
+        assert_eq!(s.status, ConnectionStatus::Connected);
+        assert_eq!(crate::acp::presence::turn_ended_ago_s(), 0);
+    }
+
     #[test]
     fn parented_delta_interleave_never_merges_across_attribution() {
         let mut s = fresh_state();

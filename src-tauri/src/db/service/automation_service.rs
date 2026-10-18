@@ -673,6 +673,21 @@ pub async fn list_due(conn: &DatabaseConnection, now: DateTime<Utc>) -> Result<V
     Ok(rows.into_iter().map(|m| m.id).collect())
 }
 
+/// fork(letscubo):最近一次要触发的定时任务时刻(启用、未删、按计划触发、`next_run_at`
+/// 非空里最早的那个);没有返回 `None`。给 `GET /api/myclaw/activity` 的
+/// `next_automation_in_s` 用 —— 平台据此不在任务快到点时停实例。
+pub async fn next_scheduled_run(conn: &DatabaseConnection) -> Result<Option<DateTime<Utc>>, DbError> {
+    let row = automation::Entity::find()
+        .filter(automation::Column::Enabled.eq(true))
+        .filter(automation::Column::DeletedAt.is_null())
+        .filter(automation::Column::TriggerKind.eq(TriggerKind::Schedule))
+        .filter(automation::Column::NextRunAt.is_not_null())
+        .order_by_asc(automation::Column::NextRunAt)
+        .one(conn)
+        .await?;
+    Ok(row.and_then(|m| m.next_run_at))
+}
+
 /// Atomically claim a due automation's current fire slot: advance `next_run_at`
 /// to the next cron instant after `now` via a CAS on the read value, so exactly
 /// one runner fires the slot — even across a desktop + server both pointing at
@@ -1219,6 +1234,24 @@ mod tests {
             .into_active_model();
         am.next_run_at = Set(Some(at));
         am.update(&db.conn).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_scheduled_run_is_the_earliest_enabled_schedule() {
+        let db = fresh_in_memory_db().await;
+        assert_eq!(next_scheduled_run(&db.conn).await.unwrap(), None);
+
+        let soon = create(&db.conn, draft("soon", Some("* * * * *"))).await.unwrap();
+        let later = create(&db.conn, draft("later", Some("* * * * *"))).await.unwrap();
+        let disabled = create(&db.conn, draft("off", Some("* * * * *"))).await.unwrap();
+        let t1 = Utc::now() + chrono::Duration::minutes(10);
+        let t2 = Utc::now() + chrono::Duration::minutes(40);
+        force_next_run_at(&db, soon.id, t1).await;
+        force_next_run_at(&db, later.id, t2).await;
+        set_enabled(&db.conn, disabled.id, false).await.unwrap();
+
+        let got = next_scheduled_run(&db.conn).await.unwrap().unwrap();
+        assert_eq!(got.timestamp(), t1.timestamp());
     }
 
     #[tokio::test]

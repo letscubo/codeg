@@ -33,6 +33,17 @@
 //! ⚠️ 读的是每条连接 `state.status`(事件流实时写入),不是 `AgentConnection.status`
 //! —— 后者是建连时的快照,之后不再更新,`acp_list_connections` 返回的就是它。
 //!
+//! ## 「最近有没有人用」(2026-10-18)
+//!
+//! `ws_clients` 只说明有页面连着,后台挂着的标签页也算 —— 平台若拿它挡停机,实例就永远停不
+//! 下来。所以再报三个「距今多久」(只报事实,规则由平台定):
+//!
+//! - `user_active_ago_s`:距上次用户在页面上操作(前端发 `user_activity`)
+//! - `turn_ended_ago_s`:距上一轮结束
+//! - `next_automation_in_s`:距最近一次定时任务到点(null = 没有或读不到)
+//!
+//! 前两个是进程内单调时钟算的间隔(容器时钟在快照恢复后会漂,不报时刻),见 `acp/presence.rs`。
+//!
 //! 鉴权与 `/api/myclaw/exec` 同:受保护路由组内,Bearer 或 WS 子协议。
 
 use std::sync::Arc;
@@ -53,13 +64,33 @@ pub struct ActivityResponse {
     pub active_turns: usize,
     /// 采集时刻(RFC3339),调用方据此判断新鲜度。
     pub collected_at: String,
+    /// 距上次「用户在页面上操作」过了几秒(前端经 `/ws/events` 发 `user_activity`)。
+    /// 进程启动后还没有过 = 距启动的秒数。见 `acp/presence.rs`。
+    pub user_active_ago_s: u64,
+    /// 距上一轮结束(任何连接从「正在跑」变成别的状态)过了几秒;还没有过 = 距启动的秒数。
+    pub turn_ended_ago_s: u64,
+    /// 最近一次定时任务还有几秒到点(已过点还没被认领的报 0);没有启用的定时任务、或读库
+    /// 失败时为 null —— 调用方应把 null 当「不知道」,而不是「没有任务」去放心停机。
+    pub next_automation_in_s: Option<i64>,
 }
 
 pub async fn activity(Extension(state): Extension<Arc<AppState>>) -> Json<ActivityResponse> {
+    let now = chrono::Utc::now();
+    let next_automation_in_s =
+        match crate::db::service::automation_service::next_scheduled_run(&state.db.conn).await {
+            Ok(at) => at.map(|at| (at - now).num_seconds().max(0)),
+            Err(e) => {
+                tracing::warn!("[myclaw/activity] next_scheduled_run failed: {e}");
+                None
+            }
+        };
     Json(ActivityResponse {
         ws_clients: crate::web::ws::ws_client_count(),
         active_turns: count_active_turns(&state.connection_manager).await,
-        collected_at: chrono::Utc::now().to_rfc3339(),
+        collected_at: now.to_rfc3339(),
+        user_active_ago_s: crate::acp::presence::user_active_ago_s(),
+        turn_ended_ago_s: crate::acp::presence::turn_ended_ago_s(),
+        next_automation_in_s,
     })
 }
 

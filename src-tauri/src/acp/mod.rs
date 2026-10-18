@@ -32,6 +32,8 @@ pub mod opencode_catalog;
 pub mod opencode_plugins;
 pub mod plan_approval;
 pub mod preflight;
+// fork(letscubo)专属: 「最近一次有人用」的两个时钟(用户操作 / 一轮结束),给 myclaw/activity 读。
+pub mod presence;
 pub mod prompt_hydration;
 pub mod question;
 pub mod registry;
