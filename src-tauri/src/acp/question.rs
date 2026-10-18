@@ -57,6 +57,18 @@ pub const MAX_HEADER_CHARS: usize = 12;
 /// produce anything this long.
 pub const MAX_QUESTION_TEXT_CHARS: usize = 4096;
 
+/// fork(letscubo): how a runtime that only reaches the companion over the HTTP
+/// endpoint (`web::handlers::myclaw::mcp`, today pi) proves WHICH conversation is
+/// asking. The pi driver mints a per-connection delegation token and puts it in
+/// this env var for every turn; the platform writes the companion entry with a
+/// `HTTP_SESSION_HEADER: ${HTTP_SESSION_TOKEN_ENV}` header (pi expands `${VAR}` in
+/// MCP headers), and the endpoint looks the token up in the delegation registry to
+/// find the connection to park the question on. Without it the endpoint only
+/// knows the agent, which can run several conversations at once.
+pub const HTTP_SESSION_TOKEN_ENV: &str = "MYCLAW_CODEG_SESSION";
+/// The request header carrying [`HTTP_SESSION_TOKEN_ENV`]'s value.
+pub const HTTP_SESSION_HEADER: &str = "x-codeg-session";
+
 /// One selectable choice in a question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionOption {

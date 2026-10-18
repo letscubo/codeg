@@ -48,7 +48,7 @@ use super::stream_json::{CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, 
 use crate::acp::connection::{
     map_prompt_blocks, record_prompt, record_transcript_header_continuing,
     record_transcript_update, record_turn_end, record_turn_error_raw, AgentConnection,
-    ConnectionCommand,
+    ConnectionCommand, DelegationInjection,
 };
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessageBlock};
@@ -74,6 +74,44 @@ pub(crate) struct PiDriver {
     /// session links back to it so the recorded history reads as one
     /// conversation. Only a NEW transcript takes it.
     pub continues_from: Option<String>,
+    /// fork(letscubo): the delegation registry the session token below lives in
+    /// (revoked from it when the driver stops).
+    pub delegation: Option<DelegationInjection>,
+    /// fork(letscubo): this conversation's token for the HTTP companion
+    /// (see [`crate::acp::question::HTTP_SESSION_TOKEN_ENV`]); `None` when
+    /// `ask_user_question` is off or there is no delegation registry.
+    pub session_token: Option<String>,
+}
+
+/// fork(letscubo): mint the per-connection token pi presents to the HTTP
+/// companion so `ask_user_question` can be parked on THIS conversation.
+///
+/// pi only reaches the companion over HTTP (its own MCP reads the projected
+/// `mcp.json`; codeg has no per-session MCP wire into `pi --print`), and that
+/// endpoint otherwise knows only the agent. The token goes in the same registry
+/// the stdio companion's `--token` does, so the endpoint resolves it exactly like
+/// the listener's `ask_target`. Only minted while asking is enabled.
+pub(crate) async fn mint_session_token(
+    injection: Option<&DelegationInjection>,
+    connection_id: &str,
+    working_dir: &Path,
+) -> Option<String> {
+    let injection = injection?;
+    if !injection.ask.is_enabled().await {
+        return None;
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    injection
+        .tokens
+        .register(
+            token.clone(),
+            crate::acp::delegation::listener::TokenEntry {
+                parent_connection_id: connection_id.to_string(),
+                working_dir: working_dir.to_path_buf(),
+            },
+        )
+        .await;
+    Some(token)
 }
 
 enum TurnEnd {
@@ -138,7 +176,9 @@ impl PiDriver {
                     blocks,
                     user_message,
                 } => {
-                    if self.run_turn(blocks, user_message, &mut commands).await {
+                    let stop = self.run_turn(blocks, user_message, &mut commands).await;
+                    self.reclaim_questions().await;
+                    if stop {
                         break;
                     }
                 }
@@ -151,8 +191,28 @@ impl PiDriver {
             status: ConnectionStatus::Disconnected,
         })
         .await;
+        if let (Some(inj), Some(token)) = (&self.delegation, &self.session_token) {
+            inj.tokens.revoke(token).await;
+        }
+        self.reclaim_questions().await;
         self.connections.lock().await.remove(&self.connection_id);
         tracing::info!(connection_id = %self.connection_id, "[CLI][pi] driver stopped");
+    }
+
+    /// fork(letscubo): a question pi parked over the HTTP companion cannot outlive
+    /// its turn — the `pi --print` process that was waiting on it has exited (or
+    /// was killed by a cancel). Drop it so the card clears and the connection's
+    /// one-at-a-time slot frees, instead of trusting the HTTP layer to notice the
+    /// client went away.
+    async fn reclaim_questions(&self) {
+        if self.session_token.is_none() {
+            return;
+        }
+        if let Some(inj) = &self.delegation {
+            inj.questions
+                .cancel_questions_by_parent(&self.connection_id)
+                .await;
+        }
     }
 
     /// Runs one turn; returns `true` when the connection must shut down.
@@ -241,6 +301,13 @@ impl PiDriver {
             .args(args)
             .current_dir(&self.working_dir)
             .envs(&self.runtime_env)
+            // fork(letscubo): always set, empty when there is no token, so the
+            // projected `${MYCLAW_CODEG_SESSION}` header always resolves (an empty
+            // header is simply ignored by the endpoint).
+            .env(
+                crate::acp::question::HTTP_SESSION_TOKEN_ENV,
+                self.session_token.as_deref().unwrap_or(""),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

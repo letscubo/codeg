@@ -327,6 +327,15 @@ impl ConnectionManager {
                 tokio::spawn(driver.run(cmd_rx));
             }
             None if request.agent_type == AgentType::Pi => {
+                // fork(letscubo): pi's ask_user_question rides the HTTP companion,
+                // which finds this conversation by this token (see pi_driver).
+                let delegation = self.delegation_snapshot();
+                let session_token = pi_driver::mint_session_token(
+                    delegation.as_ref(),
+                    &connection_id,
+                    &request.working_dir,
+                )
+                .await;
                 let driver = pi_driver::PiDriver {
                     connection_id: connection_id.clone(),
                     agent_type: request.agent_type,
@@ -342,6 +351,8 @@ impl ConnectionManager {
                     // 已经带了),这里不再另指一个,免得两处定义打架。
                     session_dir: None,
                     continues_from,
+                    delegation,
+                    session_token,
                 };
                 tokio::spawn(driver.run(cmd_rx));
             }

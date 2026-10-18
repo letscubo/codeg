@@ -65,6 +65,12 @@
 //! 不出现在 `tools/list`,被按名硬调也一律回 "unknown tool"(与 stdio 同一句,不泄露
 //! "功能存在但关着")。
 //!
+//! 例外是 **`ask_user_question` + 会话凭证**(2026-10-18):请求带了
+//! [`crate::acp::question::HTTP_SESSION_HEADER`],且值在委派凭证表里认得出(pi 驱动按连接
+//! 签发、每轮放进 `MYCLAW_CODEG_SESSION`,平台在 pi 的 mcp.json 里写成 `${…}`),这个会话
+//! 才多开 `ask` 一组;登记、等回答、渲染与 stdio 那条同一套。没带 / 认不出照旧只有上面这些。
+//! openclaw 是常驻网关、所有会话共用一个进程,带不出会话身份,仍然没有 ask。
+//!
 //! 平台工具(`platform`,清单与实现都在 MyClaw 平台,见 `commands::myclaw_platform`)
 //! 只要 agent 级身份:调用时把 URL 末段作 `{ agentKey }` 交给平台。内置工具名(哪怕所在
 //! 组没开)一律不转平台 —— 平台工具不能冒充内置工具。
@@ -88,7 +94,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use crate::acp::delegation::companion::{
-    enabled_embedded_tools, instructions_with_overview, is_embedded_tool_name,
+    enabled_embedded_tools, instructions_with_overview, is_embedded_tool_name, render_ask_result,
     render_platform_result, render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME,
 };
 use crate::app_state::AppState;
@@ -394,7 +400,9 @@ pub async fn rpc(
     let Some(id) = req.id else {
         return StatusCode::ACCEPTED.into_response();
     };
-    let features = CompanionFeatures::parse(Some(&http_features()));
+    // fork: 带了认得出的会话凭证(pi 每轮由 codeg 设),这个会话才多开 ask。
+    let session = session_of(&state, &headers).await;
+    let features = CompanionFeatures::parse(Some(&features_for(session.is_some())));
     let body = match req.method.as_str() {
         "initialize" => {
             let overview = platform_overview_for_init(&StateUpload(&state.db)).await;
@@ -404,12 +412,131 @@ pub async fn rpc(
             Ok(result) => envelope_ok(id, result),
             Err(e) => envelope_err(id, -32603, e),
         },
-        "tools/call" => {
-            call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await
-        }
+        "tools/call" => match &session {
+            Some(s) if requested_tool(&req.params) == Some("ask_user_question") => {
+                ask_user_question(&state, s, id, req.params).await
+            }
+            _ => call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await,
+        },
         other => envelope_err(id, -32601, format!("method not found: {other}")),
     };
     Json(body).into_response()
+}
+
+/// fork: 认出来的会话 —— 凭证本身(收尾前要再核一次)与它登记的连接。
+struct SessionRef {
+    token: String,
+    connection_id: String,
+}
+
+/// 读 [`crate::acp::question::HTTP_SESSION_HEADER`],到委派凭证表里找连接(与 stdio
+/// 那条 listener 的 `ask_target` 同一张表)。没带、为空(codeg 对没凭证的会话设空串)、
+/// 认不出、或提问功能关着 —— 一律当没有会话,端点退回 agent 级。
+async fn session_of(state: &AppState, headers: &HeaderMap) -> Option<SessionRef> {
+    let token = headers
+        .get(crate::acp::question::HTTP_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    if !state.question_config.is_enabled().await {
+        return None;
+    }
+    let entry = state.delegation_tokens.lookup(token).await?;
+    Some(SessionRef {
+        token: token.to_string(),
+        connection_id: entry.parent_connection_id,
+    })
+}
+
+/// 有会话时在 [`http_features`] 上加 `ask`。
+fn features_for(has_session: bool) -> String {
+    let base = http_features();
+    if has_session {
+        format!("{base},ask")
+    } else {
+        base
+    }
+}
+
+fn requested_tool(params: &Option<Value>) -> Option<&str> {
+    params.as_ref()?.get("name")?.as_str()
+}
+
+/// 提问挂着时被丢弃(客户端超时 / 断开 → handler 的 future 被 drop)就撤掉卡片。
+/// pi 驱动在每轮结束时也会按连接回收一遍,这里是早一步的那道。
+struct PendingAsk {
+    state: Arc<AppState>,
+    connection_id: String,
+    question_id: String,
+    settled: bool,
+}
+
+impl Drop for PendingAsk {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let conn = std::mem::take(&mut self.connection_id);
+        let question = std::mem::take(&mut self.question_id);
+        tokio::spawn(async move {
+            state
+                .connection_manager
+                .cancel_question(&conn, &question)
+                .await;
+        });
+    }
+}
+
+/// fork: HTTP 上的 `ask_user_question` —— 与 stdio 那条(companion 校验 → listener
+/// 登记 → 等回答)同一套:参数校验、登记、渲染都复用,只是在本进程里直接等。
+/// 登记不上(这条连接已有一个待答 / 连接没了)回「已跳过」,让模型按自己判断继续,
+/// 与 listener 的处理一致。
+async fn ask_user_question(
+    state: &Arc<AppState>,
+    session: &SessionRef,
+    id: Value,
+    params: Option<Value>,
+) -> Value {
+    let declined = |id: Value| {
+        envelope_ok(
+            id,
+            render_ask_result(&json!({ "answers": [], "declined": true })),
+        )
+    };
+    let arguments = params
+        .as_ref()
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let questions = match crate::acp::question::parse_questions(&arguments) {
+        Ok(qs) => qs,
+        Err(msg) => return envelope_err(id, -32602, msg),
+    };
+    let Some(reg) = state
+        .connection_manager
+        .register_question(&session.connection_id, questions)
+        .await
+    else {
+        return declined(id);
+    };
+    let mut pending = PendingAsk {
+        state: Arc::clone(state),
+        connection_id: session.connection_id.clone(),
+        question_id: reg.question_id,
+        settled: false,
+    };
+    // 与 listener 同一道收尾竞态:凭证在登记前后被回收(会话正在拆),立刻撤掉。
+    if state.delegation_tokens.lookup(&session.token).await.is_none() {
+        return declined(id); // pending 在这里 drop,撤卡
+    }
+    let outcome = reg.answer_rx.await;
+    pending.settled = true;
+    match outcome.ok().and_then(|o| serde_json::to_value(o).ok()) {
+        Some(o) => envelope_ok(id, render_ask_result(&o)),
+        // 发送端被丢(连接拆了 / 本轮结束被回收):按「已跳过」收
+        None => declined(id),
+    }
 }
 
 /// 一条 agent 的 MCP 条目,平台照抄进 runtime 自己的配置文件。
@@ -431,6 +558,20 @@ pub struct McpEntry {
     /// 这条传输开启的工具组与工具名,给平台做投影自检用(不影响 openclaw 读配置)。
     pub features: Vec<String>,
     pub tools: Vec<String>,
+    /// fork: 会话级身份怎么带(见 [`crate::acp::question::HTTP_SESSION_TOKEN_ENV`])。
+    /// 平台只给**会把 `${VAR}` 展开、且由 codeg 按会话设了这个变量**的 runtime(pi)
+    /// 加这条请求头;openclaw 是常驻网关,所有会话共用一个进程,不加。老 codeg 没有
+    /// 这个字段,平台就不加 —— 不会写出一个没人设的变量。
+    pub session_header: SessionHeader,
+}
+
+/// 见 [`McpEntry::session_header`]。
+#[derive(Debug, serde::Serialize)]
+pub struct SessionHeader {
+    /// 请求头名。
+    pub name: &'static str,
+    /// 值取自的环境变量名(平台写成 `${env}`)。
+    pub env: &'static str,
 }
 
 /// 条目名里用的**短**标识。
@@ -492,6 +633,10 @@ pub async fn entry(
         headers: hdrs,
         features: enabled.split(',').map(str::to_string).collect(),
         tools,
+        session_header: SessionHeader {
+            name: crate::acp::question::HTTP_SESSION_HEADER,
+            env: crate::acp::question::HTTP_SESSION_TOKEN_ENV,
+        },
     })
     .into_response()
 }
@@ -823,6 +968,44 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(&format!("/api/myclaw/mcp/{AGENT}")));
+        // 平台据此给 pi 写 `${MYCLAW_CODEG_SESSION}` 请求头;老 codeg 没有这个字段。
+        assert_eq!(
+            entry["sessionHeader"],
+            json!({ "name": "x-codeg-session", "env": "MYCLAW_CODEG_SESSION" })
+        );
+        // 条目本身不因此多出 ask —— ask 只给认得出会话的请求开。
+        assert!(!entry["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "ask_user_question"));
+    }
+
+    /// 认出会话才多一组 ask;否则与原来的组完全一样。
+    #[test]
+    fn ask_is_exposed_only_with_a_session() {
+        let without = CompanionFeatures::parse(Some(&features_for(false)));
+        assert!(!without.allows_tool("ask_user_question"));
+        assert!(without.allows_tool("upload_file"));
+        let with = CompanionFeatures::parse(Some(&features_for(true)));
+        assert!(with.allows_tool("ask_user_question"));
+        assert!(with.allows_tool("upload_file"));
+        // 委派 / 反馈 / 建工作任务仍然不开 —— 这条只解决提问。
+        for name in ["delegate_to_agent", "check_user_feedback", "create_work_task"] {
+            assert!(!with.allows_tool(name), "{name} must stay closed");
+        }
+        let names = tool_names(&tools_list_result(with).unwrap());
+        assert!(names.contains(&"ask_user_question".to_string()));
+    }
+
+    #[test]
+    fn requested_tool_reads_the_call_name() {
+        assert_eq!(
+            requested_tool(&Some(json!({ "name": "ask_user_question", "arguments": {} }))),
+            Some("ask_user_question")
+        );
+        assert_eq!(requested_tool(&Some(json!({}))), None);
+        assert_eq!(requested_tool(&None), None);
     }
 
     /// 平台给了工具总览就接在交付说明后面;没给就原样。
