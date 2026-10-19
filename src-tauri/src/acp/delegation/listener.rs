@@ -569,6 +569,11 @@ impl DelegationListener {
                 // 不长轮询、无可取消的副作用
                 platform_call_response(self.process_office(req).await)?
             }
+            BrokerMessage::BrowserTool(req) => {
+                // 转给实例的常驻浏览器执行进程(commands::myclaw_browser),排队与单次调用都有上限;
+                // 调用方中途走掉也让它跑完 —— 半截打断会留下状态不明的页面
+                platform_call_response(self.process_browser(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -891,6 +896,17 @@ impl DelegationListener {
             return Err("invalid token".to_string());
         };
         Ok(crate::commands::myclaw_office::call(&req.name, &req.arguments, Some(&entry.working_dir)).await)
+    }
+
+    /// fork(letscubo)专属: 校验 token 后交给内置浏览器(整个实例一份,不需要会话目录)。
+    async fn process_browser(
+        &self,
+        req: crate::acp::delegation::transport::BrokerBrowserRequest,
+    ) -> Result<Value, String> {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return Err("invalid token".to_string());
+        }
+        Ok(crate::commands::myclaw_browser::call(&req.name, &req.arguments).await)
     }
 
     /// 校验 token 后把上传交给实现。失败原因原样回给模型 —— 它要据此决定重试还是收手。

@@ -30,6 +30,8 @@ pub mod office_tools;
 pub mod myclaw_upload;
 // fork(letscubo)专属: 内置 Office 工具(documents / pdf / presentations / spreadsheets)
 pub mod myclaw_office;
+// fork(letscubo)专属: 内置浏览器工具(browser_exec / browser_screenshot),浏览器与执行进程归 codeg
+pub mod myclaw_browser;
 // fork(letscubo)专属: 伴生「平台工具」—— tools/list、tools/call 转给 MyClaw 平台(签名请求)。
 pub mod myclaw_platform;
 pub mod open_in;

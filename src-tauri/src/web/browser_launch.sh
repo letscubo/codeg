@@ -1,16 +1,18 @@
 #!/bin/bash
-# MyClaw fork ext (letscubo) —— 把某个 agent 的浏览器起起来就退出(编进 codeg,ws_browser.rs 调用)。
+# MyClaw fork ext (letscubo) —— 把浏览器起起来就退出(编进 codeg,commands/myclaw_browser.rs 调用:
+# 内置浏览器工具与浏览器悬浮窗共用)。
 #
-# 浏览器是实例自带的能力:用户在 MyClaw 的浏览器悬浮窗里随时能打开任意 agent 的浏览器,
-# 不管装没装浏览器应用、应用授没授权给这个 agent。应用只决定 agent 自己能不能在对话里用浏览器工具。
+# 由 codeg 起、脚本随即退出:浏览器被 init 收养,不在任何 agent 运行时的进程树里。
+# openclaw 2026.10.5 每轮结束回收 MCP 并清掉它的整棵子孙进程(ownProcessTree),浏览器若由
+# 某个 MCP 拉起就每轮被杀(麻豆传媒 2026-10-19:12 次 MCP 启动对应 12 次浏览器启动)。
 #
-# 和应用启动脚本(MyClaw 仓库 apps/myclaw-browser/skills/myclaw-browser/bin/browser-mcp.sh)
-# 共用同一套约定,两边谁先起都一样,agent 之后在对话里用的就是这里起的这个浏览器(登录态共用):
-#   ~/.myclaw-browser/<agent>/{port,profile,window-size,chrome.log}、全实例锁 .launch.lock、
+# 目录约定与浏览器应用的启动脚本(MyClaw 仓库 apps/myclaw-browser/skills/myclaw-browser/bin/browser-mcp.sh)
+# 一致,老版本 codeg 的实例还在用它:
+#   ~/.myclaw-browser/<key>/{port,profile,window-size,display,chrome.log}、全实例锁 .launch.lock、
 #   端口 9230–9330、.no-sandbox 标记、短临时目录 /tmp/mcb-<摘要>。
-# 改这里的启动参数要同步改那边。
+# 内置浏览器一个实例一份,key 固定为 `instance`(见 myclaw_browser::BROWSER_KEY)。
 #
-# 用法:MYCLAW_AGENT_ID=<id> bash -c "$script" myclaw-browser-launch
+# 用法:MYCLAW_AGENT_ID=<key> bash -c "$script" myclaw-browser-launch
 # 成功:stdout 打印端口、退出 0;内存不够退出 3;其余失败退出 1,原因在 stderr 最后一行。
 set -u
 
@@ -69,18 +71,56 @@ SANDBOX_FLAG=""
 WINSIZE_FILE="$BASE/window-size"
 window_flag() {
   local ws
-  ws=$(tr -d ' \n' 2>/dev/null <"$WINSIZE_FILE") || return 0
+  ws=$(tr -d ' \n' 2>/dev/null <"$WINSIZE_FILE") || ws=""
   if [[ "$ws" =~ ^([0-9]{3,4}),([0-9]{3,4})$ ]] && [ "${BASH_REMATCH[1]}" -le 1400 ] && [ "${BASH_REMATCH[2]}" -le 1000 ]; then
     echo "--window-size=$ws"
+  elif [ -n "${DISPLAY_FLAG:-}" ]; then
+    # 有头时没记过大小:给一个装得下 1280×800 可视区的窗口(无头的默认窗口只有 800×600 左右)
+    echo "--window-size=1280,900"
   fi
 }
 
+# 有头模式(2026-10-19):无头 chromium 的 UA 带 HeadlessChrome,Cloudflare Turnstile 这类人机
+# 验证一直过不去(麻豆传媒实例上 claude.ai 卡在 "Just a moment";同机有头对照能进登录页)。
+# 有 Xvfb 就给浏览器开一块虚拟屏幕、以有头方式运行;没有 Xvfb 才退回 --headless=new。
+# 画面与接管照旧走 CDP(screencast / Input.*),与有头无头无关。
+# 屏幕和浏览器一样 setsid 脱离启动它的进程;显示号记在 $BASE/display,下次复用。
+XVFB=$(command -v Xvfb 2>/dev/null || true)
+DISPLAY_FILE="$BASE/display"
+display_alive() {
+  [ -n "$1" ] && [ -S "/tmp/.X11-unix/X$1" ] && [ -f "/tmp/.X$1-lock" ] \
+    && kill -0 "$(tr -d ' \n' <"/tmp/.X$1-lock" 2>/dev/null)" 2>/dev/null
+}
+ensure_display() {
+  [ -n "$XVFB" ] || return 1
+  local n
+  n=$(tr -cd '0-9' 2>/dev/null <"$DISPLAY_FILE")
+  display_alive "$n" && { echo "$n"; return 0; }
+  for n in $(seq 99 160); do
+    [ -e "/tmp/.X$n-lock" ] && continue
+    setsid "$XVFB" ":$n" -screen 0 1440x1050x24 -nolisten tcp >>"$LOG" 2>&1 </dev/null 8>&- &
+    for _ in $(seq 1 20); do
+      sleep 0.25
+      display_alive "$n" && { echo "$n" >"$DISPLAY_FILE"; echo "$n"; return 0; }
+    done
+  done
+  return 1
+}
+
 launch() {
-  local from
+  local from dnum
+  local mode=(--headless=new)
   from=$(wc -l 2>/dev/null <"$LOG" || echo 0)
-  TMPDIR="$BTMP" setsid "$CHROME" --headless=new --remote-debugging-port="$1" \
+  DISPLAY_FLAG=""
+  if dnum=$(ensure_display); then
+    DISPLAY_FLAG=":$dnum"
+    mode=()
+  fi
+  # 有头:去掉 --headless,DISPLAY 指到虚拟屏幕
+  DISPLAY="${DISPLAY_FLAG:-${DISPLAY:-}}" TMPDIR="$BTMP" setsid "$CHROME" "${mode[@]}" --remote-debugging-port="$1" \
     --remote-debugging-address=127.0.0.1 --user-data-dir="$PROF" \
     --no-first-run --no-default-browser-check --disable-gpu --disable-dev-shm-usage --disable-infobars \
+    --window-position=0,0 --password-store=basic \
     $SANDBOX_FLAG $(window_flag) about:blank >>"$LOG" 2>&1 </dev/null 8>&- &
   # ↑ 8>&- 不能省:chromium 常驻,继承了锁句柄就永远不放,下一次启动会卡死在 flock
   for _ in $(seq 1 25); do

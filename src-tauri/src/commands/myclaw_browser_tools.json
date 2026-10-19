@@ -1,0 +1,24 @@
+[
+  {
+    "name": "browser_exec",
+    "description": "Run Python in a persistent browser session (variables survive across calls); returns what the code prints. This instance has ONE real Chromium shared by every agent on it, and the user can watch it live.\nSTART WITH THESE (pre-loaded):\n- elements(): print the current page as a numbered list of clickable/typeable elements plus its visible text. Use it to read the page and find things.\n- act(n): click [n]; act(n, 'text', enter=True): replace field [n]'s text (optionally press Enter); act(n) on a 'select … → \"option\"' row picks that option; act('down') / act('up') scroll. act() re-checks the page before touching it and prints the new list afterwards.\nBATCH: when the list already shows everything the next steps need, do them in ONE call — e.g. act(1, 'Alice', observe=False); act(2, '555', observe=False); act(5, observe=False); act(9) — only the last one prints the new list. A step that fails prints 'Not done' and returns False; stop there and look again. Do not spend one call per field or checkbox.\nNavigation: new_tab(url) for the first page, then goto_url(url); wait_for_load(). After new_tab / switching tabs run cdp('Page.bringToFront') before taking a screenshot.\nThe user watches this browser live: leave your last page open — never close_tab() at the end.\nLower level when needed: js(code), cdp(method, **params), list_tabs(), switch_tab(), upload_file(), iframe_target(), page_info().\nThere is NO navigate tool and NO Playwright / browser_use.Browser / page.* API here — do not import them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "description": "Python code to execute" }
+      },
+      "required": ["code"]
+    }
+  },
+  {
+    "name": "browser_screenshot",
+    "description": "Capture the current page of the shared browser and return it as an image. Run cdp('Page.bringToFront') in browser_exec first if you just opened or switched a tab. Do not pass full=True unless you really need the whole page — it is much larger.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "full": { "type": "boolean", "description": "Capture beyond the viewport (full page)", "default": false },
+        "max_dim": { "type": "integer", "minimum": 1, "description": "Downscale so no side exceeds this many pixels" }
+      }
+    }
+  }
+]

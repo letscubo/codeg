@@ -38,7 +38,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::acp::delegation::companion::{office_instructions, COMPANION_INSTRUCTIONS};
+use crate::acp::delegation::companion::{
+    office_instructions, BROWSER_INSTRUCTIONS, COMPANION_INSTRUCTIONS,
+};
+use crate::commands::myclaw_browser::browser_available;
 use crate::commands::myclaw_office::host_office_features;
 
 /// 写入的文件名。优先级最高的那个名字 —— 其余候选存在时我们本来就不写。
@@ -91,6 +94,13 @@ you cannot upload without searching first.\n"
         out.push_str(&format!(
             "\n{section}\n\nThese tools also load on demand: find one with `tool_search` (query: its name, \
 e.g. \"presentations_guide\") and call it with `tool_call` (e.g. `mcp__myclaw__presentations_guide`).\n"
+        ));
+    }
+    if browser_available() {
+        // fork(letscubo)专属: 内置浏览器同在 myclaw 上,同样按需加载
+        out.push_str(&format!(
+            "\n{BROWSER_INSTRUCTIONS}\n\nThese tools also load on demand: find them with `tool_search` (query: \
+\"browser_exec\") and call them with `tool_call` (`mcp__myclaw__browser_exec`, `mcp__myclaw__browser_screenshot`).\n"
         ));
     }
     if let Some(o) = overview.map(str::trim).filter(|o| !o.is_empty()) {

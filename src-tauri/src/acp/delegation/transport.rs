@@ -278,6 +278,16 @@ pub struct BrokerOfficeRequest {
     pub arguments: Value,
 }
 
+/// fork(letscubo)专属: 调一个内置浏览器工具(commands::myclaw_browser)。浏览器整个实例一份,
+/// token 只用来确认来路。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerBrowserRequest {
+    pub token: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
@@ -304,6 +314,8 @@ pub enum BrokerMessage {
     PlatformCall(BrokerPlatformCallRequest),
     /// fork(letscubo)专属: 内置 Office 工具。
     OfficeTool(BrokerOfficeRequest),
+    /// fork(letscubo)专属: 内置浏览器工具。
+    BrowserTool(BrokerBrowserRequest),
     /// Liveness probe. Unlike every other variant this one is NOT sent by a
     /// companion — it comes from codeg's own service-status check
     /// (`acp::delegation::service`), which is why it carries no `token`: a
@@ -502,6 +514,14 @@ pub async fn client_office_round_trip(
     req: &BrokerOfficeRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::OfficeTool(req.clone())).await
+}
+
+/// fork(letscubo)专属: 调一个内置浏览器工具,回 `{ok, result | error}`。
+pub async fn client_browser_round_trip(
+    socket_path: &str,
+    req: &BrokerBrowserRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::BrowserTool(req.clone())).await
 }
 
 /// Dispatch a `task_progress` report and read back the `{ recorded }` ack.

@@ -485,6 +485,9 @@ async fn async_main() -> ExitCode {
         ));
     }
 
+    // fork(letscubo): 内置浏览器的执行进程闲置回收(浏览器本身常驻,不在这里关)。
+    tokio::spawn(codeg_lib::commands::myclaw_browser::browser_worker_idle_sweep_task());
+
     // Automation engine (mirrors lib.rs setup): manual + scheduled fires,
     // event-bus completion, reconcile, boot recovery. One per process.
     if let Some(engine) = codeg_lib::automation::build_engine(
@@ -613,6 +616,7 @@ async fn async_main() -> ExitCode {
     // Graceful shutdown: release any live office watch preview servers
     // (kill_on_drop is the backstop, but this frees their ports promptly).
     codeg_lib::office_watch::stop_all_office_watches();
+    codeg_lib::commands::myclaw_browser::stop_browser_worker();
     ExitCode::SUCCESS
 }
 

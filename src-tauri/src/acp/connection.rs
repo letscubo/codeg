@@ -5187,6 +5187,8 @@ struct CompanionFeatureFlags {
     /// fork(letscubo)专属: 内置 Office 工具四组(commands::myclaw_office)。documents /
     /// presentations / spreadsheets 只在装了 officecli 时开;pdf 常开,缺依赖由工具自报。
     office: crate::acp::delegation::companion::OfficeFeatures,
+    /// fork(letscubo)专属: 内置浏览器(commands::myclaw_browser)。找得到 chromium 与 python3 时开。
+    browser: bool,
 }
 
 /// The `--features` value for a companion launch, or `None` when no group is
@@ -5227,6 +5229,9 @@ fn companion_features_arg(flags: CompanionFeatureFlags) -> Option<String> {
         if flags.office.enabled(group) {
             features.push(group.feature());
         }
+    }
+    if flags.browser {
+        features.push("browser");
     }
     if features.is_empty() {
         return None;
@@ -5377,6 +5382,7 @@ where
         uploads: true,
         platform: true,
         office: crate::commands::myclaw_office::host_office_features(),
+        browser: crate::commands::myclaw_browser::browser_available(),
     };
     // `None` (no feature enabled) short-circuits BEFORE the binary lookup, the
     // token registration and the server append: there is no companion to launch,
@@ -24587,15 +24593,18 @@ mod tests {
                     presentations: true,
                     spreadsheets: true,
                 },
+                browser: true,
             }),
             Some(
                 "delegation,feedback,ask,sessions,tasks,automations,taskboard,uploads,platform,\
-                 documents,pdf,presentations,spreadsheets"
+                 documents,pdf,presentations,spreadsheets,browser"
                     .to_string()
             )
         );
         // fork: 平台工具组单开也注入伴生
         assert_eq!(only(|f| f.platform = true), Some("platform".to_string()));
+        // fork: 内置浏览器单开也注入伴生
+        assert_eq!(only(|f| f.browser = true), Some("browser".to_string()));
         // fork: Office 组单开也注入伴生,且只列开着的组
         assert_eq!(only(|f| f.office.pdf = true), Some("pdf".to_string()));
     }

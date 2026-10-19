@@ -71,6 +71,9 @@
 //! 才多开 `ask` 一组;登记、等回答、渲染与 stdio 那条同一套。没带 / 认不出照旧只有上面这些。
 //! openclaw 是常驻网关、所有会话共用一个进程,带不出会话身份,仍然没有 ask。
 //!
+//! 内置 Office 四组与内置浏览器(`browser`,整个实例一份,见 `commands::myclaw_browser`)也不需要
+//! 会话,与 stdio 同一份实现。
+//!
 //! 平台工具(`platform`,清单与实现都在 MyClaw 平台,见 `commands::myclaw_platform`)
 //! 只要 agent 级身份:调用时把 URL 末段作 `{ agentKey }` 交给平台。内置工具名(哪怕所在
 //! 组没开)一律不转平台 —— 平台工具不能冒充内置工具。
@@ -98,6 +101,7 @@ use crate::acp::delegation::companion::{
     render_platform_result, render_upload_result, CompanionFeatures, COMPANION_SERVER_NAME,
 };
 use crate::app_state::AppState;
+use crate::commands::myclaw_browser;
 use crate::commands::myclaw_office::{self, OfficeGroup};
 use crate::commands::myclaw_upload::ArtifactUploadAccess;
 use crate::web::handlers::myclaw::download::ServerToken;
@@ -110,6 +114,7 @@ const HTTP_FEATURES: &str = "uploads,platform";
 /// 实际开启的组:[`HTTP_FEATURES`] + 内置 Office 工具(同样只要 agent 级身份)。
 /// documents / presentations / spreadsheets 只在装了 officecli 时开,与 stdio 注入同一判据;
 /// pdf 常开,缺什么由各工具自己报。这条传输没有会话目录,Office 工具只认绝对路径或 `~`。
+/// 内置浏览器整个实例一份、不需要会话,与 stdio 同一判据(有 chromium 与 python3)。
 fn http_features() -> String {
     let office = myclaw_office::host_office_features();
     let mut groups: Vec<&str> = HTTP_FEATURES.split(',').collect();
@@ -119,6 +124,9 @@ fn http_features() -> String {
             .filter(|g| office.enabled(*g))
             .map(OfficeGroup::feature),
     );
+    if myclaw_browser::browser_available() {
+        groups.push("browser");
+    }
     groups.join(",")
 }
 
@@ -224,7 +232,7 @@ fn initialize_result(overview: Option<&str>, features: CompanionFeatures) -> Val
         "capabilities": { "tools": {} },
         // 与 stdio 那条同一段文字 —— 交付义务只写一处,见 COMPANION_INSTRUCTIONS;
         // 后面接平台下发的工具总览(见 instructions_with_overview)。
-        "instructions": instructions_with_overview(overview, features.office),
+        "instructions": instructions_with_overview(overview, features.office, features.browser),
     })
 }
 
@@ -310,6 +318,10 @@ async fn call_tool(
         // 内置 Office 工具:与 stdio 同一份实现;这条传输没有会话目录(working_dir = None)。
         office if OfficeGroup::of_tool(office).is_some() => {
             envelope_ok(id, myclaw_office::call(office, &arguments, None).await)
+        }
+        // 内置浏览器:与 stdio 同一份实现,整个实例一份(哪个 agent 调都是同一个浏览器)。
+        browser if myclaw_browser::is_browser_tool_name(browser) => {
+            envelope_ok(id, myclaw_browser::call(browser, &arguments).await)
         }
         other => envelope_err(id, -32602, format!("unknown tool: {other}")),
     }

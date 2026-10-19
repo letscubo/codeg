@@ -148,6 +148,21 @@ RUN pip3 install --break-system-packages -q playwright \
  && test -d /opt/pw-browsers
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 
+# 内置浏览器(codeg commands::myclaw_browser):browser-use 的 CLI MCP 作常驻执行进程(浏览器与它
+# 都由 codeg 持有,不在 agent 运行时的进程树里),Xvfb 给 chromium 一块虚拟屏幕以有头方式运行
+# (无头的 UA 带 HeadlessChrome,Cloudflare 一类人机验证过不去)。venv 装在 /opt,ubuntu 只读;
+# `.ready` 是 codeg 认「装好了」的标记 —— 没有这一层的老镜像,codeg 会运行时装到 ~/.myclaw-browser/venv。
+ARG V_BROWSER_USE=0.13.11
+ARG V_BROWSER_HARNESS=0.1.13
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/myclaw-browser/venv \
+ && /opt/myclaw-browser/venv/bin/pip install -q "browser-use==${V_BROWSER_USE}" "browser-harness==${V_BROWSER_HARNESS}" \
+ && /opt/myclaw-browser/venv/bin/python -c "import browser_use.mcp.cli_mcp, browser_harness.helpers" \
+ && touch /opt/myclaw-browser/venv/.ready \
+ && rm -rf /root/.cache/pip \
+ && command -v Xvfb
+
 # officecli 本体 (官方安装器,装到 ~/.local/bin)。以 ubuntu 身份装 —— solution
 # prepare 的 probe 就是 `test -x /home/ubuntu/.local/bin/officecli`。
 # 安装器会探测 runtime 决定要不要顺带装 skill;**本层必须排在预装 agent 层
@@ -335,6 +350,7 @@ RUN set -e \
  && ldconfig -p | grep -q libicu \
  && test -x /home/ubuntu/.local/bin/officecli \
  && test -d /opt/pw-browsers \
+ && test -f /opt/myclaw-browser/venv/.ready && command -v Xvfb \
  && test -x /opt/codeg/codeg-server \
  && for agent_cmd in openclaw claude pi hermes dsh; do \
       if ! test -x "/home/ubuntu/.npm-global/bin/$agent_cmd"; then \

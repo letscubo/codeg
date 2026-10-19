@@ -1,9 +1,9 @@
-//! MyClaw fork ext (letscubo) —— agent 浏览器的实时画面与接管。
+//! MyClaw fork ext (letscubo) —— 实例浏览器的实时画面与接管。
 //!
-//! MyClaw 的浏览器应用给每个 agent 起一个自己的 headless chromium(启动脚本见 MyClaw 仓库
-//! `apps/myclaw-browser/skills/myclaw-browser/bin/browser-mcp.sh`),调试端口记在
-//! `~/.myclaw-browser/<agent>/port`。页面想看 agent 正在浏览器里干什么、必要时自己伸手点
-//! (登录、验证码),就连这条 `/ws/browser?agent=<id>`:
+//! 浏览器由 codeg 起、整个实例一份(内置浏览器工具 `commands::myclaw_browser` 与本面板共用,
+//! 目录 `~/.myclaw-browser/instance/`,调试端口记在其中的 `port`)。页面想看 agent 正在浏览器里
+//! 干什么、必要时自己伸手点(登录、验证码),就连这条 `/ws/browser?agent=<id>`(`agent` 只校验,
+//! 不再用来选浏览器):
 //!
 //! ```text
 //! 网页 ──WS(本路由,与 /ws/events 同一把 token)──> codeg ──CDP──> 127.0.0.1:<port>
@@ -15,8 +15,7 @@
 //! (`{"type":"icon","targetId","data"}`;这页没有图标时 `data` 为 null,页面据此清掉旧图标)。
 //!
 //! 浏览器不在(从没用过 / 被关掉)时页面在地址栏输网址:用 codeg 自带的启动脚本
-//! (`browser_launch.sh`,与应用脚本同一套约定)把这个 agent 的浏览器起起来,再在新标签页里打开 ——
-//! 和装没装浏览器应用无关;
+//! (`browser_launch.sh`)把浏览器起起来,再在新标签页里打开;
 //! 浏览器在但一个标签页都没有时同样开新标签页。
 //! ```
 //!
@@ -52,6 +51,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message as CdpMessage;
 
+use crate::commands::myclaw_browser::{launch_browser, BROWSER_KEY};
+
 /// 调试端口的合法范围:启动脚本从 9230 起挑(9222 留给手工调试)。只连这个范围里的本机端口,
 /// 端口文件被改写也连不到别的服务上去。
 const PORT_RANGE: std::ops::RangeInclusive<u16> = 9222..=9400;
@@ -61,8 +62,6 @@ const SCREENCAST: &str =
 const WAIT_BROWSER: Duration = Duration::from_secs(2);
 /// 刚连上时逐个问标签页的等待上限 —— 卡死的页面不回话,不能让面板一直等它。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-/// 启动脚本起浏览器的等待上限:脚本自己最多等 25 秒,再给排队拿锁留点余量。
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 /// 网页可视区的上下限(CSS 像素)。上限与截图费用挂钩,下限再小网页就没法用了。
 const VIEW_MIN: (f64, f64) = (320.0, 200.0);
 const VIEW_MAX: (f64, f64) = (1280.0, 800.0);
@@ -244,43 +243,6 @@ pub(crate) fn navigate_url(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// codeg 自带的启动脚本(见 `browser_launch.sh`):和浏览器应用的启动脚本同一套目录、端口、锁,
-/// 所以不装应用也能打开,装了应用 agent 在对话里用的也是同一个浏览器。
-const LAUNCH_SCRIPT: &str = include_str!("browser_launch.sh");
-
-/// 把这个 agent 的浏览器起起来(同一份资料、同一个端口、记住的窗口大小)。
-async fn launch_browser(agent: &str) -> Result<(), String> {
-    let run = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(LAUNCH_SCRIPT)
-        .arg("myclaw-browser-launch")
-        .env("MYCLAW_AGENT_ID", agent)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(LAUNCH_TIMEOUT, run)
-        .await
-        .map_err(|_| "starting the browser timed out".to_string())?
-        .map_err(|e| format!("cannot run the browser start script: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    let line = err
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    Err(if line.is_empty() {
-        format!(
-            "the browser did not start (exit {})",
-            out.status.code().unwrap_or(-1)
-        )
-    } else {
-        line.trim().to_string()
-    })
-}
-
 /// `view-size` 文件("宽,高")→ 可视区。
 pub(crate) fn parse_view(text: &str) -> Option<(f64, f64)> {
     let (w, h) = text.trim().split_once(',')?;
@@ -348,9 +310,12 @@ async fn run(mut socket: WebSocket, agent: String) {
         .await;
         return;
     }
-    // 等浏览器出现:agent 第一次用浏览器之前端口文件不存在;用户在面板里关掉浏览器后端口
-    // 文件还在、浏览器不在。页面开着面板等就行 —— 或者直接在地址栏输网址:这里用浏览器应用
-    // 的启动脚本(`--launch`)把这个 agent 的浏览器起起来,连上后在新标签页里打开它。
+    // 2026-10-19 起浏览器一个实例一份(内置浏览器工具也用它):不管从哪个 agent 打开,看的都是
+    // 同一个。`agent` 参数照旧校验(老页面还会带),只是不再用来选浏览器。
+    let agent = BROWSER_KEY.to_string();
+    // 等浏览器出现:第一次用浏览器之前端口文件不存在;用户在面板里关掉浏览器后端口文件还在、
+    // 浏览器不在。页面开着面板等就行 —— 或者直接在地址栏输网址:这里用 codeg 自带的启动脚本
+    // 把浏览器起起来,连上后在新标签页里打开它。
     let mut announced = false;
     let mut pending_url: Option<String> = None;
     let (port, ws_url) = loop {
@@ -391,7 +356,7 @@ async fn run(mut socket: WebSocket, agent: String) {
             let _ = send_json(&mut socket, json!({"type": "status", "state": "launching"})).await;
             match launch_browser(&agent).await {
                 // 起来了下一圈就连上(连不上的话重新告诉页面「没有浏览器」)
-                Ok(()) => {
+                Ok(_) => {
                     pending_url = Some(url);
                     announced = false;
                 }

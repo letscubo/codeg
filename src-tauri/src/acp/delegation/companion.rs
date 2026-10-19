@@ -45,13 +45,13 @@ use crate::acp::chat_authoring::{
     NewAutomationSpec, NewWorkTaskSpec, MAX_PROMPT_CHARS, MAX_TITLE_CHARS,
 };
 use crate::acp::delegation::transport::{
-    client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_create_automation_round_trip, client_create_work_task_round_trip,
+    client_ask_round_trip, client_browser_round_trip, client_cancel, client_cancel_task_round_trip,
+    client_commit_feedback, client_create_automation_round_trip, client_create_work_task_round_trip,
     client_feedback_round_trip, client_office_round_trip, client_platform_call_round_trip,
     client_platform_catalog_round_trip, client_resume_task_round_trip, client_round_trip,
     client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
     client_task_progress_round_trip, client_upload_round_trip, BrokerAskRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerBrowserRequest, BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
     BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
     BrokerOfficeRequest, BrokerPlatformCallRequest, BrokerPlatformCatalogRequest, BrokerRequest,
     BrokerResponse,
@@ -60,6 +60,7 @@ use crate::acp::delegation::transport::{
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
+use crate::commands::myclaw_browser;
 use crate::commands::myclaw_office::{self, OfficeGroup};
 use crate::models::AutomationAction;
 
@@ -215,6 +216,8 @@ pub struct CompanionFeatures {
     pub platform: bool,
     /// fork(letscubo)专属: 内置 Office 工具四组(commands::myclaw_office)。
     pub office: OfficeFeatures,
+    /// fork(letscubo)专属: 内置浏览器(`browser_exec` / `browser_screenshot`,commands::myclaw_browser)。
+    pub browser: bool,
 }
 
 /// fork(letscubo)专属: documents / pdf / presentations / spreadsheets 各自的开关。
@@ -279,6 +282,7 @@ impl CompanionFeatures {
                 uploads: false,
                 platform: false,
                 office: OfficeFeatures::NONE,
+                browser: false,
             };
         };
         let mut f = Self {
@@ -292,6 +296,7 @@ impl CompanionFeatures {
             uploads: false,
             platform: false,
             office: OfficeFeatures::NONE,
+            browser: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -304,6 +309,7 @@ impl CompanionFeatures {
                 "taskboard" => f.taskboard = true,
                 "uploads" => f.uploads = true,
                 "platform" => f.platform = true,
+                "browser" => f.browser = true,
                 other => f.office.set(other),
             }
         }
@@ -320,6 +326,7 @@ impl CompanionFeatures {
             "create_automation" => self.automations,
             "create_work_task" => self.taskboard,
             "upload_file" => self.uploads,
+            "browser_exec" | "browser_screenshot" => self.browser,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation"
             | "resume_delegation" => self.delegation,
             other => OfficeGroup::of_tool(other).is_some_and(|g| self.office.enabled(g)),
@@ -334,6 +341,7 @@ pub fn embedded_tools() -> Result<Vec<Value>, String> {
         .map_err(|e| format!("embedded schema invalid: {e}"))?;
     let mut tools = base.as_array().cloned().unwrap_or_default();
     tools.extend(myclaw_office::tools_for(|_| true));
+    tools.extend(myclaw_browser::tools());
     Ok(tools)
 }
 
@@ -492,11 +500,19 @@ async fn append_platform_tools(ctx: &CompanionContext, tools: &mut Value) {
 /// fork(letscubo)专属: 伴生的 MCP `instructions` —— 自己的交付说明,后面接平台下发的工具总览。
 /// 按需加载工具的 runtime(claude_code、hermes)起初只看得到工具名,靠这段才知道平台工具能做什么。
 /// 没有总览(不是平台托管 / 平台不可达 / 老平台)时就是原来那段。stdio 与 HTTP 两条传输共用。
-pub fn instructions_with_overview(overview: Option<&str>, office: OfficeFeatures) -> String {
+pub fn instructions_with_overview(
+    overview: Option<&str>,
+    office: OfficeFeatures,
+    browser: bool,
+) -> String {
     let mut out = COMPANION_INSTRUCTIONS.to_string();
     if let Some(section) = office_instructions(office) {
         out.push_str("\n\n");
         out.push_str(&section);
+    }
+    if browser {
+        out.push_str("\n\n");
+        out.push_str(BROWSER_INSTRUCTIONS);
     }
     if let Some(o) = overview.map(str::trim).filter(|o| !o.is_empty()) {
         out.push_str("\n\n");
@@ -504,6 +520,23 @@ pub fn instructions_with_overview(overview: Option<&str>, office: OfficeFeatures
     }
     out
 }
+
+/// fork(letscubo)专属: 开了浏览器组时追加的一段。规则取自原浏览器应用的 SKILL.md(MyClaw 仓库
+/// apps/myclaw-browser),只留模型最常踩的几条;工具名同样写不带前缀的后半截。
+pub const BROWSER_INSTRUCTIONS: &str = "\
+BROWSER. This server also carries a real Chromium for this instance — `browser_exec` (Python with \
+helpers, variables persist across calls) and `browser_screenshot`. Use it whenever a task needs a \
+website rather than an API: reading pages, filling forms, walking a sign-up / checkout flow, admin \
+consoles. Prefer it over any other browser or web-fetch tool you may have: the user watches this one \
+live and can step in (logins, CAPTCHAs).
+- Read and act with elements() / act(n) inside browser_exec; open the first page with new_tab(url), \
+then goto_url(url). Batch steps in one call when the list already shows what you need.
+- After new_tab or switching tabs, run cdp('Page.bringToFront') before browser_screenshot.
+- Leave your last page open — never close_tab() at the end; close old finished tabs when there are more than ~5.
+- One browser is shared by every agent on this instance, and sign-ins persist. Never sign out, never \
+enter credentials the user did not give you, and ask before anything with real-world consequences \
+(purchases, sending, deleting).
+- If a page shows a human check you cannot pass, ask the user to complete it in the live browser view, then continue.";
 
 /// fork(letscubo)专属: 开了 Office 组时追加的一段 —— 只列开着的格式。工具名写的是不带前缀的
 /// 后半截,与上面 `upload_file` 同一写法(各 runtime 的前缀不同,模型照工具表上的全名调)。
@@ -652,7 +685,11 @@ pub async fn dispatch_line(
                     },
                     "capabilities": { "tools": {} },
                     // 服务器自述,客户端并进系统提示 —— 见 COMPANION_INSTRUCTIONS 的注释。
-                    "instructions": instructions_with_overview(overview.as_deref(), ctx.features.office),
+                    "instructions": instructions_with_overview(
+                        overview.as_deref(),
+                        ctx.features.office,
+                        ctx.features.browser,
+                    ),
                 }),
             ))
         }
@@ -1075,6 +1112,17 @@ async fn build_tools_call_spawn(
                 arguments,
             };
             let round_trip = Box::pin(async move { client_office_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_platform_result).await
+        }
+        browser if myclaw_browser::is_browser_tool_name(browser) => {
+            // fork(letscubo)专属: 浏览器与执行进程都在父进程(commands::myclaw_browser)里,
+            // 整个实例一份;结果是完整的 CallToolResult(截图是 image 块)。
+            let req = BrokerBrowserRequest {
+                token: ctx.token.clone(),
+                name: browser.to_string(),
+                arguments,
+            };
+            let round_trip = Box::pin(async move { client_browser_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_platform_result).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
@@ -1920,6 +1968,7 @@ mod tests {
             uploads: false,
             platform: false,
             office: OfficeFeatures::NONE,
+            browser: false,
         })
     }
 
@@ -2514,6 +2563,7 @@ mod tests {
         uploads: false,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2526,6 +2576,7 @@ mod tests {
         uploads: false,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2538,6 +2589,7 @@ mod tests {
         uploads: false,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2550,6 +2602,7 @@ mod tests {
         uploads: false,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -2891,6 +2944,7 @@ mod tests {
         uploads: true,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
 
     #[tokio::test]
@@ -3045,6 +3099,7 @@ mod tests {
         uploads: true,
         platform: true,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
 
     /// 一次性假父进程:接一个连接,读一帧,回给定的 outcome。
@@ -3128,9 +3183,12 @@ mod tests {
             );
         }
         assert_eq!(
-            instructions_with_overview(Some("  "), OfficeFeatures::NONE),
+            instructions_with_overview(Some("  "), OfficeFeatures::NONE, false),
             COMPANION_INSTRUCTIONS
         );
+        let with_browser = instructions_with_overview(None, OfficeFeatures::NONE, true);
+        assert!(with_browser.starts_with(COMPANION_INSTRUCTIONS));
+        assert!(with_browser.contains("browser_exec") && with_browser.contains("bringToFront"));
     }
 
     /// 父进程不可达(不是平台托管 / 平台挂了):tools/list 照常,只有内置工具。
@@ -3196,6 +3254,7 @@ mod tests {
         uploads: false,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
     const TASKBOARD_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -3208,6 +3267,7 @@ mod tests {
         uploads: false,
         platform: false,
         office: OfficeFeatures::NONE,
+        browser: false,
     };
 
     /// The two authoring groups gate independently: enabling one must not
