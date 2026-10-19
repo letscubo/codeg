@@ -1846,6 +1846,11 @@ pub fn build_router(
                 handlers::myclaw::download::ServerToken(token_for_device_mcp),
             )),
         )
+        // MyClaw fork ext:claude_code 跑非 Claude 模型的协议转接(见 llm_bridge.rs)。放公共组是因为
+        // 调用方是容器里的 claude,只带网关凭证(原样转给网关);handler 自己只放行本机 ——
+        // 对端回环且不带任何转发头,公网经反向代理进来的一律 403。
+        .route("/myclaw/llm/v1/messages", post(super::llm_bridge::messages))
+        .route("/myclaw/llm/health", get(super::llm_bridge::health))
         .route(
             "/workspace_download/{ticket}",
             get(handlers::workspace_files::consume_download_ticket),

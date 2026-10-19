@@ -4,7 +4,7 @@
 //! `/v1/messages` 只收 Claude 模型。于是 claude_code 的 `ANTHROPIC_BASE_URL` 指到这里:
 //!
 //! ```text
-//! claude ──Anthropic Messages──> 127.0.0.1:3081/v1/messages(本模块)
+//! claude ──Anthropic Messages──> 127.0.0.1:3080/api/myclaw/llm/v1/messages(本模块,挂在 codeg 主服务上)
 //!            · Claude 模型:原样透传网关 /v1/messages(提示缓存、tool search 等 Anthropic 专有能力照旧)
 //!            · 其余模型:请求转成 OpenAI Chat 发网关 /v1/chat/completions,响应(含流式)转回 Anthropic
 //! ```
@@ -13,84 +13,93 @@
 //! ~1 万行测试)。2026-10-19 在 C9 实测:真 Claude Code CLI 经它跑 kimi-k3 / deepseek 多步工具任务、
 //! 会话中途在 Claude 与非 Claude 之间来回切换都正常。这里只做三件事:路由、转发、补网关用量字段。
 //!
-//! **只监听 127.0.0.1**(默认 3081,`CODEG_LLM_BRIDGE_PORT` 可改,0 = 不开)。不挂在 3080 主服务上:
-//! 3080 经 `cg-*.moltly.ai` 对公网开放,而网关的平台凭证靠「来源 IP 白名单」挡外部调用 ——
-//! 这里若对外可达,就成了绕过白名单的转发口。凭证本身不在这里存:claude 带来的 `Authorization`
-//! 原样转给网关,由网关认。
+//! ## 只放行本机
+//! 3080 经 `cg-*.moltly.ai` 对公网开放,而网关的平台凭证(`<user_id>.<vm_id>`)靠「来源 IP 白名单」
+//! 挡外部调用 —— 这里若对外可达,就成了绕过白名单的转发口。所以 handler 自己认两条,都满足才放行:
+//!
+//! - 对端地址是回环。主服务以 `into_make_service_with_connect_info` 起(见 codeg_server.rs);
+//!   OVH 实例的公网请求由宿主机 nginx 转进来,对端是 docker 网关 172.17.0.1(2026-10-19 C9 实测)。
+//! - 不带任何转发头(X-Forwarded-For / X-Real-IP / Forwarded / CF-Connecting-IP)。宿主机 nginx、
+//!   集群 ingress、sidecar 这类反向代理都会加,容器里的 claude 不会发;万一某种部署里代理把公网
+//!   请求以 127.0.0.1 送进来,这一条照样挡住。
+//!
+//! 拿不到对端地址(没接 connect info 的启动方式,如桌面版)一律拒。凭证本身不在这里存:claude 带来的
+//! `Authorization` 原样转给网关,由网关认。
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::extract::{ConnectInfo, Request};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
-use axum::Router;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use switchyard_translation::{
     StreamTranslationState, TranslationEngine, TranslationPolicy, WireFormat,
 };
 
-pub const DEFAULT_PORT: u16 = 3081;
 pub const DEFAULT_UPSTREAM: &str = "https://api.myclaw.ai/v1";
-const ENV_PORT: &str = "CODEG_LLM_BRIDGE_PORT";
 const ENV_UPSTREAM: &str = "CODEG_LLM_UPSTREAM";
 /// claude 一次请求体的上限(长会话 + 图片),超了直接拒,别把内存吃光
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// 反向代理会加、容器里的 claude 不会发的头 —— 带了就说明请求是从外面转进来的
+const FORWARDED_HEADERS: [&str; 4] = ["x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip"];
 
 #[derive(Clone)]
-struct Bridge {
+pub(crate) struct Bridge {
     upstream: String,
     client: reqwest::Client,
 }
 
-/// codeg-server 启动时调用:在 127.0.0.1 上起转接服务。失败只记日志,不影响 codeg 本身。
-pub fn spawn() {
-    let port = match std::env::var(ENV_PORT) {
-        Ok(v) => match v.trim().parse::<u16>() {
-            Ok(0) => {
-                tracing::info!("[llm-bridge] {ENV_PORT}=0,不开转接");
-                return;
-            }
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!("[llm-bridge] {ENV_PORT}={v} 不是端口号,用默认 {DEFAULT_PORT}");
-                DEFAULT_PORT
-            }
-        },
-        Err(_) => DEFAULT_PORT,
-    };
-    let upstream = std::env::var(ENV_UPSTREAM)
-        .ok()
-        .map(|u| u.trim().trim_end_matches('/').to_string())
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
-    tokio::spawn(async move {
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!("[llm-bridge] 绑定 {addr} 失败,不开转接:{e}");
-                return;
-            }
-        };
-        tracing::info!("[llm-bridge] listening on {addr} → {upstream}");
-        if let Err(e) = axum::serve(listener, router(upstream)).await {
-            tracing::warn!("[llm-bridge] 退出:{e}");
-        }
-    });
+impl Bridge {
+    pub(crate) fn new(upstream: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        Self { upstream: upstream.into().trim().trim_end_matches('/').to_string(), client }
+    }
+
+    fn from_env() -> Self {
+        let upstream = std::env::var(ENV_UPSTREAM)
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
+        Self::new(upstream)
+    }
 }
 
-fn router(upstream: String) -> Router {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
-    Router::new()
-        .fallback(any(handle))
-        .with_state(Bridge { upstream, client })
+static BRIDGE: LazyLock<Bridge> = LazyLock::new(Bridge::from_env);
+
+/// `POST /api/myclaw/llm/v1/messages`(公共组,handler 自己只放行本机)。
+pub async fn messages(req: Request) -> Response {
+    serve_messages(&BRIDGE, req).await
+}
+
+/// `GET /api/myclaw/llm/health` —— 平台在 open 路径上据此判断「这台 codeg 有没有转接」,
+/// 有才把 claude 的 ANTHROPIC_BASE_URL 指过来。同样只放行本机。
+pub async fn health(req: Request) -> Response {
+    if let Some(denied) = guard_local(&req) {
+        return denied;
+    }
+    (StatusCode::OK, [("content-type", "application/json")], r#"{"ok":true}"#).into_response()
+}
+
+/// 只放行容器里的本机调用(见文件头「只放行本机」)。放行返回 None,拒绝返回要回给对方的响应。
+pub(crate) fn guard_local(req: &Request) -> Option<Response> {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_canonical());
+    let local = peer.is_some_and(|ip| ip.is_loopback());
+    let forwarded = FORWARDED_HEADERS.iter().any(|h| req.headers().contains_key(*h));
+    if local && !forwarded {
+        return None;
+    }
+    tracing::warn!("[llm-bridge] 拒绝非本机调用 peer={peer:?} forwarded={forwarded}");
+    Some(anthropic_error(StatusCode::FORBIDDEN, "the codeg LLM bridge only accepts calls from inside the instance"))
 }
 
 /// 与平台 `isAnthropicModel` 同一判据:名字以 claude 开头的走 Anthropic 原生。
@@ -164,11 +173,12 @@ fn bearer_of(headers: &HeaderMap) -> Option<String> {
         .map(|k| format!("Bearer {k}"))
 }
 
-async fn handle(State(bridge): State<Bridge>, uri: Uri, headers: HeaderMap, body: Body) -> Response {
-    // 只接 Messages 本身;Claude Code 启动时会探 /api/hello 之类,回 404 它就不再问(实测无影响)
-    if uri.path() != "/v1/messages" {
-        return anthropic_error(StatusCode::NOT_FOUND, format!("{} is not served by the codeg LLM bridge", uri.path()));
+pub(crate) async fn serve_messages(bridge: &Bridge, req: Request) -> Response {
+    if let Some(denied) = guard_local(&req) {
+        return denied;
     }
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return anthropic_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
@@ -182,9 +192,9 @@ async fn handle(State(bridge): State<Bridge>, uri: Uri, headers: HeaderMap, body
     };
     let model = request.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     if is_claude_model(&model) {
-        return passthrough(&bridge, &headers, &auth, bytes).await;
+        return passthrough(bridge, &headers, &auth, bytes).await;
     }
-    translate(&bridge, &auth, &model, &request).await
+    translate(bridge, &auth, &model, &request).await
 }
 
 /// Claude 模型:请求体一个字节不改发给网关 /v1/messages,响应(含流)原样回。
@@ -348,7 +358,8 @@ fn encode_events(events: Vec<Value>) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::post;
+    use axum::routing::{any, post};
+    use axum::Router;
     use tower::ServiceExt;
 
     #[test]
@@ -475,16 +486,34 @@ mod tests {
         (format!("http://{addr}/v1"), seen)
     }
 
+    /// 跟主服务里一样的挂法:handler 拿整个 Request,对端地址来自 ConnectInfo 扩展。
+    fn router(upstream: String) -> Router {
+        let bridge = Bridge::new(upstream);
+        Router::new()
+            .route("/v1/messages", any(move |req: Request| {
+                let bridge = bridge.clone();
+                async move { serve_messages(&bridge, req).await }
+            }))
+            .route("/health", any(health))
+    }
+
+    fn from_peer(mut req: axum::http::Request<Body>, ip: [u8; 4]) -> axum::http::Request<Body> {
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::from((ip, 45678))));
+        req
+    }
+
+    /// 容器里的 claude 发来的请求(对端 127.0.0.1、不带转发头)
     fn messages_request(model: &str) -> axum::http::Request<Body> {
         let body = json!({"model": model, "max_tokens": 64,
             "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": "hello"}]});
-        axum::http::Request::post("/v1/messages")
+        let req = axum::http::Request::post("/v1/messages")
             .header("authorization", "Bearer tok-123")
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
-            .unwrap()
+            .unwrap();
+        from_peer(req, [127, 0, 0, 1])
     }
 
     async fn json_of(resp: Response) -> (StatusCode, Value) {
@@ -533,14 +562,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn other_paths_and_missing_credentials_are_refused() {
+    async fn only_calls_from_inside_the_instance_get_through() {
         let (upstream, seen) = mock_gateway().await;
         let app = router(upstream);
-        let hello = axum::http::Request::get("/api/hello").body(Body::empty()).unwrap();
-        assert_eq!(app.clone().oneshot(hello).await.unwrap().status(), StatusCode::NOT_FOUND);
-        let mut req = messages_request("kimi-k3");
-        req.headers_mut().remove("authorization");
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert!(seen.lock().unwrap().is_empty(), "没凭证不该打到网关");
+
+        // 公网经宿主机 nginx 转进来:对端是 docker 网关(C9 实测 172.17.0.1)
+        let mut remote = messages_request("kimi-k3");
+        remote.extensions_mut().insert(ConnectInfo(SocketAddr::from(([172, 17, 0, 1], 40856))));
+        let resp = app.clone().oneshot(remote).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_of(resp).await.1["error"]["type"], "permission_error");
+
+        // 对端是回环、但带了反向代理加的头 —— 代理把公网请求以 127.0.0.1 送进来的情形
+        for header in FORWARDED_HEADERS {
+            let mut proxied = messages_request("kimi-k3");
+            proxied.headers_mut().insert(header, "203.0.113.9".parse().unwrap());
+            assert_eq!(app.clone().oneshot(proxied).await.unwrap().status(), StatusCode::FORBIDDEN, "{header}");
+        }
+
+        // 拿不到对端地址(没接 connect info 的启动方式)一律拒
+        let mut unknown = messages_request("kimi-k3");
+        unknown.extensions_mut().remove::<ConnectInfo<SocketAddr>>();
+        assert_eq!(app.clone().oneshot(unknown).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // 本机但没凭证:401
+        let mut no_auth = messages_request("kimi-k3");
+        no_auth.headers_mut().remove("authorization");
+        assert_eq!(app.clone().oneshot(no_auth).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        assert!(seen.lock().unwrap().is_empty(), "以上都不该打到网关");
+    }
+
+    #[tokio::test]
+    async fn health_answers_only_inside_the_instance() {
+        let (upstream, _) = mock_gateway().await;
+        let app = router(upstream);
+        let get = || axum::http::Request::get("/health").body(Body::empty()).unwrap();
+        let (status, body) = json_of(app.clone().oneshot(from_peer(get(), [127, 0, 0, 1])).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(app.clone().oneshot(from_peer(get(), [172, 17, 0, 1])).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let mut proxied = from_peer(get(), [127, 0, 0, 1]);
+        proxied.headers_mut().insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert_eq!(app.oneshot(proxied).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_counts_as_local() {
+        // 双栈监听时 127.0.0.1 会以 ::ffff:127.0.0.1 出现
+        let mut req = axum::http::Request::get("/health").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), 1)));
+        assert!(guard_local(&req).is_none());
+        let mut v6 = axum::http::Request::get("/health").body(Body::empty()).unwrap();
+        v6.extensions_mut().insert(ConnectInfo(SocketAddr::new("::1".parse().unwrap(), 1)));
+        assert!(guard_local(&v6).is_none());
     }
 }

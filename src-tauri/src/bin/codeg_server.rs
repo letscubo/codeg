@@ -608,11 +608,14 @@ async fn async_main() -> ExitCode {
         tracing::info!("  {}", addr);
     }
 
-    // MyClaw fork ext:claude_code 跑非 Claude 模型的协议转接,只听 127.0.0.1(见 web/llm_bridge.rs)
-    codeg_lib::web::llm_bridge::spawn();
-
     // Start serving
-    if let Err(e) = axum::serve(listener, router).await {
+    // MyClaw fork ext:带上对端地址(ConnectInfo),llm_bridge 据此只放行容器里的本机调用
+    if let Err(e) = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         tracing::error!("[SERVER] Server error: {}", e);
         return ExitCode::from(1);
     }
