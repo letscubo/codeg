@@ -10,6 +10,16 @@ use std::{sync::OnceLock, time::Duration};
 const PREFIX: &str = "channel_relay_result:";
 const PREFIX_END: &str = "channel_relay_result;";
 static READY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+fn result_events() -> &'static tokio::sync::watch::Sender<u64> {
+    static EVENTS: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+    EVENTS.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+/// Subscribe before querying to avoid missing a terminal save between the query
+/// and the wait. This only notifies; the durable SQLite receipt is authoritative.
+pub(crate) fn subscribe_results() -> tokio::sync::watch::Receiver<u64> {
+    result_events().subscribe()
+}
+
 #[derive(Serialize, Deserialize)]
 struct Stored {
     result: Value,
@@ -70,8 +80,11 @@ pub(crate) async fn save(
             .map_err(|error| error.to_string())
     })
     .await?;
-    if terminal && !acknowledged {
-        READY.notify_one();
+    if terminal {
+        result_events().send_modify(|version| *version = version.wrapping_add(1));
+        if !acknowledged {
+            READY.notify_one();
+        }
     }
     Ok(())
 }

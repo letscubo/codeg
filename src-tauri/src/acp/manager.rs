@@ -1185,8 +1185,16 @@ impl ConnectionManager {
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
     ) -> Result<(), AcpError> {
+        if crate::chat_channel::ingress::control_blocks(self, conn_id, None).await {
+            return Err(AcpError::TurnInProgress);
+        }
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
+        let _conversation_guard =
+            crate::chat_channel::ingress::prompt_admission_gate(self, conn_id, None).await;
+        if crate::chat_channel::ingress::control_blocks(self, conn_id, None).await {
+            return Err(AcpError::TurnInProgress);
+        }
         self.send_prompt_inner(conn_id, blocks, None).await
     }
 
@@ -1312,6 +1320,13 @@ impl ConnectionManager {
             ));
         }
 
+        // A channel model operation holds the same prompt lock until its
+        // platform result is confirmed. Reject callers promptly; the lock below
+        // closes the race if control starts after this advisory check.
+        if crate::chat_channel::ingress::control_blocks(self, conn_id, conversation_id).await {
+            return Err(AcpError::TurnInProgress);
+        }
+
         // Acquire the per-connection prompt lock for the entire link-check
         // + DB write + emit + cmd_tx.send sequence. Two concurrent prompts
         // (multiple browser tabs of the same conversation; chat-channel
@@ -1322,6 +1337,13 @@ impl ConnectionManager {
             Some(guard) => guard,
             None => self.clone_prompt_lock(conn_id).await?.lock_owned().await,
         };
+        let mut conversation_guard =
+            crate::chat_channel::ingress::prompt_admission_gate(self, conn_id, conversation_id)
+                .await;
+
+        if crate::chat_channel::ingress::control_blocks(self, conn_id, conversation_id).await {
+            return Err(AcpError::TurnInProgress);
+        }
 
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
@@ -1631,6 +1653,19 @@ impl ConnectionManager {
             outcome?;
             guard
         };
+
+        // A first link may have created/split onto a different conversation.
+        // Retake the exact conversation gate before status or prompt side effects.
+        let linked_id = state_arc.read().await.conversation_id;
+        if conversation_guard.as_ref().map(|(id, _)| *id) != linked_id {
+            drop(conversation_guard.take());
+            conversation_guard =
+                crate::chat_channel::ingress::prompt_admission_gate(self, conn_id, linked_id).await;
+        }
+        if crate::chat_channel::ingress::control_blocks(self, conn_id, linked_id).await {
+            return Err(AcpError::TurnInProgress);
+        }
+        let _conversation_guard = conversation_guard;
 
         // Centralized status transition: every prompt send flips the
         // conversation row to InProgress. This MUST happen on every call

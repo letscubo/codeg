@@ -47,3 +47,5 @@ pub mod workspace_files;
 pub mod workspace_state;
 
 pub mod relay;
+
+pub mod channel_ingress;

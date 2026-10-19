@@ -244,6 +244,32 @@ pub(crate) fn cursor_force_enabled(value: Option<&str>) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
 }
 
+/// The retained OpenClaw Gateway owns execution independently of its ACP CLI.
+/// A bridge exit without a turn receipt cannot prove that execution stopped.
+pub(crate) fn retained_openclaw_transport_exit(
+    retained_bridge: bool,
+    turn_in_flight: bool,
+) -> Option<AcpEvent> {
+    (retained_bridge && turn_in_flight).then(|| AcpEvent::Error {
+        message: "The original OpenClaw runtime outcome is unknown after its ACP bridge closed".into(),
+        agent_type: "openclaw".into(),
+        code: Some("runtime_outcome_unknown".into()),
+        details: None,
+        terminal: true,
+    })
+}
+
+pub(crate) fn retained_openclaw_cancel_pending(retained_bridge: bool) -> Option<AcpEvent> {
+    retained_openclaw_transport_exit(retained_bridge, true).map(|mut event| {
+        if let AcpEvent::Error { message, code, terminal, .. } = &mut event {
+            *message = "The original OpenClaw runtime has not confirmed cancellation".into();
+            *code = Some("runtime_cancel_pending".into());
+            *terminal = false;
+        }
+        event
+    })
+}
+
 /// Cursor subscription-mode launch policy. When the user picked the official
 /// subscription (browser login), guarantee the launched CLI sees NONE of the
 /// custom-endpoint credentials — not even a stale `CURSOR_API_KEY` /
@@ -1904,6 +1930,24 @@ fn agent_debug_callback(
     }
 }
 
+fn openclaw_runtime_session_flags(runtime_env: &BTreeMap<String, String>) -> Vec<String> {
+    let mut flags = Vec::new();
+    for (key, flag) in [("OPENCLAW_GATEWAY_URL", "--url"), ("OPENCLAW_SESSION_KEY", "--session")] {
+        if let Some(value) = runtime_env.get(key).filter(|value| !value.is_empty()) {
+            flags.extend([flag.to_owned(), value.clone()]);
+        }
+    }
+    // Reset is opt-in. Legacy channels explicitly keep it off and require the
+    // original key to exist, so a missing transcript cannot become a new one.
+    for (key, flag) in [("OPENCLAW_RESET_SESSION", "--reset-session"),
+                        ("OPENCLAW_REQUIRE_EXISTING", "--require-existing")] {
+        if runtime_env.get(key).is_some_and(|value| value == "1") {
+            flags.push(flag.into());
+        }
+    }
+    flags
+}
+
 async fn build_agent(
     agent_type: AgentType,
     runtime_env: &BTreeMap<String, String>,
@@ -1987,16 +2031,32 @@ async fn build_agent(
             for (k, v) in &merged_env {
                 parts.push(format!("{k}={v}"));
             }
-            parts.push(
-                crate::commands::acp::resolve_npx_command(cmd)
-                    .await
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| {
-                        crate::process::normalized_program(cmd)
-                            .to_string_lossy()
-                            .to_string()
-                    }),
-            );
+            let original_openclaw = if agent_type == AgentType::OpenClaw {
+                runtime_env
+                    .get("OPENCLAW_ACP_COMMAND")
+                    .filter(|path| !path.is_empty())
+            } else {
+                None
+            };
+            if let Some(path) = original_openclaw {
+                if !Path::new(path).is_absolute() || !Path::new(path).is_file() {
+                    return Err(AcpError::SpawnFailed(
+                        "original OpenClaw CLI is unavailable".into(),
+                    ));
+                }
+                parts.push(path.clone());
+            } else {
+                parts.push(
+                    crate::commands::acp::resolve_npx_command(cmd)
+                        .await
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| {
+                            crate::process::normalized_program(cmd)
+                                .to_string_lossy()
+                                .to_string()
+                        }),
+                );
+            }
             // Grok's root-level launch flags go BEFORE its `agent stdio`
             // subcommand (which rejects them):
             //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
@@ -2021,29 +2081,7 @@ async fn build_agent(
             }
             // Translate OpenClaw-specific env vars to CLI flags
             if agent_type == AgentType::OpenClaw {
-                if let Some(url) = runtime_env
-                    .get("OPENCLAW_GATEWAY_URL")
-                    .filter(|v| !v.is_empty())
-                {
-                    parts.push("--url".into());
-                    parts.push(url.clone());
-                }
-                if let Some(key) = runtime_env
-                    .get("OPENCLAW_SESSION_KEY")
-                    .filter(|v| !v.is_empty())
-                {
-                    parts.push("--session".into());
-                    parts.push(key.clone());
-                }
-                // When creating a new conversation (no session_id to resume),
-                // pass --reset-session so OpenClaw mints a fresh transcript
-                // instead of appending to the previous one.
-                if runtime_env
-                    .get("OPENCLAW_RESET_SESSION")
-                    .is_some_and(|v| v == "1")
-                {
-                    parts.push("--reset-session".into());
-                }
+                parts.extend(openclaw_runtime_session_flags(runtime_env));
             }
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
@@ -2377,6 +2415,8 @@ pub async fn spawn_agent_connection(
     // this point.
     initial_state.env_pinned_config_option_ids =
         env_pinned_config_option_ids(agent_type, &runtime_env);
+    initial_state.retained_openclaw_bridge = agent_type == AgentType::OpenClaw
+        && runtime_env.get("CODEG_LEGACY_OPENCLAW_BRIDGE").map(String::as_str) == Some("1");
 
     let session_state = Arc::new(RwLock::new(initial_state));
 
@@ -2543,6 +2583,8 @@ pub async fn spawn_agent_connection(
     let cleanup_connections = connections.clone();
     let cleanup_connection_id = connection_id.clone();
     let state_clone = Arc::clone(&session_state);
+    let retained_openclaw_bridge = agent_type == AgentType::OpenClaw
+        && runtime_env.get("CODEG_LEGACY_OPENCLAW_BRIDGE").map(String::as_str) == Some("1");
 
     // Canonical config fingerprint of what this process is launching with.
     // Derived from the same `runtime_env` we hand the agent (minus per-launch
@@ -2641,7 +2683,21 @@ pub async fn spawn_agent_connection(
                 .await;
         }
 
-        if let Err(e) = result {
+        let (retained_in_flight, unknown_announced) = {
+            let snapshot = state_clone.read().await;
+            (retained_openclaw_bridge && snapshot.turn_in_flight,
+                snapshot.last_error.as_ref().and_then(|error| error.code.as_deref())
+                    == Some("runtime_outcome_unknown"))
+        };
+        if retained_in_flight {
+            // This must precede generic Error/Disconnected: the relay settles
+            // on its first terminal event and must not finalize an unknown turn.
+            // Cancel already announces unknown; do not publish another terminal.
+            if !unknown_announced {
+                let event = retained_openclaw_transport_exit(true, true).expect("retained active turn");
+                emit_with_state(&state_clone, &emitter_clone, event).await;
+            }
+        } else if let Err(e) = result {
             // A teardown codeg itself ordered (idle sweep, explicit disconnect,
             // owner-window cleanup) is not an agent failure, even when killing
             // the process makes it exit non-zero (openclaw's launcher turns the
@@ -10652,6 +10708,12 @@ async fn run_conversation_loop<'a>(
                                         Agent,
                                         CancelNotification::new(sid.clone()),
                                     );
+                                    let retained = state.read().await.retained_openclaw_bridge;
+                                    if let Some(event) = retained_openclaw_cancel_pending(retained) {
+                                        // Stop user-side activity before any potentially slow
+                                        // local tool cleanup, while keeping runtime admission.
+                                        emit_with_state(state, emitter, event).await;
+                                    }
                                     // Also terminate any command runtimes created for this
                                     // session so cancellation does not hang on long-running
                                     // terminal tools.
@@ -10659,6 +10721,13 @@ async fn run_conversation_loop<'a>(
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
                                     tracked_terminal_tool_calls.clear();
+                                    if retained {
+                                        // The notification is not a Gateway receipt. Stop relay
+                                        // activity now, but retain the active-turn gate and wait
+                                        // for the real prompt response (or transport loss).
+                                        drain_permissions(perms, state, emitter).await;
+                                        continue;
+                                    }
                                     // Also cancel any pending permission requests
                                     // (queued ones included), clearing the card
                                     // that was on screen, and immediately emit
@@ -15395,6 +15464,42 @@ async fn emit_conversation_update(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_openclaw_disconnect_is_unknown_only_before_a_turn_receipt() {
+        let event = super::retained_openclaw_transport_exit(true, true).unwrap();
+        assert!(matches!(event, AcpEvent::Error { code: Some(ref code), terminal: true, .. }
+            if code == "runtime_outcome_unknown"));
+        assert!(super::retained_openclaw_transport_exit(false, true).is_none());
+        assert!(super::retained_openclaw_transport_exit(true, false).is_none());
+    }
+    #[test]
+    fn retained_openclaw_cancel_without_receipt_does_not_complete_or_release_turn() {
+        let mut state = SessionState::new("legacy".into(), AgentType::OpenClaw, None, "test".into(), None);
+        state.retained_openclaw_bridge = true;
+        state.turn_in_flight = true;
+        let event = super::retained_openclaw_cancel_pending(state.retained_openclaw_bridge).unwrap();
+        state.apply_event(&event);
+        assert!(state.turn_in_flight);
+        assert_eq!(state.turns_completed, 0);
+        assert_eq!(state.last_error.as_ref().unwrap().code.as_deref(), Some("runtime_cancel_pending"));
+        assert!(matches!(event, AcpEvent::Error { terminal: false, .. }));
+        state.apply_event(&super::retained_openclaw_transport_exit(true, state.turn_in_flight).unwrap());
+        state.apply_event(&AcpEvent::StatusChanged { status: ConnectionStatus::Disconnected });
+        assert!(state.turn_in_flight);
+        assert_eq!(state.turns_completed, 0);
+        assert_eq!(state.last_error.as_ref().unwrap().code.as_deref(), Some("runtime_outcome_unknown"));
+        assert!(super::retained_openclaw_cancel_pending(false).is_none());
+    }
+    #[test]
+    fn openclaw_legacy_key_requires_existing_without_resetting() {
+        let env = std::collections::BTreeMap::from([
+            ("OPENCLAW_SESSION_KEY".to_owned(), "agent:main:telegram:group:original/topic".to_owned()),
+            ("OPENCLAW_RESET_SESSION".to_owned(), "0".to_owned()),
+            ("OPENCLAW_REQUIRE_EXISTING".to_owned(), "1".to_owned()),
+        ]);
+        assert_eq!(super::openclaw_runtime_session_flags(&env), vec![
+            "--session", "agent:main:telegram:group:original/topic", "--require-existing"]);
+    }
     use super::*;
     use sacp::schema::{Diff, SessionConfigId};
 

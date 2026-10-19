@@ -11,6 +11,7 @@ pub struct Presentation {
     pub text_prefix: String,
     pub strip_agent_mentions: bool,
     pub suppress_no_action: bool,
+    pub suppress_slack_no_reply: bool,
 }
 #[derive(Default)]
 struct Filter {
@@ -18,29 +19,32 @@ struct Filter {
     started: bool,
     opts: Presentation,
 }
-fn no_action(text: &str) -> bool {
+fn normalized_sentinel(text: &str) -> &str {
     text.trim()
         .trim_end_matches('.')
         .trim()
         .trim_matches('`')
         .trim()
-        == "NO_ACTION"
+}
+impl Presentation {
+    fn suppresses(&self, text: &str) -> bool {
+        let value = normalized_sentinel(text);
+        (self.suppress_no_action && value == "NO_ACTION")
+            || (self.suppress_slack_no_reply && value == "[[MYCLAW_NO_REPLY]]")
+    }
+    fn may_suppress(&self, text: &str) -> bool {
+        let value = normalized_sentinel(text);
+        (self.suppress_no_action && "NO_ACTION".starts_with(value))
+            || (self.suppress_slack_no_reply && "[[MYCLAW_NO_REPLY]]".starts_with(value))
+    }
 }
 impl Filter {
     fn push(&mut self, text: &str, finished: bool) -> Option<String> {
         self.pending.push_str(text);
-        if self.opts.suppress_no_action && !self.started && !finished {
-            let candidate = self
-                .pending
-                .trim()
-                .trim_matches('`')
-                .trim()
-                .trim_end_matches('.');
-            if "NO_ACTION".starts_with(candidate) || no_action(&self.pending) {
-                return None;
-            }
+        if !self.started && !finished && self.opts.may_suppress(&self.pending) {
+            return None;
         }
-        if finished && !self.started && self.opts.suppress_no_action && no_action(&self.pending) {
+        if finished && !self.started && self.opts.suppresses(&self.pending) {
             self.pending.clear();
             return None;
         }
@@ -106,9 +110,7 @@ pub(crate) fn wrap(
                         AcpEvent::TurnComplete { .. } | AcpEvent::Error { terminal: true, .. }
                     );
                     if terminal {
-                        let silent = filter.opts.suppress_no_action
-                            && !filter.started
-                            && no_action(&filter.pending);
+                        let silent = !filter.started && filter.opts.suppresses(&filter.pending);
                         if let Some(text) = filter.push("", true) {
                             let _ = tx.send(RelayInput::Event(Arc::new(EventEnvelope {
                                 payload: AcpEvent::ContentDelta {
@@ -176,5 +178,36 @@ mod tests {
     fn ordinary_no_prefix_can_stream() {
         let mut f = Filter::default();
         assert_eq!(f.push("Hello", false).as_deref(), Some("Hello"));
+    }
+    #[test]
+    fn slack_sentinel_is_opt_in_and_fragment_safe() {
+        let mut filter = Filter {
+            opts: Presentation {
+                suppress_slack_no_reply: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for part in ["[[MY", "CLAW_", "NO_REPLY", "]]\n"] {
+            assert!(filter.push(part, false).is_none());
+        }
+        assert!(filter.push("", true).is_none());
+        let mut ordinary = Filter::default();
+        assert_eq!(
+            ordinary.push("[[MYCLAW_NO_REPLY]]", false).as_deref(),
+            Some("[[MYCLAW_NO_REPLY]]")
+        );
+        let mut prose = Filter {
+            opts: Presentation {
+                suppress_slack_no_reply: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(prose.push("[[MYCLAW_NO_REPLY]]", false).is_none());
+        assert_eq!(
+            prose.push(" is a marker", false).as_deref(),
+            Some("[[MYCLAW_NO_REPLY]] is a marker")
+        );
     }
 }

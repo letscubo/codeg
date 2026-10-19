@@ -42,6 +42,10 @@ pub fn build_router(
 
     let api = Router::new()
         .route("/health", post(health_check))
+        .route("/channel_submit", post(handlers::channel_ingress::channel_submit))
+        .route("/legacy_channel_inspect", post(handlers::channel_ingress::legacy_channel_inspect))
+        .route("/channel_operation", post(handlers::channel_ingress::channel_operation))
+        .route("/channel_cancel", post(handlers::channel_ingress::channel_cancel))
         .route("/get_relay_capabilities", post(handlers::relay::get_relay_capabilities))
         .route("/get_relay_result", post(handlers::relay::get_relay_result))
         .route("/cancel_relay_turn", post(handlers::relay::cancel_relay_turn))

@@ -246,6 +246,9 @@ impl SlackTurn {
     pub(crate) async fn run(self, mut rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
         let mut stream = Stream::new();
         let mut full_text = String::new();
+        let mut cancel_pending = false;
+        let mut deferred_text = String::new();
+        let mut counted = true;
         let counter = session_counter(&self.session_key);
         {
             let mut count = counter.lock().await;
@@ -261,38 +264,77 @@ impl SlackTurn {
                 stream.last_write.unwrap_or_else(Instant::now) + INTERVAL
             };
             tokio::select! {
+                // Pending cancellation/terminal events beat a due refresh.
+                biased;
                 input = rx.recv() => match input {
                     None => break Outcome::Aborted,
                     Some(RelayInput::Lagged) => break Outcome::Lagged,
                     Some(RelayInput::SilentComplete) => break Outcome::Silent,
                     Some(RelayInput::Event(env)) => match &env.payload {
                         AcpEvent::ContentDelta {text,parent_tool_use_id:None} => {
-                            full_text.push_str(text); self.append_text(&mut stream,text).await;
+                            full_text.push_str(text);
+                            if cancel_pending { deferred_text.push_str(text); }
+                            else { self.append_text(&mut stream,text).await; }
                         }
-                        AcpEvent::ToolCall {tool_call_id,title,description,..} if !stream.failed => {
+                        AcpEvent::ToolCall {tool_call_id,title,description,..} if !stream.failed && !cancel_pending => {
                             let title = description.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(title).to_owned();
                             stream.tools.insert(tool_call_id.clone(),title.clone()); Self::task(&mut stream,tool_call_id,&title,"in_progress");
                         }
-                        AcpEvent::ToolCallUpdate {tool_call_id,title,description,status,..} if !stream.failed => {
+                        AcpEvent::ToolCallUpdate {tool_call_id,title,description,status,..} if !stream.failed && !cancel_pending => {
                             let label = description.as_ref().or(title.as_ref()).or(stream.tools.get(tool_call_id)).cloned().unwrap_or_else(|| "Tool".into());
                             let state = match status.as_deref() { Some("completed") => "complete", Some("failed") => "error", _ => "in_progress" };
                             Self::task(&mut stream,tool_call_id,&label,state);
                             if state == "in_progress" {stream.tools.insert(tool_call_id.clone(),label);} else { stream.tools.remove(tool_call_id); }
                         }
+                        AcpEvent::Error {terminal:false,code,..} if code.as_deref()==Some("runtime_cancel_pending") && !cancel_pending => {
+                            cancel_pending = true;
+                            // A stopped Slack stream cannot accept more appends.
+                            // Keep its unsent suffix for a new segment only after
+                            // the runtime confirms the actual terminal outcome.
+                            deferred_text = stream.pending.iter()
+                                .filter(|chunk| chunk["type"] == "markdown_text")
+                                .filter_map(|chunk| chunk["text"].as_str()).collect();
+                            if stream.current().text.ends_with(&deferred_text) {
+                                let length = stream.current().text.len() - deferred_text.len();
+                                stream.current().text.truncate(length);
+                            } else {
+                                stream.failed = true;
+                            }
+                            stream.pending.clear();
+                            self.stop(&mut stream, true).await;
+                            let mut count = counter.lock().await;
+                            *count = count.saturating_sub(1);
+                            counted = false;
+                            if *count == 0 { self.status("active").await; }
+                        }
                         AcpEvent::TurnComplete {stop_reason,..} => break match stop_reason.as_str() {"end_turn"=>Outcome::Completed,"cancelled"=>Outcome::Cancelled,_=>Outcome::Failed},
+                        AcpEvent::Error {terminal:true,code,..} if code.as_deref()==Some("runtime_outcome_unknown") => break Outcome::Unknown,
                         AcpEvent::Error {terminal:true,..} | AcpEvent::StatusChanged {status:ConnectionStatus::Disconnected|ConnectionStatus::Error} => break Outcome::Failed,
                         _=>{}
                     },
                 },
-                _ = tokio::time::sleep_until(next) => self.flush(&mut stream).await,
-                _ = tokio::time::sleep_until(heartbeat) => { self.status("processing").await; heartbeat = Instant::now()+Duration::from_secs(30*60); }
-                _ = tokio::time::sleep_until(deadline) => break Outcome::Failed,
+                _ = tokio::time::sleep_until(next), if !cancel_pending => self.flush(&mut stream).await,
+                _ = tokio::time::sleep_until(heartbeat), if !cancel_pending => { self.status("processing").await; heartbeat = Instant::now()+Duration::from_secs(30*60); }
+                _ = tokio::time::sleep_until(deadline) => break if cancel_pending { Outcome::Unknown } else { Outcome::Failed },
             }
-            if stream.pending.len() >= 20 {
+            if !cancel_pending && stream.pending.len() >= 20 {
                 self.flush(&mut stream).await;
             }
         };
-        if !matches!(outcome, Outcome::Aborted | Outcome::Lagged) {
+        if !matches!(
+            outcome,
+            Outcome::Aborted | Outcome::Lagged | Outcome::Unknown
+        ) {
+            if cancel_pending {
+                *counter.lock().await += 1;
+                counted = true;
+                if stream.current().message_ts.is_some() || !stream.current().text.is_empty() {
+                    stream
+                        .segments
+                        .push(DeliverySegment::new(stream.segments.len(), String::new()));
+                }
+                self.append_text(&mut stream, &deferred_text).await;
+            }
             let note = match outcome {
                 Outcome::Completed if full_text.trim().is_empty() => Some(&self.texts.empty),
                 Outcome::Cancelled => Some(&self.texts.cancelled),
@@ -327,7 +369,9 @@ impl SlackTurn {
         self.stop(&mut stream, true).await;
         let cleaned = {
             let mut count = counter.lock().await;
-            *count = count.saturating_sub(1);
+            if counted {
+                *count = count.saturating_sub(1);
+            }
             if *count == 0 {
                 self.status("active").await
             } else {
@@ -454,6 +498,98 @@ mod tests {
         assert!(calls.iter().any(|(m, _)| m == "chat.stopStream"));
         assert_eq!(calls.last().unwrap().1["status"], "active");
     }
+    #[tokio::test(start_paused = true)]
+    async fn uncertain_runtime_stops_loading_without_finalizing_pending_text() {
+        for terminal in
+            [crate::acp::connection::retained_openclaw_transport_exit(true, true).unwrap()]
+        {
+            let api = Arc::new(FakeSlack::default());
+            let (tx, rx) = mpsc::unbounded_channel();
+            let worker = tokio::spawn(turn(api.clone(), "uncertain-runtime").run(rx));
+            tx.send(delta("partial")).unwrap();
+            tx.send(event(terminal)).unwrap();
+            tx.send(event(AcpEvent::StatusChanged {
+                status: ConnectionStatus::Disconnected,
+            }))
+            .unwrap();
+            tx.send(complete()).unwrap();
+            let report = worker.await.unwrap();
+            assert_eq!(report.outcome, Outcome::Unknown);
+            assert!(!report.text_complete);
+            let calls = api.calls.lock().unwrap();
+            assert_eq!(calls.last().unwrap().1["status"], "active");
+            assert!(!calls.iter().any(|(name, _)| name == "chat.startStream"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_pauses_stream_and_loading_until_a_real_receipt() {
+        for reason in ["cancelled", "end_turn"] {
+            let api = Arc::new(FakeSlack::default());
+            let (tx, rx) = mpsc::unbounded_channel();
+            let worker = tokio::spawn(turn(api.clone(), reason).run(rx));
+            tx.send(delta("shown")).unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tx.send(event(
+                crate::acp::connection::retained_openclaw_cancel_pending(true).unwrap(),
+            ))
+            .unwrap();
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !worker.is_finished(),
+                "cancel intent is not a terminal receipt"
+            );
+            assert_eq!(
+                api.calls.lock().unwrap().last().unwrap().1["status"],
+                "active"
+            );
+            let calls = api.calls.lock().unwrap().len();
+            tx.send(delta(" deferred")).unwrap();
+            tokio::time::sleep(Duration::from_secs(31 * 60)).await;
+            assert_eq!(
+                api.calls.lock().unwrap().len(),
+                calls,
+                "no stream writes or loading heartbeat while cancellation is pending"
+            );
+            assert!(!worker.is_finished());
+            tx.send(event(AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: reason.into(),
+                agent_type: "openclaw".into(),
+                duration_ms: None,
+            }))
+            .unwrap();
+            let report = worker.await.unwrap();
+            assert_eq!(
+                report.outcome,
+                if reason == "cancelled" {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Completed
+                }
+            );
+            assert!(report.text_complete);
+            assert!(!report.delivery_failed);
+            assert!(report.final_text.starts_with("shown deferred"));
+            let calls = api.calls.lock().unwrap();
+            let first_stop = calls
+                .iter()
+                .position(|(name, _)| name == "chat.stopStream")
+                .unwrap();
+            assert!(
+                !calls[first_stop + 1..]
+                    .iter()
+                    .any(|(name, _)| name == "chat.appendStream"),
+                "confirmed output uses a new stream after the old stream was stopped"
+            );
+            assert_eq!(calls.last().unwrap().1["status"], "active");
+            drop(calls);
+            assert_eq!(*session_counter(reason).lock().await, 0);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unknown_start_is_not_retried() {
         let api = Arc::new(FakeSlack {

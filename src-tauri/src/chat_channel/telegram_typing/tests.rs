@@ -216,6 +216,65 @@ async fn typing_starts_and_renews_while_draft_loading_remains() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retained_openclaw_uncertainty_stops_typing_without_finalizing_unknown_output() {
+    let terminal = crate::acp::connection::retained_openclaw_transport_exit(true, true).unwrap();
+    let api = Arc::new(MockTelegram::default());
+    api.hold_draft.store(true, Ordering::SeqCst);
+    let (tx, task) = start(api.clone());
+    settle().await;
+    advance(HEARTBEAT).await;
+    tx.send(delta("partial output")).unwrap();
+    tx.send(event(terminal)).unwrap();
+    tx.send(event(AcpEvent::StatusChanged {
+        status: ConnectionStatus::Disconnected,
+    }))
+    .unwrap();
+    tx.send(complete("cancelled")).unwrap();
+    settle().await;
+    let typing_count = api.calls("sendChatAction").len();
+    advance(HEARTBEAT * 3).await;
+    assert_eq!(api.calls("sendChatAction").len(), typing_count);
+    api.unblock_draft();
+    let report = task.await.unwrap();
+    assert_eq!(report.outcome, Outcome::Unknown);
+    assert!(!report.text_complete);
+    assert!(api.calls("sendMessage").is_empty());
+    let drafts = api.calls("sendMessageDraft").len();
+    advance(HEARTBEAT * 3).await;
+    assert_eq!(api.calls("sendMessageDraft").len(), drafts);
+    assert_eq!(api.calls("sendChatAction").len(), typing_count);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_openclaw_cancel_stops_typing_but_waits_for_runtime_receipt() {
+    let api = Arc::new(MockTelegram::default());
+    let (tx, task) = start(api.clone());
+    settle().await;
+    advance(HEARTBEAT).await;
+    tx.send(event(
+        crate::acp::connection::retained_openclaw_cancel_pending(true).unwrap(),
+    ))
+    .unwrap();
+    settle().await;
+    let typing = api.calls("sendChatAction").len();
+    let drafts = api.calls("sendMessageDraft").len();
+    tx.send(delta("late runtime output")).unwrap();
+    settle().await;
+    advance(HEARTBEAT * 3).await;
+    assert_eq!(api.calls("sendChatAction").len(), typing);
+    assert_eq!(api.calls("sendMessageDraft").len(), drafts);
+    assert!(api.calls("sendMessage").is_empty());
+    assert!(
+        !task.is_finished(),
+        "cancel intent cannot substitute a runtime terminal receipt"
+    );
+    tx.send(complete("cancelled")).unwrap();
+    assert_eq!(task.await.unwrap().outcome, Outcome::Cancelled);
+    advance(HEARTBEAT * 3).await;
+    assert_eq!(api.calls("sendChatAction").len(), typing);
+}
+
+#[tokio::test(start_paused = true)]
 async fn every_terminal_stops_typing_even_while_the_initial_draft_is_blocked() {
     let cases = vec![
         (Some(complete("end_turn")), Outcome::Completed),

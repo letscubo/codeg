@@ -317,6 +317,12 @@ async fn async_main() -> ExitCode {
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
+    // Restore uncertain control operations before any ingress or background
+    // engine can admit a prompt for the same conversation.
+    if let Err(code) = codeg_lib::chat_channel::ingress::start(state.clone()).await {
+        tracing::error!("[ChannelIngress] startup recovery failed: {code}");
+        return ExitCode::from(1);
+    }
     state
         .connection_manager
         .install_chat_channel(state.chat_channel_manager.clone_ref());

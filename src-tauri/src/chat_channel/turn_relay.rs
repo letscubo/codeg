@@ -279,6 +279,8 @@ pub(crate) enum Outcome {
     Silent,
     Cancelled,
     Failed,
+    /// Runtime ownership was lost; neither completion nor cancellation is proved.
+    Unknown,
     /// 连接被新一轮顶替 / 提交失败被撤回:什么都不发。
     Aborted,
     /// 事件总线落后:什么都不发,由平台补。
@@ -331,7 +333,10 @@ impl TurnReport {
         for (index, segment) in segments.iter_mut().enumerate() {
             segment.index = index;
         }
-        let text_complete = !matches!(outcome, Outcome::Lagged | Outcome::Aborted);
+        let text_complete = !matches!(
+            outcome,
+            Outcome::Lagged | Outcome::Aborted | Outcome::Unknown
+        );
         Self {
             delivery_failed: segments.iter().any(|s| !s.delivered) || !text_complete,
             message_ids: segments.iter().filter_map(|s| s.message_id).collect(),
@@ -376,7 +381,10 @@ impl TelegramTurn {
         super::telegram_typing::run(self, rx).await
     }
 
-    pub(super) async fn run_delivery(self, mut rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
+    pub(super) async fn run_delivery(
+        self,
+        mut rx: mpsc::UnboundedReceiver<RelayInput>,
+    ) -> TurnReport {
         let deadline = Instant::now() + MAX_TURN;
         let mut body = Composer::default();
         let mut full_text = String::new();
@@ -388,6 +396,7 @@ impl TelegramTurn {
         let mut shown = String::new();
         let mut status = self.texts.thinking.clone();
         let mut status_tool = None;
+        let mut cancel_pending = false;
         self.draft(
             &status,
             &mut draft_shown,
@@ -420,6 +429,8 @@ impl TelegramTurn {
                 next = deadline;
             }
             tokio::select! {
+                // Pending cancellation/terminal events beat a due refresh.
+                biased;
                 input = rx.recv() => match input {
                     None => break Outcome::Aborted,
                     Some(RelayInput::Lagged) => break Outcome::Lagged,
@@ -430,7 +441,9 @@ impl TelegramTurn {
                             for head in body.push(text) {
                                 let segment = segments.last_mut().unwrap();
                                 segment.text = head.clone();
-                                self.write(&head, segment, &fence, &mut shown, &mut last_update, &mut blocked_until).await;
+                                if !cancel_pending {
+                                    self.write(&head, segment, &fence, &mut shown, &mut last_update, &mut blocked_until).await;
+                                }
                                 // Only finalized chunks advance the cross-message fence.
                                 tg_html::render_chunk(&head, &mut fence);
                                 segments.push(DeliverySegment::new(segments.len(), String::new()));
@@ -451,28 +464,35 @@ impl TelegramTurn {
                                 status = line;
                             }
                         }
+                        AcpEvent::Error { terminal: false, code, .. } if code.as_deref() == Some("runtime_cancel_pending") => {
+                            cancel_pending = true;
+                        }
                         AcpEvent::TurnComplete { stop_reason, .. } => break match stop_reason.as_str() {
                             "end_turn" => Outcome::Completed, "cancelled" => Outcome::Cancelled, _ => Outcome::Failed,
                         },
+                        AcpEvent::Error { terminal: true, code, .. } if code.as_deref() == Some("runtime_outcome_unknown") => break Outcome::Unknown,
                         AcpEvent::Error { terminal: true, .. } |
                         AcpEvent::StatusChanged { status: ConnectionStatus::Disconnected | ConnectionStatus::Error } => break Outcome::Failed,
                         _ => {}
                     }
                 },
-                _ = tokio::time::sleep_until(next) => {
+                _ = tokio::time::sleep_until(next), if !cancel_pending => {
                     if body.text().trim().is_empty() {
                         self.draft(&want, &mut draft_shown, &mut last_update, &mut blocked_until).await;
                     } else {
                         self.write(&want, segments.last_mut().unwrap(), &fence, &mut shown, &mut last_update, &mut blocked_until).await;
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => break Outcome::Failed,
+                _ = tokio::time::sleep_until(deadline) => break if cancel_pending { Outcome::Unknown } else { Outcome::Failed },
             }
         };
-        if matches!(outcome, Outcome::Aborted | Outcome::Lagged) {
+        if matches!(
+            outcome,
+            Outcome::Aborted | Outcome::Lagged | Outcome::Unknown
+        ) {
             // Only repair the already known message. A missing ID must never
             // become a new send while handing an incomplete turn back.
-            if let Some(segment) = segments.last() {
+            if let Some(segment) = segments.last().filter(|_| !cancel_pending) {
                 if let Some(id) = segment.message_id {
                     if !segment.text.trim().is_empty() && shown != segment.text {
                         let mut local_fence = fence.clone();
@@ -770,6 +790,39 @@ pub async fn register_for_prompt(
     conversation_id: Option<i32>,
     spec: OutboundSpec,
 ) -> Result<Option<String>, String> {
+    register_with_state(state, connection_id, conversation_id, spec, false).await
+}
+
+/// External runtimes keep their original sessions outside ConnectionManager.
+/// Require durable v2 receipts so ingress can wait for actual delivery completion.
+pub async fn register_external(
+    state: &crate::app_state::AppState,
+    connection_id: &str,
+    spec: OutboundSpec,
+) -> Result<(), String> {
+    let version = match &spec {
+        OutboundSpec::Telegram {
+            delivery_version, ..
+        }
+        | OutboundSpec::Slack {
+            delivery_version, ..
+        } => *delivery_version,
+    };
+    if version < 2 {
+        return Err("external_relay_requires_v2".into());
+    }
+    register_with_state(state, connection_id, None, spec, true)
+        .await
+        .map(|_| ())
+}
+
+async fn register_with_state(
+    state: &crate::app_state::AppState,
+    connection_id: &str,
+    conversation_id: Option<i32>,
+    spec: OutboundSpec,
+    external: bool,
+) -> Result<Option<String>, String> {
     let relay = relay(&state.acp_event_bus, &state.db.conn);
     let _admission = relay.admission.lock().await;
     if spec.turn_id().is_empty() || spec.turn_id().len() > 200 {
@@ -785,16 +838,17 @@ pub async fn register_for_prompt(
     if relay.workers.lock().unwrap().contains_key(connection_id) {
         return Err("relay_turn_in_progress".into());
     }
-    let (generation, start_seq) =
-        if let Some(session) = state.connection_manager.get_state(connection_id).await {
-            let session = session.read().await;
-            if session.turn_in_flight {
-                return Err("relay_turn_in_progress".into());
-            }
-            (session.turns_completed, session.event_seq)
-        } else {
-            return Err("relay_connection_not_found".into());
-        };
+    let (generation, start_seq) = if external {
+        (0, 0)
+    } else if let Some(session) = state.connection_manager.get_state(connection_id).await {
+        let session = session.read().await;
+        if session.turn_in_flight {
+            return Err("relay_turn_in_progress".into());
+        }
+        (session.turns_completed, session.event_seq)
+    } else {
+        return Err("relay_connection_not_found".into());
+    };
     let (version, kind, target, callback, format) = match &spec {
         OutboundSpec::Telegram {
             delivery_version,
@@ -991,7 +1045,7 @@ fn register(
             }
         }
         if version >= 2 {
-            let status = if report.delivery_unknown {
+            let status = if report.delivery_unknown || report.outcome == Outcome::Unknown {
                 "unknown"
             } else if report.delivery_failed {
                 "failed"
@@ -1003,6 +1057,7 @@ fn register(
                 "relay_turn_id": tid, "relay_kind": kind, "connection_id": connection_id,
                 "conversation_id": conversation_id, "outcome": report.outcome,
                 "delivery_status": status,
+                "execution_status": if report.outcome == Outcome::Unknown { "unknown" } else { "terminal" },
                 "fallback_allowed": report.delivery_failed && !report.delivery_unknown && report.text_complete,
                 "text_complete": report.text_complete, "final_text": report.final_text,
                 "segments": report.segments, "target": target,
@@ -1434,6 +1489,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn uncertain_runtime_never_finalizes_or_allows_fallback() {
+        let api = Arc::new(FakeTg::default());
+        let report = run_with(
+            api.clone(),
+            vec![
+                delta("partial"),
+                env(AcpEvent::Error {
+                    message: "lost owner".into(),
+                    agent_type: "legacy".into(),
+                    code: Some("runtime_outcome_unknown".into()),
+                    details: None,
+                    terminal: true,
+                }),
+            ],
+        )
+        .await;
+        assert_eq!(report.outcome, Outcome::Unknown);
+        assert!(!report.text_complete);
+        assert!(messages(&api).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn markdown_is_sent_as_html_and_falls_back_to_plain() {
         let api = Arc::new(FakeTg::default());
         run_with(
@@ -1537,11 +1614,7 @@ mod tests {
         let body_calls = || messages(&api).len() + edits(&api).len() + drafts(&api).len();
         let before = body_calls();
         tokio::time::sleep(Duration::from_secs(20)).await;
-        assert_eq!(
-            body_calls(),
-            before,
-            "静默时不重写正文或草稿"
-        );
+        assert_eq!(body_calls(), before, "静默时不重写正文或草稿");
 
         tx.send(complete("end_turn")).unwrap();
         let r = handle.await.unwrap();
@@ -1552,6 +1625,68 @@ mod tests {
             "abcd"
         );
     }
+}
+
+/// Deliver a command reply through the same formatting, throttling and durable
+/// receipts as normal turns. Synthetic events are sent ONLY to this worker,
+/// never to the ACP/global bus or an agent/transcript.
+pub async fn deliver_reply(
+    state: &crate::app_state::AppState,
+    spec: OutboundSpec,
+    text: String,
+) -> Result<serde_json::Value, String> {
+    let turn_id = spec.turn_id().to_string();
+    let connection_id = format!("channel-reply:{turn_id}");
+    register_external(state, &connection_id, spec).await?;
+    let relay = relay(&state.acp_event_bus, &state.db.conn);
+    let tx = relay
+        .workers
+        .lock()
+        .unwrap()
+        .get(&connection_id)
+        .map(|worker| worker.tx.clone())
+        .ok_or("reply_worker_missing")?;
+    for (seq, payload) in [
+        (
+            1,
+            AcpEvent::ContentDelta {
+                text,
+                parent_tool_use_id: None,
+            },
+        ),
+        (
+            2,
+            AcpEvent::TurnComplete {
+                session_id: String::new(),
+                stop_reason: "end_turn".into(),
+                agent_type: "channel-command".into(),
+                duration_ms: None,
+            },
+        ),
+    ] {
+        tx.send(RelayInput::Event(Arc::new(EventEnvelope {
+            seq,
+            connection_id: connection_id.clone(),
+            payload,
+        })))
+        .map_err(|_| "reply_worker_closed")?;
+    }
+    let mut results = super::relay_outbox::subscribe_results();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if let Some(result) =
+                get_result(&state.db.conn, &turn_id, ResultFormat::CompactV1).await?
+            {
+                return Ok(result);
+            }
+            results
+                .changed()
+                .await
+                .map_err(|_| "relay_result_stream_closed".to_string())?;
+        }
+    })
+    .await
+    .map_err(|_| "reply_outcome_unknown".to_string())?
 }
 
 pub async fn get_result(

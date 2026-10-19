@@ -636,6 +636,10 @@ pub struct SessionState {
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
 
+    /// A retained OpenClaw Gateway outlives this ACP transport. Local cancel
+    /// notification alone must not synthesize a completed runtime turn.
+    pub retained_openclaw_bridge: bool,
+
     /// How many `TurnComplete`s this connection has applied — the turn's
     /// IDENTITY, paired with `turn_in_flight`. `turn_in_flight` alone only says
     /// "some turn is running"; a caller that admitted itself against turn N and
@@ -756,6 +760,7 @@ impl SessionState {
             pending_user_message: None,
             pending_user_message_started_at: None,
             turn_in_flight: false,
+            retained_openclaw_bridge: false,
             turns_completed: 0,
             last_turn_ended_abnormally: false,
             config_stale: false,

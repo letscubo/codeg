@@ -54,8 +54,17 @@ async fn forward(
     output: mpsc::UnboundedSender<RelayInput>,
     stopped: oneshot::Sender<()>,
 ) {
+    let mut stopped = Some(stopped);
     while let Some(event) = input.recv().await {
         let done = terminal(&event);
+        let cancel_pending = matches!(&event, RelayInput::Event(event)
+            if matches!(&event.payload, AcpEvent::Error { terminal: false, code: Some(code), .. }
+                if code == "runtime_cancel_pending"));
+        if done || cancel_pending {
+            // Stop typing immediately on cancellation intent, but continue
+            // forwarding until the runtime supplies its real terminal verdict.
+            drop(stopped.take());
+        }
         if output.send(event).is_err() || done {
             break;
         }

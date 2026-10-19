@@ -51,6 +51,8 @@ pub struct ActivityResponse {
     pub ws_clients: usize,
     /// 此刻正在跑一轮的会话连接数。0 = 没有任何一轮在进行(网页、渠道、定时任务都算)。
     pub active_turns: usize,
+    /// Queued/running channel commands and legacy runtime operations.
+    pub channel_operations: usize,
     /// 采集时刻(RFC3339),调用方据此判断新鲜度。
     pub collected_at: String,
 }
@@ -58,7 +60,10 @@ pub struct ActivityResponse {
 pub async fn activity(Extension(state): Extension<Arc<AppState>>) -> Json<ActivityResponse> {
     Json(ActivityResponse {
         ws_clients: crate::web::ws::ws_client_count(),
-        active_turns: count_active_turns(&state.connection_manager).await,
+        // Preserve the existing platform zero/nonzero guard during rollout.
+        active_turns: count_active_turns(&state.connection_manager).await
+            + crate::chat_channel::ingress::active_operations(),
+        channel_operations: crate::chat_channel::ingress::active_operations(),
         collected_at: chrono::Utc::now().to_rfc3339(),
     })
 }

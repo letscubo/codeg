@@ -22,3 +22,8 @@ pub mod webhook;
 
 mod relay_input;
 mod telegram_typing;
+
+pub mod ingress;
+pub mod legacy_runtime;
+
+pub mod legacy_openclaw_inspect;
