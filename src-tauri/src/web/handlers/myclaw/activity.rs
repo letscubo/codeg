@@ -42,7 +42,7 @@
 //! - `turn_ended_ago_s`:距上一轮结束
 //! - `next_automation_in_s`:距最近一次定时任务到点(null = 没有或读不到)
 //!
-//! 前两个是进程内单调时钟算的间隔(容器时钟在快照恢复后会漂,不报时刻),见 `acp/presence.rs`。
+//! 前两个按墙钟算、落盘(重启读回);从没有过报约 10 年(`presence::NEVER_AGO_S`),不报 null。见 `acp/presence.rs`。
 //!
 //! ## 维护中
 //!
@@ -70,9 +70,9 @@ pub struct ActivityResponse {
     /// 采集时刻(RFC3339),调用方据此判断新鲜度。
     pub collected_at: String,
     /// 距上次「用户在页面上操作」过了几秒(前端经 `/ws/events` 发 `user_activity`)。
-    /// 进程启动后还没有过 = 距启动的秒数。见 `acp/presence.rs`。
+    /// 从没有过 = `presence::NEVER_AGO_S`(约 10 年)。见 `acp/presence.rs`。
     pub user_active_ago_s: u64,
-    /// 距上一轮结束(任何连接从「正在跑」变成别的状态)过了几秒;还没有过 = 距启动的秒数。
+    /// 距上一轮结束(任何连接从「正在跑」变成别的状态)过了几秒;从没有过 = `presence::NEVER_AGO_S`。
     pub turn_ended_ago_s: u64,
     /// 最近一次定时任务还有几秒到点(已过点还没被认领的报 0);没有启用的定时任务、或读库
     /// 失败时为 null —— 调用方应把 null 当「不知道」,而不是「没有任务」去放心停机。

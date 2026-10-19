@@ -126,6 +126,24 @@ pub fn codeg_logs_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(CODEG_DIR_NAME).join(LOGS_DIR_NAME))
 }
 
+/// fork(letscubo):「最近一次有人用」两个时刻的落盘文件(见 `crate::acp::presence`),
+/// 进程重启后读回来,不会把重启当成「刚有人用过」。
+///
+/// Resolution mirrors [`codeg_turn_timings_root`]:
+/// 1. `$CODEG_HOME/myclaw-presence.json`
+/// 2. `$CODEG_DATA_DIR/myclaw-presence.json` (server-mode data directory)
+/// 3. `~/.codeg/myclaw-presence.json` (desktop default)
+pub fn codeg_presence_file() -> PathBuf {
+    const FILE: &str = "myclaw-presence.json";
+    if let Some(custom) = std::env::var_os("CODEG_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(custom).join(FILE);
+    }
+    if let Some(data) = std::env::var_os("CODEG_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(data).join(FILE);
+    }
+    codeg_home_dir().join(FILE)
+}
+
 /// Root directory for codeg's own per-turn timing observations (see
 /// `crate::turn_timings`) — wall-clock turn spans the ACP connection layer
 /// records for agents whose native session store carries no per-turn
