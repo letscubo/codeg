@@ -186,6 +186,10 @@ async fn is_quiet(state: &Arc<AppState>) -> bool {
     if crate::web::ws::ws_client_count() > 0 {
         return false;
     }
+    // 正在备份(平台触发的维护):重启会把备份打断
+    if crate::web::handlers::myclaw::backup::maintenance().is_some() {
+        return false;
+    }
     if crate::web::handlers::myclaw::activity::count_active_turns(&state.connection_manager).await
         > 0
     {

@@ -44,6 +44,11 @@
 //!
 //! 前两个是进程内单调时钟算的间隔(容器时钟在快照恢复后会漂,不报时刻),见 `acp/presence.rs`。
 //!
+//! ## 维护中
+//!
+//! `maintenance`:平台触发的维护正在进行(目前只有备份,见 `handlers/myclaw/backup.rs`)。
+//! 平台据此别暂停实例;codeg 自己的闲时自动升级也不在这时重启。
+//!
 //! 鉴权与 `/api/myclaw/exec` 同:受保护路由组内,Bearer 或 WS 子协议。
 
 use std::sync::Arc;
@@ -72,6 +77,9 @@ pub struct ActivityResponse {
     /// 最近一次定时任务还有几秒到点(已过点还没被认领的报 0);没有启用的定时任务、或读库
     /// 失败时为 null —— 调用方应把 null 当「不知道」,而不是「没有任务」去放心停机。
     pub next_automation_in_s: Option<i64>,
+    /// 正在做的平台维护(目前只有 `"backup"`,见 `handlers/myclaw/backup.rs`);没有为 null。
+    /// 非 null 时平台应当成「忙」、别暂停 —— 暂停会把维护打断。
+    pub maintenance: Option<&'static str>,
 }
 
 pub async fn activity(Extension(state): Extension<Arc<AppState>>) -> Json<ActivityResponse> {
@@ -91,6 +99,7 @@ pub async fn activity(Extension(state): Extension<Arc<AppState>>) -> Json<Activi
         user_active_ago_s: crate::acp::presence::user_active_ago_s(),
         turn_ended_ago_s: crate::acp::presence::turn_ended_ago_s(),
         next_automation_in_s,
+        maintenance: super::backup::maintenance(),
     })
 }
 

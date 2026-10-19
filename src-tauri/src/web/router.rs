@@ -1759,6 +1759,13 @@ pub fn build_router(
         // 不采 CPU、不读磁盘,与 metrics 分开正是为了别为一个计数做那些系统调用。
         .route("/myclaw/activity", get(handlers::myclaw::activity::activity))
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
+        // 整个家目录备份到平台给的预签名地址(异步:POST 开始、GET 查状态、cancel 取消;
+        // 见 handlers/myclaw/backup.rs)。备份期间 activity 报 maintenance=backup。
+        .route(
+            "/myclaw/backup",
+            post(handlers::myclaw::backup::start).get(handlers::myclaw::backup::get),
+        )
+        .route("/myclaw/backup/cancel", post(handlers::myclaw::backup::cancel))
         // 统一记忆:平台改了记忆 → 缓存作废,下一轮重新注入(见 acp/myclaw_memory.rs)
         .route(
             "/myclaw/memory/invalidate",
