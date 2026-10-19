@@ -2,6 +2,7 @@ pub mod auth;
 pub mod compression;
 pub mod event_bridge;
 pub mod handlers;
+pub mod llm_bridge;
 pub mod port_probe;
 pub mod router;
 pub mod shutdown;

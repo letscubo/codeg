@@ -1080,6 +1080,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "shlex",
+ "switchyard-translation",
  "tar",
  "tauri",
  "tauri-build",
@@ -6828,6 +6829,36 @@ dependencies = [
  "base64 0.21.7",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "switchyard-protocol"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c49a9e7884e7f50669250463a58a21bc79084adb87ef03647cbe7ba5c3b22ee"
+dependencies = [
+ "async-trait",
+ "futures",
+ "http",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "switchyard-translation"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "629f9c47cb198da7e92569384fec4da8486852c38a7af922e0c9d6b62ed74fa1"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "futures",
+ "serde",
+ "serde_json",
+ "switchyard-protocol",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
