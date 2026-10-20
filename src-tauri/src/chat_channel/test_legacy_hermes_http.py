@@ -331,6 +331,77 @@ class NativeSessionIdentity(unittest.TestCase):
         self.assertEqual(len(closes),2)
 
 
+class TerminalPeerRecovery(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.writes=[]
+        self.rows={"root":{"id":"root","source":"telegram","session_key":"original","chat_id":"42","user_id":"42","chat_type":"dm"},
+                   "compressed":{"id":"compressed","source":"api_server","session_key":"original"}}
+        state=ModuleType("hermes_state")
+        def db(path,read_only=False):
+            def record(sid,**identity):
+                self.assertFalse(read_only)
+                self.writes.append((sid,identity))
+                self.rows[sid].update(identity)
+            return SimpleNamespace(get_session=lambda sid:self.rows.get(sid),
+                get_compression_chain=lambda sid:["root","compressed"],get_compression_tip=lambda sid:"compressed",
+                record_gateway_session_peer=record,close=lambda:None)
+        state.SessionDB=db
+        self.stack=ExitStack()
+        self.stack.enter_context(patch.dict(sys.modules,{"hermes_state":state}))
+        self.wire=io.StringIO();self.stack.enter_context(patch.object(bridge,"WIRE",self.wire))
+        native={"nativeSessionId":"root","sessionKey":"original","chatId":"42","senderId":"42","nativeOriginChatType":"dm"}
+        def recover():
+            current=bridge.http_live_session(Path("/fixture"),"root")
+            bridge.http_restore_native_peer(Path("/fixture"),native,current)
+        self.events=bridge.HttpSessionEvents("root",terminal_session=recover)
+        self.events.accept("run.started",{"run_id":"run_fixture","session_id":"root","seq":1})
+
+    async def asyncTearDown(self):
+        self.stack.close()
+
+    def assert_recovered(self):
+        self.assertEqual(len(self.writes),1)
+        sid,identity=self.writes[0]
+        self.assertEqual(sid,"compressed")
+        self.assertEqual(identity["source"],"telegram")
+        self.assertEqual(identity["session_key"],"original")
+        self.assertEqual(identity["chat_id"],"42")
+        self.assertEqual(identity["user_id"],"42")
+        self.assertNotIn("include_compression_ancestors",identity)
+
+    async def test_sse_error_after_compression_repairs_only_current_tip_before_failure(self):
+        self.assertTrue(self.events.accept("error",{"run_id":"run_fixture","session_id":"root","seq":2,"message":"private failure details"}))
+        self.assert_recovered()
+        self.assertEqual(json.loads(self.wire.getvalue().splitlines()[-1])["event"],"run.failed")
+        self.assertNotIn("private failure",self.wire.getvalue())
+
+    async def test_observed_failed_and_cancelled_runs_repair_compressed_peer(self):
+        for status,outcome in [("failed","run.failed"),("cancelled","run.cancelled"),("interrupted","run.cancelled")]:
+            with self.subTest(status=status):
+                self.rows["compressed"]["source"]="api_server";self.writes.clear()
+                async def http(*args,**kwargs):return {"run_id":"run_fixture","status":status,"session_id":"root"}
+                with patch.object(bridge,"http_json",http):
+                    await bridge.http_observe_after_disconnect(None,"http://fixture",self.events)
+                self.assert_recovered()
+                self.assertEqual(json.loads(self.wire.getvalue().splitlines()[-1])["event"],outcome)
+
+    async def test_confirmed_completion_without_final_text_repairs_peer_but_not_result(self):
+        async def http(*args,**kwargs):return {"run_id":"run_fixture","status":"completed","session_id":"compressed"}
+        with patch.object(bridge,"http_json",http),self.assertRaisesRegex(ValueError,"hermes_final_snapshot_missing"):
+            await bridge.http_observe_after_disconnect(None,"http://fixture",self.events)
+        self.assert_recovered()
+        self.assertNotIn('"event": "run.completed"',self.wire.getvalue())
+
+    async def test_unknown_or_foreign_run_does_not_repair_peer(self):
+        for run_id,status,error in [("run_fixture","unknown","hermes_execution_unknown"),("other","failed","hermes_session_identity_changed")]:
+            with self.subTest(run_id=run_id,status=status):
+                async def http(*args,**kwargs):return {"run_id":run_id,"status":status}
+                with patch.object(bridge,"http_json",http),self.assertRaisesRegex(ValueError,error):
+                    await bridge.http_observe_after_disconnect(None,"http://fixture",self.events)
+                self.assertEqual(self.writes,[])
+                self.assertEqual(self.rows["compressed"]["source"],"api_server")
+
+
 try:
     from aiohttp import web
 except ImportError:

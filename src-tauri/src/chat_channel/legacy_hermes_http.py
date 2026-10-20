@@ -345,10 +345,11 @@ def http_restore_native_peer(home, native, session_id):
 
 class HttpSessionEvents:
     """The official session SSE uses named events, not the Runs JSON event field."""
-    def __init__(self, session_id, validate_session=None, complete_session=None):
+    def __init__(self, session_id, validate_session=None, complete_session=None, terminal_session=None):
         self.session_id = session_id
         self.validate_session = validate_session or (lambda sid:sid == session_id)
         self.complete_session = complete_session or (lambda sid:None)
+        self.terminal_session = terminal_session or (lambda:None)
         self.run_id = None
         self.sequence = 0
         self.final = None
@@ -389,6 +390,9 @@ class HttpSessionEvents:
             emit("run.cancelled" if self.cancelled else "run.completed", **({} if self.cancelled else {"output":self.final}))
             return True
         elif name == "error":
+            # The session API sets failed before emitting error. A failed turn
+            # may already have compressed, without an assistant.completed frame.
+            self.terminal_session()
             emit("run.failed")
             return True
         # tool.progress contains reasoning text; deliberately never relay it.
@@ -429,7 +433,8 @@ async def http_run(request):
         body.update(model=request["model"], provider=request["provider"], require_model_lock=True)
     headers = {"Authorization":"Bearer " + key, "X-Hermes-Session-Key":session_key}
     events = HttpSessionEvents(current, lambda sid:sid in http_compression_ids(home, current),
-        lambda sid:http_restore_native_peer(home, native, sid))
+        lambda sid:http_restore_native_peer(home, native, sid),
+        lambda:http_restore_native_peer(home, native, http_live_session(home, current)))
     async with aiohttp.ClientSession(headers=headers, read_bufsize=4 * 1024 * 1024) as client:
         existing = await http_json(client, "GET", base + "/api/sessions/" + quote(current, safe=""))
         require((existing.get("session") or {}).get("id") == current, "hermes_session_not_found")
@@ -503,6 +508,10 @@ async def http_observe_after_disconnect(client, base, events):
             status = None
         if status:
             require(status.get("run_id") == events.run_id, "hermes_session_identity_changed")
+            if status.get("status") in ("completed", "failed", "cancelled", "interrupted"):
+                # Only a confirmed terminal run authorizes this recovery. Unknown
+                # status never rewrites peer metadata or retries the prompt.
+                events.terminal_session()
             if status.get("status") in ("cancelled", "interrupted"):
                 emit("run.cancelled")
                 return
