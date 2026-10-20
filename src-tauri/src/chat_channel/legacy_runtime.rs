@@ -68,6 +68,10 @@ struct HermesNativeRequest {
     hermes_home: String,
     python_path: String,
     session_id: String,
+    #[serde(default)]
+    session_key: Option<String>,
+    #[serde(default)]
+    transport: Option<String>,
     message: String,
     model: Option<String>,
     provider: Option<String>,
@@ -578,51 +582,65 @@ async fn wait_result(state: &AppState, turn_id: &str) -> Result<Value, String> {
 }
 
 const HERMES_GATEWAY_BRIDGE: &str = include_str!("legacy_hermes_gateway.py");
+const HERMES_HTTP_BRIDGE: &str = include_str!("legacy_hermes_http.py");
 
-/// Read-only native Telegram readiness. Paths are deployment configuration, never
-/// inferred from a user's message or changed to codeg's own agent home.
-pub async fn inspect_hermes() -> Result<Value, String> {
+fn hermes_bridge_source() -> String {
+    format!("{HERMES_HTTP_BRIDGE}\n{HERMES_GATEWAY_BRIDGE}")
+}
+
+/// Inspect/resolve use deployment-owned paths. No caller-selected runtime or credentials.
+pub async fn legacy_hermes_action(action: &str, params: &Value) -> Result<Value, String> {
+    if !matches!(action, "inspect" | "resolve") {
+        return Err("hermes_invalid_action".into());
+    }
     let home = std::env::var("CODEG_LEGACY_HERMES_HOME").unwrap_or_default();
     let python = std::env::var("CODEG_LEGACY_HERMES_PYTHON").unwrap_or_default();
-    let unavailable = |reason: &str| {
-        json!({"kind":"hermes","ready":false,
-        "nativeDeliveryDisabled":false,"reasonCodes":[reason],"sessions":[]})
-    };
     if !std::path::Path::new(&home).is_absolute() || !std::path::Path::new(&python).is_absolute() {
-        return Ok(unavailable("hermes_native_paths_not_configured"));
+        return Err("hermes_native_paths_not_configured".into());
     }
-    let mut child = match tokio::process::Command::new(&python)
-        .args(["-u", "-c", HERMES_GATEWAY_BRIDGE])
+    let mut payload = params.as_object().cloned().unwrap_or_default();
+    payload.insert("action".into(), json!(action));
+    payload.insert("hermesHome".into(), json!(&home));
+    payload.insert("pythonPath".into(), json!(&python));
+    let mut child = tokio::process::Command::new(&python)
+        .args(["-u", "-c"])
+        .arg(hermes_bridge_source())
         .env("HERMES_HOME", &home)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Ok(unavailable("hermes_python_unavailable")),
-    };
+        .map_err(|_| "hermes_python_unavailable")?;
     let mut input = child.stdin.take().ok_or("hermes_bridge_unavailable")?;
-    let payload = json!({"action":"inspect","hermesHome":home,"pythonPath":python});
     input
-        .write_all(format!("{payload}\n").as_bytes())
+        .write_all(format!("{}\n", Value::Object(payload)).as_bytes())
         .await
         .map_err(|_| "hermes_bridge_unavailable")?;
     drop(input);
     let mut lines = BufReader::new(child.stdout.take().ok_or("hermes_bridge_unavailable")?).lines();
-    let result = match tokio::time::timeout(Duration::from_secs(40), lines.next_line()).await {
+    let result = match tokio::time::timeout(Duration::from_secs(60), lines.next_line()).await {
         Ok(Ok(Some(line))) if line.len() <= 8 * 1024 * 1024 => {
             match serde_json::from_str::<Value>(&line) {
-                Ok(frame) if frame["event"] == "inspect" => frame["result"].clone(),
-                Ok(frame) => unavailable(&bridge_error(&frame)),
-                Err(_) => unavailable("hermes_invalid_bridge_frame"),
+                Ok(frame) if frame["event"] == action => Ok(frame["result"].clone()),
+                Ok(frame) => Err(bridge_error(&frame)),
+                Err(_) => Err("hermes_invalid_bridge_frame".into()),
             }
         }
-        _ => unavailable("hermes_native_inspection_unavailable"),
+        _ => Err("hermes_native_inspection_unavailable".into()),
     };
     let _ = child.kill().await;
-    Ok(result)
+    result
+}
+
+pub async fn inspect_hermes() -> Result<Value, String> {
+    match legacy_hermes_action("inspect", &json!({})).await {
+        Ok(value) => Ok(value),
+        Err(reason) => Ok(
+            json!({"kind":"hermes","transport":"hermes_http", "compatible":false,
+            "ready":false,"nativeDeliveryDisabled":false,"reasonCodes":[reason],"sessions":[]}),
+        ),
+    }
 }
 
 async fn execute_native(
@@ -644,7 +662,8 @@ async fn execute_native(
     }
     let turn_id = outbound.turn_id().to_owned();
     let mut child = tokio::process::Command::new(&request.python_path)
-        .args(["-u", "-c", HERMES_GATEWAY_BRIDGE])
+        .args(["-u", "-c"])
+        .arg(hermes_bridge_source())
         .env("HERMES_HOME", &request.hermes_home)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -656,14 +675,12 @@ async fn execute_native(
     let mut input = child.stdin.take().ok_or("hermes_bridge_unavailable")?;
     let mut output =
         BufReader::new(child.stdout.take().ok_or("hermes_bridge_unavailable")?).lines();
-    let initial = json!({"hermesHome":request.hermes_home,"sessionId":request.session_id,
-        "message":request.message,"model":request.model,"provider":request.provider,
-        "nativeDeliveryDisabled":true,"turnId":turn_id});
+    let initial = native_bridge_request(&request, &turn_id);
     input
         .write_all(format!("{initial}\n").as_bytes())
         .await
         .map_err(|_| "hermes_bridge_unavailable")?;
-    let ready = tokio::time::timeout(Duration::from_secs(40), output.next_line())
+    let ready = tokio::time::timeout(Duration::from_secs(60), output.next_line())
         .await
         .map_err(|_| "hermes_gateway_preflight_timeout")?
         .map_err(|_| "hermes_bridge_unavailable")?
@@ -696,6 +713,18 @@ async fn execute_native(
                     if line.len() > 8*1024*1024 {return Err("hermes_invalid_bridge_frame".into());}
                     let frame: Value = serde_json::from_str(&line).map_err(|_|"hermes_invalid_bridge_frame")?;
                     if frame["event"] == "bridge.error" {return Err(bridge_error(&frame));}
+                    if frame["event"] == "run.accepted" {
+                        let run_id = frame["run_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 200)
+                            .ok_or("hermes_invalid_bridge_frame")?;
+                        let native_id = frame["session_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 512)
+                            .ok_or("hermes_invalid_bridge_frame")?;
+                        // One checkpoint per accepted run, no tokens or message bodies.
+                        crate::db::service::app_metadata_service::upsert_value(&state.db.conn,
+                            &format!("hermes_http_run:{turn_id}"),
+                            &json!({"runId":run_id,"nativeSessionId":native_id}).to_string()).await
+                            .map_err(|_| "hermes_run_checkpoint_failed")?;
+                        continue;
+                    }
                     if let Some(outcome) = events.event(&frame)? {return Ok(outcome.into());}
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -716,9 +745,17 @@ async fn execute_native(
         }),
         Err(code) => events.emit(runtime_error(code)),
     }
-    // Completion comes from the owner's durable receipt, never child process exit.
+    // Completion comes from the runtime terminal event/observed status, never child process exit.
     let _ = child.kill().await;
     wait_result(state, &turn_id).await
+}
+
+fn native_bridge_request(request: &HermesNativeRequest, turn_id: &str) -> Value {
+    json!({"hermesHome":request.hermes_home,"pythonPath":request.python_path,
+        "sessionId":request.session_id,"message":request.message,
+        "model":request.model,"provider":request.provider,"sessionKey":request.session_key,
+        "transport":request.transport,"nativeDeliveryDisabled":request.native_delivery_disabled,
+        "turnId":turn_id})
 }
 
 fn bridge_error(frame: &Value) -> String {
@@ -779,6 +816,7 @@ pub(crate) fn is_known_preflight_failure(reason: &str) -> bool {
             | "hermes_bridge_unavailable"
             | "hermes_gateway_preflight_timeout"
             | "hermes_canonical_gateway_unsupported"
+            | "hermes_http_bridge_unsupported"
             | "hermes_invalid_bridge_frame"
             | "hermes_gateway_failed"
             | "hermes_home_unavailable"
@@ -789,6 +827,13 @@ pub(crate) fn is_known_preflight_failure(reason: &str) -> bool {
             | "hermes_status_unverified"
             | "hermes_status_timeout"
             | "hermes_invalid_status"
+            | "hermes_api_not_configured"
+            | "hermes_api_credential_unavailable"
+            | "hermes_http_request_rejected"
+            | "hermes_http_unavailable"
+            | "hermes_invalid_http_response"
+            | "hermes_channel_not_ready"
+            | "hermes_session_identity_changed"
     )
 }
 
@@ -889,6 +934,25 @@ mod tests {
             json!({"kind":"legacy_hermes_native","sessionKey":"original"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn native_http_bridge_request_contains_runtime_paths_and_original_identity() {
+        let request: HermesNativeRequest = serde_json::from_value(json!({
+            "hermesHome":"/fixture/home", "pythonPath":"/fixture/venv/bin/python",
+            "sessionId":"original-id", "sessionKey":"agent:main:telegram:dm:42",
+            "transport":"hermes_http", "message":"hello", "model":"selected",
+            "provider":"provider", "nativeDeliveryDisabled":true,
+        }))
+        .unwrap();
+        let payload = native_bridge_request(&request, "stable-turn");
+        assert_eq!(payload["pythonPath"], "/fixture/venv/bin/python");
+        assert_eq!(payload["hermesHome"], "/fixture/home");
+        assert_eq!(payload["sessionId"], "original-id");
+        assert_eq!(payload["sessionKey"], "agent:main:telegram:dm:42");
+        assert_eq!(payload["transport"], "hermes_http");
+        assert_eq!(payload["turnId"], "stable-turn");
+        assert_eq!(payload["nativeDeliveryDisabled"], true);
     }
     #[test]
     fn run_identifier_cannot_escape_its_path_segment() {

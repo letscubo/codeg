@@ -52,12 +52,16 @@ Retained runtimes can still have their original Web/native clients. Those client
 | --- | --- | --- |
 | Existing OpenClaw | Original CLI ACP with exact session key and no reset | `CODEG_LEGACY_OPENCLAW_CLI` = absolute path to the original installed CLI; preserve original HOME/config |
 | Existing Hermes Slack | Original Runs API with saved Slack history and explicit model/provider | Existing local API endpoint and credentials supplied by signed platform callback |
-| Existing Hermes native Telegram | Original canonical Gateway, existing native session ID | `CODEG_LEGACY_HERMES_HOME`, `CODEG_LEGACY_HERMES_PYTHON` = absolute original paths |
+| Existing Hermes native Telegram | Original HTTP session streaming API with retained native session ID | `CODEG_LEGACY_HERMES_HOME`, `CODEG_LEGACY_HERMES_PYTHON` = absolute original paths |
 
 `POST /api/legacy_channel_inspect` takes `{ "kind": "hermes", "platform": "telegram" }` (or `openclaw`).
 It reads the original runtime's policy, session inventory and live adapter state. It does not stop, reconfigure or upgrade that runtime.
-Native Telegram adoption currently covers verified existing private text sessions only. Complex/ambiguous routes, topics and new native chats fail closed.
+Hermes inspection reports `compatible` before handoff and `ready` after the original adapter is stopped. The `legacyHermesTelegramVersion: 1` capability requires the HTTP session stream, request-scoped model lock and run stop/status APIs. Compatibility is verified against the running APIs and policy, not a version label.
+Hermes supports existing and new private text conversations. `POST /api/legacy_channel_resolve` receives `{ "kind": "hermes", "platform": "telegram", "chatId": "...", "senderId": "...", "createSession": true }`; the runtime checks its current allowlist and PairingStore before returning or creating the native session. An unapproved sender receives the original pairing response. Group/topic and unsupported policy configurations fail closed. OpenClaw adoption still requires an existing private session.
+New Telegram routing entries use a separate `.codeg-telegram` routing scope in the same Hermes database; the native gateway's original routing scope stays read-only. The bound native ID survives official compression lineage changes. A reset or unrelated session cannot replace it. Runtime API credentials are read locally from the validated Gateway process and never returned to the platform.
 The original Telegram adapter must be fully stopped before adoption; otherwise both the runtime and codeg could send replies.
+
+Hermes uses `POST /api/sessions/{id}/chat/stream` exactly once per admitted codeg operation. An explicit model/provider pair uses `require_model_lock`; tool events drive loading, assistant events drive text, and reasoning progress is filtered. The original HTTP API does not offer prompt idempotency, so interrupted or uncertain submissions are not retried. Cancellation targets the same observed run ID and waits for its terminal event.
 
 The relay uses the existing Telegram typing/draft and Slack loading/streaming implementation. Thinking records remain excluded from visible response text.
 Legacy Slack `thread_message` may suppress `[[MYCLAW_NO_REPLY]]` without exposing a partial sentinel.

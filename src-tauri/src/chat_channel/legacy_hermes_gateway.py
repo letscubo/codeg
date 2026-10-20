@@ -72,7 +72,7 @@ def native_adapter_absent(home, endpoint):
 
 def simple_policy(config, extra, home):
     """Preserve the supported policy exactly; refuse rules this bridge cannot express."""
-    truthy = lambda value: str(value).strip().lower() in ("true", "1", "yes", "on")
+    truthy = lambda value: str(value).lower() in ("true", "1", "yes")
     reasons = []
     complex_keys = ("groups", "group_allow_from", "group_policy", "allowed_chats", "group_allowed_chats",
         "allowed_topics", "ignored_threads", "mention_patterns", "guest_mode", "allow_admin_from",
@@ -327,6 +327,8 @@ async def observe(client, session_id, admission_id, epoch, seen, poll_interval=5
 
 
 async def run(request):
+    if request.get("transport") == "hermes_http":
+        return await http_run(request)
     require(request.get("nativeDeliveryDisabled") is True, "hermes_native_delivery_not_disabled")
     home = Path(request["hermesHome"])
     require(home.is_absolute() and home.is_dir(), "hermes_home_unavailable")
@@ -373,14 +375,17 @@ if __name__ == "__main__":
     try:
         request = json.loads(sys.stdin.readline())
         if request.get("action") == "inspect":
-            emit("inspect", result=asyncio.run(inspect_native(request)))
+            emit("inspect", result=asyncio.run(http_inspect(request)))
+        elif request.get("action") == "resolve":
+            emit("resolve", result=asyncio.run(http_resolve(request)))
         else:
             asyncio.run(run(request))
     except Exception as error:
         # RPC errors and imports can contain paths/tokens. Only our fixed codes leave.
         reason = str(error) if isinstance(error, ValueError) else ""
         if isinstance(error, ImportError):
-            reason = "hermes_canonical_gateway_unsupported"
+            reason = ("hermes_http_bridge_unsupported" if request.get("transport") == "hermes_http"
+                      or request.get("action") in ("inspect", "resolve") else "hermes_canonical_gateway_unsupported")
         if not reason.startswith("hermes_") or not reason.replace("_", "").isalnum() or len(reason) > 80:
             reason = "hermes_gateway_failed"
         emit("bridge.error", code=reason)

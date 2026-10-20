@@ -44,6 +44,7 @@ pub fn build_router(
         .route("/health", post(health_check))
         .route("/channel_submit", post(handlers::channel_ingress::channel_submit))
         .route("/legacy_channel_inspect", post(handlers::channel_ingress::legacy_channel_inspect))
+        .route("/legacy_channel_resolve", post(handlers::channel_ingress::legacy_channel_resolve))
         .route("/channel_operation", post(handlers::channel_ingress::channel_operation))
         .route("/channel_cancel", post(handlers::channel_ingress::channel_cancel))
         .route("/get_relay_capabilities", post(handlers::relay::get_relay_capabilities))

@@ -75,3 +75,85 @@ pub async fn legacy_channel_inspect(
         .map(Json)
         .map_err(|_| error("legacy_inspection_failed"))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveRequest {
+    pub kind: String,
+    pub platform: String,
+    pub chat_id: String,
+    pub sender_id: String,
+    pub sender_name: Option<String>,
+    #[serde(default)]
+    pub create_session: bool,
+}
+
+/// The platform has authenticated the Telegram webhook; Hermes remains the
+/// authority for sender grants, pairing and the retained native session.
+pub async fn legacy_channel_resolve(
+    Json(request): Json<ResolveRequest>,
+) -> Result<Json<Value>, AppCommandError> {
+    let valid_id = |value: &str| {
+        !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+    };
+    if request.kind != "hermes"
+        || request.platform != "telegram"
+        || !valid_id(&request.chat_id)
+        || request.chat_id != request.sender_id
+        || request
+            .sender_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 256)
+    {
+        return Err(AppCommandError::invalid_input("unsupported_legacy_channel"));
+    }
+    crate::chat_channel::legacy_runtime::legacy_hermes_action(
+        "resolve",
+        &json!({
+            "chatId": request.chat_id,
+            "senderId": request.sender_id,
+            "senderName": request.sender_name,
+            "createSession": request.create_session,
+        }),
+    )
+    .await
+    .map(Json)
+    .map_err(|_| error("legacy_resolution_failed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_resolution_rejects_non_private_or_foreign_identity_before_runtime() {
+        for (kind, platform, chat_id, sender_id) in [
+            ("hermes", "telegram", "-123", "123"),
+            ("hermes", "telegram", "123", "456"),
+            ("hermes", "slack", "123", "123"),
+            ("openclaw", "telegram", "123", "123"),
+        ] {
+            let result = legacy_channel_resolve(Json(ResolveRequest {
+                kind: kind.into(),
+                platform: platform.into(),
+                chat_id: chat_id.into(),
+                sender_id: sender_id.into(),
+                sender_name: None,
+                create_session: true,
+            }))
+            .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_resolution_does_not_accept_runtime_or_session_overrides() {
+        for key in ["pythonPath", "hermesHome", "sessionId", "apiUrl"] {
+            let mut request = json!({
+                "kind":"hermes", "platform":"telegram", "chatId":"123", "senderId":"123"
+            });
+            request[key] = json!("untrusted");
+            assert!(serde_json::from_value::<ResolveRequest>(request).is_err());
+        }
+    }
+}
