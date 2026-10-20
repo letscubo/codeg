@@ -296,6 +296,7 @@ fn stream_back(up: reqwest::Response, engine: TranslationEngine) -> Response {
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let mut state = StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+        let mut indexes = ToolCallIndexes::default();
         let mut upstream = up.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         'read: while let Some(chunk) = upstream.next().await {
@@ -303,7 +304,7 @@ fn stream_back(up: reqwest::Response, engine: TranslationEngine) -> Response {
             buf.extend_from_slice(&chunk);
             while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
-                let Some(events) = translate_sse_line(&engine, &mut state, &line) else {
+                let Some(events) = translate_sse_line(&engine, &mut state, &mut indexes, &line) else {
                     continue;
                 };
                 if !events.is_empty() && tx.send(Ok(encode_events(events))).await.is_err() {
@@ -324,10 +325,65 @@ fn stream_back(up: reqwest::Response, engine: TranslationEngine) -> Response {
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
+/// 流式工具调用补 `index`。
+///
+/// OpenAI 流式格式里每个工具调用片段都带 `index`,转换库(switchyard-translation `stream.rs`)按它把片段
+/// 拼回一个调用,缺了就当 0。网关给 Gemini 系模型(gemini-3.7-flash / gemini-3.1-pro,2026-10-20 C9
+/// 直连网关实测)的流**不带 `index`**,一条消息里的两个工具调用各自整块发来、只带 `id`:
+/// 两个都被当成 0 号,名字和参数接在一起 —— `browser_screenshot` + `pdf_guide` 变成
+/// `browser_screenshotpdf_guide`,参数变成 `{..}{..}`,模型拿到「工具不存在」反复重试。
+/// kimi / deepseek 的流带 `index`,原样不动。
+///
+/// 规则:带 `index` 的照用并记下;缺的按 `id` 认 —— 见过的 `id` 用它原来的号,新 `id` 给下一个号;
+/// 既没 `index` 也没 `id` 的是上一个调用的续片,沿用上一个号。
+#[derive(Default)]
+pub(crate) struct ToolCallIndexes {
+    by_id: std::collections::HashMap<String, u64>,
+    next: u64,
+    last: Option<u64>,
+}
+
+impl ToolCallIndexes {
+    fn fill(&mut self, event: &mut Value) {
+        let Some(choices) = event.get_mut("choices").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for choice in choices {
+            let Some(calls) = choice
+                .get_mut("delta")
+                .and_then(|d| d.get_mut("tool_calls"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for call in calls.iter_mut().filter_map(Value::as_object_mut) {
+                let id = call.get("id").and_then(Value::as_str).map(str::to_owned);
+                let index = match call.get("index").and_then(Value::as_u64) {
+                    Some(index) => index,
+                    None => match &id {
+                        Some(id) => match self.by_id.get(id) {
+                            Some(index) => *index,
+                            None => self.next,
+                        },
+                        None => self.last.unwrap_or(0),
+                    },
+                };
+                call.insert("index".into(), json!(index));
+                if let Some(id) = id {
+                    self.by_id.insert(id, index);
+                }
+                self.next = self.next.max(index + 1);
+                self.last = Some(index);
+            }
+        }
+    }
+}
+
 /// 一行 OpenAI SSE → 若干 Anthropic 事件。非 `data:` 行、`[DONE]`、解析不了的行 → None(忽略)。
 pub(crate) fn translate_sse_line(
     engine: &TranslationEngine,
     state: &mut StreamTranslationState,
+    indexes: &mut ToolCallIndexes,
     line: &[u8],
 ) -> Option<Vec<Value>> {
     let line = std::str::from_utf8(line).ok()?.trim_end_matches(['\r', '\n']);
@@ -337,6 +393,7 @@ pub(crate) fn translate_sse_line(
     }
     let mut event: Value = serde_json::from_str(data).ok()?;
     normalize_gateway_usage(&mut event);
+    indexes.fill(&mut event);
     match engine.translate_event(state, WireFormat::OpenAiChat, WireFormat::AnthropicMessages, &event) {
         Ok(events) => Some(events),
         Err(e) => {
@@ -410,6 +467,7 @@ mod tests {
     fn stream_lines_translate_tool_calls_and_cache_usage() {
         let engine = TranslationEngine::default();
         let mut state = StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+        let mut indexes = ToolCallIndexes::default();
         let lines = [
             r#"data: {"id":"c1","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"Checking."}}]}"#,
             r#"data: {"id":"c1","model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#,
@@ -421,7 +479,7 @@ mod tests {
         ];
         let mut events = Vec::new();
         for line in lines {
-            if let Some(evs) = translate_sse_line(&engine, &mut state, line.as_bytes()) {
+            if let Some(evs) = translate_sse_line(&engine, &mut state, &mut indexes, line.as_bytes()) {
                 events.extend(evs);
             }
         }
@@ -444,6 +502,68 @@ mod tests {
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
         assert_eq!(delta["usage"]["input_tokens"], 259);
         assert_eq!(delta["usage"]["cache_read_input_tokens"], 15360, "网关的缓存命中不能丢");
+    }
+
+    /// 网关给 Gemini 的流(2026-10-20 C9 直连网关抓的原样形状):两个工具调用各自整块、只带 `id`、没有 `index`。
+    /// 不补 `index` 时转换库把它们都当 0 号,名字拼成 `browser_screenshotpdf_guide`。
+    #[test]
+    fn gemini_parallel_tool_calls_without_index_stay_separate() {
+        let engine = TranslationEngine::default();
+        let mut state = StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+        let mut indexes = ToolCallIndexes::default();
+        let lines = [
+            r#"data: {"id":"c2","model":"gemini-3.7-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_138361","type":"function","function":{"name":"browser_screenshot","arguments":"{\"x\":\"1\"}"}}]}}]}"#,
+            r#"data: {"id":"c2","model":"gemini-3.7-flash","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_138364","type":"function","function":{"name":"pdf_guide","arguments":"{\"y\":\"2\"}"}}]}}]}"#,
+            r#"data: {"id":"c2","model":"gemini-3.7-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let mut events = Vec::new();
+        for line in lines {
+            if let Some(evs) = translate_sse_line(&engine, &mut state, &mut indexes, line.as_bytes()) {
+                events.extend(evs);
+            }
+        }
+        events.extend(engine.finish_stream(&mut state, WireFormat::AnthropicMessages).unwrap());
+        // 每个 tool_use 块:名字 + 它自己那段参数
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let mut by_block: std::collections::HashMap<u64, usize> = Default::default();
+        for e in &events {
+            if e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use" {
+                by_block.insert(e["index"].as_u64().unwrap(), calls.len());
+                calls.push((e["content_block"]["name"].as_str().unwrap().to_string(), String::new()));
+            }
+            if e["delta"]["type"] == "input_json_delta" {
+                let slot = by_block[&e["index"].as_u64().unwrap()];
+                calls[slot].1.push_str(e["delta"]["partial_json"].as_str().unwrap());
+            }
+        }
+        let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["browser_screenshot", "pdf_guide"]);
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].1).unwrap(), json!({"x": "1"}));
+        assert_eq!(serde_json::from_str::<Value>(&calls[1].1).unwrap(), json!({"y": "2"}));
+    }
+
+    #[test]
+    fn tool_call_indexes_keep_given_ones_and_fill_by_id() {
+        let mut ix = ToolCallIndexes::default();
+        let mut ev = |calls: Value| {
+            let mut e = json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}}]});
+            ix.fill(&mut e);
+            e["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["index"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // 带 index 的(kimi / deepseek 形状)原样
+        assert_eq!(ev(json!([{"index": 0, "id": "a", "function": {"name": "f"}}])), [0]);
+        assert_eq!(ev(json!([{"index": 0, "function": {"arguments": "{}"}}])), [0]);
+        // 缺 index:新 id 拿下一个号,同一行里两个也分开
+        assert_eq!(ev(json!([{"id": "b"}, {"id": "c"}])), [1, 2]);
+        // 见过的 id 用原来的号;既没 index 也没 id 的续片跟上一个
+        assert_eq!(ev(json!([{"id": "b", "function": {"arguments": "x"}}])), [1]);
+        assert_eq!(ev(json!([{"function": {"arguments": "y"}}])), [1]);
     }
 
     /// 起一个假网关:记下收到的路径和 Authorization,按路径回 Anthropic / OpenAI 形状。
