@@ -200,10 +200,37 @@ def http_native_absent(home, health):
     from gateway.status import read_runtime_status, runtime_status_pid_is_live, get_process_start_time
     state = read_runtime_status(home / "gateway_state.json")
     require(isinstance(state, dict) and runtime_status_pid_is_live(state), "hermes_status_unverified")
-    require(health.get("pid") == state.get("pid") and state.get("start_time") == get_process_start_time(state["pid"]),
+    pid, started = state.get("pid"), state.get("start_time")
+    require(type(pid) is int and pid > 0 and type(started) is int and started > 0
+            and health.get("pid") == pid and started == get_process_start_time(pid)
+            and health.get("gateway_state") == state.get("gateway_state") == "running",
             "hermes_status_unverified")
     require(isinstance(health.get("platforms"), dict) and isinstance(state.get("platforms"), dict), "hermes_status_unverified")
-    return not any(k == "telegram" or k.endswith(":telegram") for k in {*health["platforms"], *state["platforms"]})
+    # Hermes status.py preserves primary-platform entries across restarts and
+    # /health/detailed returns that same file, not the live adapter inventory.
+    # Only an explicitly disconnected record from a verified previous process
+    # can be ignored. Current/unknown writers may still own a reconnect loop.
+    # Official contract: 345cd2b status.py:815-862, run_startup.py:984-988.
+    for platforms in (health["platforms"], state["platforms"]):
+        for name, entry in platforms.items():
+            if name != "telegram" and not name.endswith(":telegram"):
+                continue
+            if name != "telegram" or not isinstance(entry, dict) or entry.get("state") != "disconnected":
+                return False
+            writer_pid, writer_started = entry.get("writer_pid"), entry.get("writer_start_time")
+            if (type(writer_pid) is not int or writer_pid <= 0
+                    or type(writer_started) is not int or not 0 < writer_started < started):
+                return False
+            try:
+                observed_start = get_process_start_time(writer_pid)
+                if (observed_start is not None and (type(observed_start) is not int or observed_start <= 0)):
+                    return False
+                if observed_start == writer_started or runtime_status_pid_is_live(
+                        {"pid":writer_pid, "start_time":writer_started}) is not False:
+                    return False
+            except Exception:
+                return False
+    return True
 
 
 async def http_inspect(request):

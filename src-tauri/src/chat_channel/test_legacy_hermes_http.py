@@ -162,14 +162,91 @@ class Inspect(unittest.IsolatedAsyncioTestCase):
 
     def test_status_must_belong_to_the_live_api_process(self):
         status=ModuleType("gateway.status")
-        status.read_runtime_status=lambda path:{"pid":42,"start_time":7,"platforms":{}}
+        status.read_runtime_status=lambda path:{"pid":42,"start_time":7,"gateway_state":"running","platforms":{}}
         status.runtime_status_pid_is_live=lambda state:True
         status.get_process_start_time=lambda pid:7
         with patch.dict(sys.modules,{"gateway.status":status}):
-            self.assertTrue(bridge.http_native_absent(Path("/fixture"),{"pid":42,"platforms":{}}))
+            self.assertTrue(bridge.http_native_absent(Path("/fixture"),{"pid":42,"gateway_state":"running","platforms":{}}))
             with self.assertRaisesRegex(ValueError,"hermes_status_unverified"):
-                bridge.http_native_absent(Path("/fixture"),{"pid":43,"platforms":{}})
-            self.assertFalse(bridge.http_native_absent(Path("/fixture"),{"pid":42,"platforms":{"telegram":{}}}))
+                bridge.http_native_absent(Path("/fixture"),{"pid":43,"gateway_state":"running","platforms":{}})
+            self.assertFalse(bridge.http_native_absent(Path("/fixture"),{"pid":42,"gateway_state":"running","platforms":{"telegram":{}}}))
+
+
+class NativeDeliveryIdentity(unittest.TestCase):
+    def setUp(self):
+        self.state={"pid":42,"start_time":700,"gateway_state":"running","platforms":{}}
+        self.health={"pid":42,"gateway_state":"running","platforms":{}}
+        self.starts={42:700}
+        self.alive={42}
+        self.status=ModuleType("gateway.status")
+        self.status.read_runtime_status=lambda _:self.state
+        self.status.get_process_start_time=lambda pid:self.starts.get(pid)
+        # Official liveness treats a live PID with unavailable start time as
+        # live; an unreadable identity must not become evidence of an exit.
+        self.status.runtime_status_pid_is_live=lambda row:row["pid"] in self.alive and (
+            self.starts.get(row["pid"]) is None or self.starts[row["pid"]] == row.get("start_time"))
+
+    def entry(self, **changes):
+        return {"state":"disconnected","writer_pid":7,"writer_start_time":100,**changes}
+
+    def check(self, entry=None, name="telegram"):
+        if entry is not None:
+            self.state["platforms"]={name:entry}
+            self.health["platforms"]={name:entry}
+        with patch.dict(sys.modules,{"gateway.status":self.status}):
+            return bridge.http_native_absent(Path("/fixture"),self.health)
+
+    def test_previous_dead_writer_disconnected_record_is_preserved_history(self):
+        self.assertTrue(self.check(self.entry()))
+
+    def test_current_or_still_live_old_writer_is_not_absent(self):
+        self.assertFalse(self.check(self.entry(writer_pid=42,writer_start_time=700)))
+        self.starts[7]=100; self.alive.add(7)
+        self.assertFalse(self.check(self.entry()))
+        self.starts[7]=None
+        self.assertFalse(self.check(self.entry()))
+
+    def test_pid_reuse_requires_verified_different_start_time(self):
+        self.starts[7]=800; self.alive.add(7)
+        self.assertTrue(self.check(self.entry()))
+        self.assertTrue(self.check(self.entry(writer_pid=42,writer_start_time=100)))
+        self.starts[42]=800
+        with self.assertRaisesRegex(ValueError,"hermes_status_unverified"):
+            self.check()
+
+    def test_missing_invalid_or_non_previous_writer_identity_is_rejected(self):
+        for changes in ({"writer_pid":None},{"writer_pid":True},{"writer_pid":0},
+                {"writer_start_time":None},{"writer_start_time":True},{"writer_start_time":"100"},
+                {"writer_start_time":0},{"writer_start_time":700},{"writer_start_time":800}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self.check(self.entry(**changes)))
+        self.assertFalse(self.check({"state":"disconnected"}))
+
+    def test_active_unknown_and_profile_entries_are_never_ignored(self):
+        for state in ("connected","connecting","retrying","failed",None):
+            with self.subTest(state=state):
+                self.assertFalse(self.check(self.entry(state=state)))
+        self.assertFalse(self.check(self.entry(),"secondary:telegram"))
+
+    def test_both_status_snapshots_must_exclude_current_writers(self):
+        old=self.entry(); current=self.entry(writer_pid=42,writer_start_time=700)
+        for first,second in ((old,current),(current,old)):
+            self.health["platforms"]={"telegram":first}
+            self.state["platforms"]={"telegram":second}
+            self.assertFalse(self.check())
+
+    def test_unreadable_old_process_identity_fails_closed(self):
+        def start(pid):
+            if pid == 42: return 700
+            raise PermissionError("fixture")
+        self.status.get_process_start_time=start
+        self.assertFalse(self.check(self.entry()))
+
+    def test_only_running_verified_gateway_can_ignore_preserved_records(self):
+        for state in ("starting","stopping",None):
+            self.state["gateway_state"]=state
+            with self.subTest(state=state),self.assertRaisesRegex(ValueError,"hermes_status_unverified"):
+                self.check(self.entry())
 
 
 class IsolatedRoutingScope(unittest.TestCase):
