@@ -35,6 +35,56 @@ pub(crate) struct HttpSlack {
     pub client: reqwest::Client,
     pub token: String,
 }
+
+fn diagnostic_method(method: &str) -> &'static str {
+    match method {
+        "agents.sessions.setStatus" => "agents.sessions.setStatus",
+        "chat.startStream" => "chat.startStream",
+        "chat.appendStream" => "chat.appendStream",
+        "chat.stopStream" => "chat.stopStream",
+        _ => "invalid_method",
+    }
+}
+
+fn diagnostic_error_code(code: Option<&str>) -> &str {
+    code.filter(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+    .unwrap_or("invalid_code")
+}
+
+fn log_api_failure(method: &str, http_status: u16, code: Option<&str>) {
+    // Never format request/response bodies, URLs, tokens, or reqwest errors.
+    // A zero HTTP status means no response was received.
+    tracing::warn!(
+        method = diagnostic_method(method),
+        http_status,
+        error_code = diagnostic_error_code(code),
+        "Slack API request failed"
+    );
+}
+
+fn log_status_failure(status: &str, error: &SlackError) {
+    tracing::warn!(
+        method = "agents.sessions.setStatus",
+        phase = match status {
+            "active" => "active",
+            "processing" => "processing",
+            _ => "invalid_status",
+        },
+        error_class = match error {
+            SlackError::RetryAfter(_) => "rate_limited",
+            SlackError::Rejected => "rejected",
+            SlackError::Unknown => "unknown",
+        },
+        "Slack session status update failed"
+    );
+}
+
 #[async_trait]
 impl SlackApi for HttpSlack {
     async fn call(&self, method: &str, body: Value) -> Result<Value, SlackError> {
@@ -45,24 +95,34 @@ impl SlackApi for HttpSlack {
             .json(&body)
             .send()
             .await
-            .map_err(|_| SlackError::Unknown)?;
+            .map_err(|_| {
+                log_api_failure(method, 0, Some("network_error"));
+                SlackError::Unknown
+            })?;
+        let http_status = response.status().as_u16();
         let retry = response
             .headers()
             .get("retry-after")
             .and_then(|s| s.to_str().ok())
             .and_then(|s| s.parse().ok());
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            log_api_failure(method, http_status, Some("rate_limited"));
             return Err(retry
                 .map(SlackError::RetryAfter)
                 .unwrap_or(SlackError::Rejected));
         }
         if response.status().is_server_error() {
+            log_api_failure(method, http_status, Some("http_server_error"));
             return Err(SlackError::Unknown);
         }
-        let value: Value = response.json().await.map_err(|_| SlackError::Unknown)?;
+        let value: Value = response.json().await.map_err(|_| {
+            log_api_failure(method, http_status, Some("invalid_json_response"));
+            SlackError::Unknown
+        })?;
         if value["ok"] == true {
             return Ok(value);
         }
+        log_api_failure(method, http_status, value["error"].as_str());
         match value["error"].as_str().unwrap_or("") {
             "internal_error" | "fatal_error" => Err(SlackError::Unknown),
             "ratelimited" | "rate_limited" => Err(retry
@@ -120,13 +180,17 @@ impl SlackTurn {
         unreachable!()
     }
     async fn status(&self, status: &str) -> bool {
-        self.call(
-            "agents.sessions.setStatus",
-            json!({"channel_id": self.channel, "thread_ts": self.thread_ts,
+        let result = self
+            .call(
+                "agents.sessions.setStatus",
+                json!({"channel_id": self.channel, "thread_ts": self.thread_ts,
             "initiator_user_id": self.recipient_user_id, "status": status}),
-        )
-        .await
-        .is_ok()
+            )
+            .await;
+        if let Err(error) = &result {
+            log_status_failure(status, error);
+        }
+        result.is_ok()
     }
     async fn flush(&self, stream: &mut Stream) {
         if stream.failed || stream.pending.is_empty() {
@@ -472,6 +536,73 @@ mod tests {
             duration_ms: None,
         })
     }
+
+    #[test]
+    fn failure_diagnostics_keep_only_bounded_symbols_and_known_methods() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slack-diagnostics.jsonl");
+        let writer = Arc::new(std::fs::File::create(&path).unwrap());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(writer)
+            .finish();
+        let too_long = "a".repeat(65);
+        tracing::subscriber::with_default(subscriber, || {
+            log_api_failure("chat.appendStream", 200, Some("feature_disabled"));
+            for code in [
+                None,
+                Some(""),
+                Some("xoxb-private-token"),
+                Some("private\nbody"),
+                Some("PRIVATE"),
+                Some("用户正文"),
+                Some(too_long.as_str()),
+            ] {
+                log_api_failure("https://private.invalid/?token=secret", 200, code);
+            }
+            log_api_failure("chat.startStream", 0, Some("network_error"));
+        });
+        let contents = std::fs::read_to_string(path).unwrap();
+        let records: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 9);
+        assert_eq!(records[0]["fields"]["method"], "chat.appendStream");
+        assert_eq!(records[0]["fields"]["error_code"], "feature_disabled");
+        assert_eq!(records[0]["fields"]["http_status"], 200);
+        for record in &records[1..8] {
+            assert_eq!(record["fields"]["method"], "invalid_method");
+            assert_eq!(record["fields"]["error_code"], "invalid_code");
+        }
+        assert_eq!(records[8]["fields"]["http_status"], 0);
+        assert_eq!(records[8]["fields"]["error_code"], "network_error");
+        for forbidden in ["private", "secret", "PRIVATE", "用户正文", &too_long] {
+            assert!(!contents.contains(forbidden));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_failure_diagnostics_preserve_delivery_classification() {
+        let api = Arc::new(FakeSlack {
+            fail_method: Some("agents.sessions.setStatus".into()),
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(delta("delivered body")).unwrap();
+        tx.send(complete()).unwrap();
+        let report = turn(api.clone(), "status-diagnostics").run(rx).await;
+        assert!(report.delivery_failed);
+        assert_eq!(report.segments.len(), 1);
+        assert!(report.segments[0].delivered);
+        assert_eq!(report.final_text, "delivered body");
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls[0].1["status"], "processing");
+        assert_eq!(calls.last().unwrap().1["status"], "active");
+        assert_eq!(calls.len(), 4);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn native_stream_has_loading_deltas_and_final_stop() {
         let api = Arc::new(FakeSlack::default());
