@@ -10,6 +10,16 @@ use tokio::{sync::mpsc, time::Instant};
 const INTERVAL: Duration = Duration::from_secs(1);
 const CHUNK_LIMIT: usize = 10_000;
 
+/// Slack D... identifiers may be application session keys, but are never thread timestamps.
+pub(crate) fn is_message_timestamp(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, fraction)| {
+        !seconds.is_empty()
+            && !fraction.is_empty()
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 #[derive(Debug)]
 pub(crate) enum SlackError {
     RetryAfter(u64),
@@ -497,6 +507,53 @@ mod tests {
         );
         assert!(calls.iter().any(|(m, _)| m == "chat.stopStream"));
         assert_eq!(calls.last().unwrap().1["status"], "active");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn direct_message_stream_uses_message_timestamp_and_filters_reasoning() {
+        let api = Arc::new(FakeSlack::default());
+        let mut dm = turn(api.clone(), "dm-thread");
+        dm.channel = "D123ABC".into();
+        dm.thread_ts = "1721609600.123456".into();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(dm.run(rx));
+        tx.send(event(AcpEvent::Thinking {
+            text: "private-reasoning".into(),
+            parent_tool_use_id: None,
+        }))
+        .unwrap();
+        tx.send(event(serde_json::from_value(json!({
+            "type":"tool_call", "tool_call_id":"tool1", "title":"terminal", "kind":"execute",
+            "status":"in_progress", "raw_input":"private-tool-input", "raw_output":"private-tool-output"
+        })).unwrap())).unwrap();
+        tx.send(delta("first")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(delta(" second")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(complete()).unwrap();
+        let report = worker.await.unwrap();
+        assert!(!report.delivery_failed);
+        assert_eq!(report.final_text, "first second");
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.first().unwrap().1["status"], "processing");
+        assert_eq!(calls.last().unwrap().1["status"], "active");
+        for (method, body) in calls.iter() {
+            if method == "agents.sessions.setStatus" || method == "chat.startStream" {
+                assert_eq!(body["thread_ts"], "1721609600.123456");
+            }
+        }
+        let start = &calls
+            .iter()
+            .find(|(method, _)| method == "chat.startStream")
+            .unwrap()
+            .1;
+        assert_eq!(start["channel"], "D123ABC");
+        assert_eq!(start["chunks"][0]["type"], "task_update");
+        assert_eq!(start["chunks"][0]["title"], "terminal");
+        assert!(calls
+            .iter()
+            .any(|(method, _)| method == "chat.appendStream"));
+        assert!(calls.iter().any(|(method, _)| method == "chat.stopStream"));
+        assert!(!serde_json::to_string(&*calls).unwrap().contains("private-"));
     }
     #[tokio::test(start_paused = true)]
     async fn uncertain_runtime_stops_loading_without_finalizing_pending_text() {

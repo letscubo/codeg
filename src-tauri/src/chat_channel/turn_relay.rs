@@ -875,7 +875,7 @@ async fn register_with_state(
             result_format,
             ..
         } => {
-            if channel.is_empty() || thread_ts.is_empty() || thread_ts == "0" {
+            if channel.is_empty() || !super::slack_relay::is_message_timestamp(thread_ts) {
                 return Err("invalid_slack_relay_target".into());
             }
             (
@@ -1896,6 +1896,32 @@ mod regression_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn slack_logical_dm_keys_are_rejected_before_delivery_is_admitted() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::app_state::AppState::new_for_test(db, directory.path().to_owned());
+        for thread_ts in ["D123ABC", "", "0", "123", "1.", ".1", "1.2.3", "1.0 "] {
+            let spec = serde_json::from_value(serde_json::json!({
+                "kind":"slack", "turnId":"invalid-dm-target", "deliveryVersion":2,
+                "botToken":"unused", "channel":"D123ABC", "threadTs":thread_ts,
+                "recipientUserId":"U1", "recipientTeamId":"T1"
+            }))
+            .unwrap();
+            assert_eq!(
+                register_with_state(&state, "dm-validation", None, spec, true)
+                    .await
+                    .unwrap_err(),
+                "invalid_slack_relay_target"
+            );
+            assert!(
+                get_result(&state.db.conn, "invalid-dm-target", ResultFormat::Legacy)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
     #[tokio::test]
     async fn isolated_callback_rejects_missing_targets_other_channels_and_ambiguous_urls() {
