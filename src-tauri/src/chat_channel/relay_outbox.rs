@@ -1,5 +1,6 @@
 //! Durable terminal results. A turn can select exactly one already registered
-//! callback URL; only its SHA-256 hash is stored here, never tokens or URLs.
+//! callback URL or isolated channel target; only its ID/hash is stored here,
+//! never tokens or credential-bearing URLs.
 use super::relay_result::{self, ResultFormat};
 use crate::db::{entities::app_metadata, service::app_metadata_service};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -24,6 +25,8 @@ pub(crate) fn subscribe_results() -> tokio::sync::watch::Receiver<u64> {
 struct Stored {
     result: Value,
     target_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    callback_target_id: Option<String>,
     acknowledged: bool,
     #[serde(default)]
     process_id: String,
@@ -53,6 +56,7 @@ pub(crate) async fn validated_target(db: &DatabaseConnection, url: Option<&str>)
         .any(|known| known == url)
         .then(|| hash(url))
 }
+#[cfg(test)]
 pub(crate) async fn save(
     db: &DatabaseConnection,
     turn_id: &str,
@@ -60,14 +64,25 @@ pub(crate) async fn save(
     target_hash: Option<String>,
     wire_format: ResultFormat,
 ) -> Result<(), String> {
+    save_with_target(db, turn_id, result, target_hash, None, wire_format).await
+}
+pub(crate) async fn save_with_target(
+    db: &DatabaseConnection,
+    turn_id: &str,
+    result: Value,
+    target_hash: Option<String>,
+    callback_target_id: Option<String>,
+    wire_format: ResultFormat,
+) -> Result<(), String> {
     let result = relay_result::compact(result)?;
     let terminal = result["delivery_status"] != "running";
     // No selected callback means query-only, so there is no delivery to poll.
     // Running intents stay pending until restart recovery or terminal save.
-    let acknowledged = terminal && target_hash.is_none();
+    let acknowledged = terminal && target_hash.is_none() && callback_target_id.is_none();
     let stored = Stored {
         result,
         target_hash,
+        callback_target_id,
         acknowledged,
         process_id: process_id().into(),
         wire_format,
@@ -197,7 +212,8 @@ async fn drain(
             stored.result["delivery_status"] = "unknown".into();
             stored.result["outcome"] = "aborted".into();
             stored.result["failure_code"] = "process_restarted".into();
-            stored.acknowledged = stored.target_hash.is_none();
+            stored.acknowledged =
+                stored.target_hash.is_none() && stored.callback_target_id.is_none();
             app_metadata_service::upsert_value(
                 db,
                 &record.key,
@@ -209,22 +225,33 @@ async fn drain(
         if stored.acknowledged {
             continue;
         }
-        let Some(target) = &stored.target_hash else {
-            continue;
-        };
-        if configured.is_none() {
-            configured = Some(urls(db).await);
-        }
-        let Some(url) = configured
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|url| hash(url) == *target)
-        else {
-            // A previously selected endpoint may be temporarily disabled. Keep
-            // checking configuration; no-target turns remain query-only.
-            retry.get_or_insert(Duration::from_secs(60));
-            continue;
+        let url = if let Some(id) = &stored.callback_target_id {
+            match super::channel_callback::result_url(db, id).await {
+                Ok(url) => url,
+                Err(_) => {
+                    // Never fall back to a different origin when the retained
+                    // target cannot be verified (including VM changes).
+                    retry.get_or_insert(Duration::from_secs(60));
+                    continue;
+                }
+            }
+        } else {
+            let Some(target) = &stored.target_hash else {
+                continue;
+            };
+            if configured.is_none() {
+                configured = Some(urls(db).await);
+            }
+            let Some(url) = configured
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|url| hash(url) == *target)
+            else {
+                retry.get_or_insert(Duration::from_secs(60));
+                continue;
+            };
+            url.clone()
         };
         let payload = relay_result::for_wire(stored.result.clone(), stored.wire_format)?;
         if client
@@ -324,6 +351,7 @@ mod tests {
         let record = Stored {
             result: serde_json::json!({"event_id":"stable","relay_turn_id":"turn"}),
             target_hash: Some(hash("https://host/events?s=SECRET")),
+            callback_target_id: None,
             acknowledged: false,
             process_id: process_id().into(),
             wire_format: ResultFormat::Legacy,
@@ -453,6 +481,7 @@ mod integration_tests {
         let stored = Stored {
             result: serde_json::json!({"event_id":"stable-old","delivery_status":"running","fallback_allowed":false,"text_complete":false,"final_text":"","segments":[]}),
             target_hash: None,
+            callback_target_id: None,
             acknowledged: false,
             process_id: "previous-process".into(),
             wire_format: ResultFormat::Legacy,
@@ -562,5 +591,81 @@ mod integration_tests {
             .get("text")
             .is_none());
         server.abort();
+    }
+    #[tokio::test]
+    async fn isolated_target_survives_restart_and_never_falls_back_to_global_hooks() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let global = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let global_url = format!(
+            "http://{}/api/codeg/events?vmId=vm-a&s=SECRET",
+            global.local_addr().unwrap()
+        );
+        app_metadata_service::upsert_value(
+            &db.conn,
+            super::super::event_subscriber::EVENT_WEBHOOKS_KEY,
+            &serde_json::json!([{"url":global_url,"enabled":true}]).to_string(),
+        )
+        .await
+        .unwrap();
+        let id =
+            super::super::channel_callback::register(&db.conn, "slack", "https://slack-a.example")
+                .await
+                .unwrap();
+        save_with_target(
+            &db.conn,
+            "isolated",
+            serde_json::json!({"event_id":"stable","delivery_status":"running"}),
+            None,
+            Some(id.clone()),
+            ResultFormat::CompactV1,
+        )
+        .await
+        .unwrap();
+        let key = format!("{PREFIX}isolated");
+        let mut stored: Stored = serde_json::from_str(
+            &app_metadata_service::get_value(&db.conn, &key)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        stored.process_id = "prior-process".into();
+        app_metadata_service::upsert_value(
+            &db.conn,
+            &key,
+            &serde_json::to_string(&stored).unwrap(),
+        )
+        .await
+        .unwrap();
+        let new_id =
+            super::super::channel_callback::register(&db.conn, "slack", "https://slack-b.example")
+                .await
+                .unwrap();
+        assert_ne!(id, new_id);
+        // An identity change invalidates this retained target. Recovery must
+        // retain it and retry, never POST the old result to a global subscriber.
+        app_metadata_service::upsert_value(
+            &db.conn,
+            super::super::event_subscriber::EVENT_WEBHOOKS_KEY,
+            &serde_json::json!([{"url":global_url.replace("vm-a", "vm-b"),"enabled":true}])
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(drain(&db.conn, &client()).await.unwrap().is_some());
+        let text = app_metadata_service::get_value(&db.conn, &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!text.contains("SECRET"));
+        let restored: Stored = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored.callback_target_id, Some(id));
+        assert_eq!(restored.result["delivery_status"], "unknown");
+        assert!(!restored.acknowledged);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), global.accept())
+                .await
+                .is_err()
+        );
     }
 }

@@ -42,6 +42,7 @@ pub fn build_router(
 
     let api = Router::new()
         .route("/health", post(health_check))
+        .route("/register_channel_callback", post(handlers::channel_ingress::register_channel_callback))
         .route("/channel_submit", post(handlers::channel_ingress::channel_submit))
         .route("/legacy_channel_inspect", post(handlers::channel_ingress::legacy_channel_inspect))
         .route("/legacy_channel_resolve", post(handlers::channel_ingress::legacy_channel_resolve))

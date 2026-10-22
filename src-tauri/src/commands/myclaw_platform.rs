@@ -157,11 +157,27 @@ async fn signed_request_with_query(
     body: Option<String>,
     timeout: Duration,
 ) -> Result<Value, String> {
+    signed_request_with_query_options(ep, method, path, query, body, timeout, false).await
+}
+
+async fn signed_request_with_query_options(
+    ep: &PlatformEndpoint,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, &str)],
+    body: Option<String>,
+    timeout: Duration,
+    forbid_redirects: bool,
+) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(timeout)
-        .build()
-        .map_err(redacted_err)?;
+        .timeout(timeout);
+    let client = if forbid_redirects {
+        client.redirect(reqwest::redirect::Policy::none())
+    } else {
+        client
+    };
+    let client = client.build().map_err(redacted_err)?;
     let body_str = body.unwrap_or_default();
     let ts = now_secs();
     let sig = sign(&ep.secret, ts, method.as_str(), path, &body_str);
@@ -178,6 +194,9 @@ async fn signed_request_with_query(
     }
     let res = req.send().await.map_err(redacted_err)?;
     let status = res.status();
+    if forbid_redirects && !status.is_success() {
+        return Err(format!("the platform callback returned HTTP {status}"));
+    }
     let text = res.text().await.map_err(redacted_err)?;
     let env: ApiEnvelope = serde_json::from_str(&text).map_err(|_| {
         format!(
@@ -216,6 +235,26 @@ pub async fn post_signed(
         path,
         Some(body.to_string()),
         timeout,
+    )
+    .await
+}
+
+/// Signed channel callbacks reuse the platform credentials with an independently
+/// registered destination. Callers must validate that destination before calling.
+pub(crate) async fn post_signed_endpoint(
+    ep: &PlatformEndpoint,
+    path: &str,
+    body: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    signed_request_with_query_options(
+        ep,
+        reqwest::Method::POST,
+        path,
+        &[],
+        Some(body.to_string()),
+        timeout,
+        true,
     )
     .await
 }
@@ -444,8 +483,14 @@ mod tests {
             target_version_of(&serde_json::json!({ "version": "0.30.10-43", "source": "stable" })),
             Some("0.30.10-43".to_string())
         );
-        assert_eq!(target_version_of(&serde_json::json!({ "version": null, "source": "none" })), None);
-        assert_eq!(target_version_of(&serde_json::json!({ "version": "  " })), None);
+        assert_eq!(
+            target_version_of(&serde_json::json!({ "version": null, "source": "none" })),
+            None
+        );
+        assert_eq!(
+            target_version_of(&serde_json::json!({ "version": "  " })),
+            None
+        );
         assert_eq!(TARGET_VERSION_PATH, "/api/codeg/target-version");
     }
 
@@ -454,5 +499,62 @@ mod tests {
         let r = error_result("nope");
         assert_eq!(r["isError"], true);
         assert_eq!(r["content"][0]["text"], "nope");
+    }
+    #[tokio::test]
+    async fn channel_callback_preserves_signature_and_does_not_follow_redirects() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::Redirect,
+            routing::post,
+            Router,
+        };
+        use std::sync::{Arc, Mutex};
+        let selected = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", selected.local_addr().unwrap());
+        let destination = format!("http://{}/target", other.local_addr().unwrap());
+        let observed = Arc::new(Mutex::new(None));
+        let sink = observed.clone();
+        let app = Router::new()
+            .route(
+                "/callback",
+                post(move |headers: HeaderMap, body: String| {
+                    let sink = sink.clone();
+                    let destination = destination.clone();
+                    async move {
+                        *sink.lock().unwrap() = Some((headers, body));
+                        Redirect::temporary(&destination)
+                    }
+                }),
+            )
+            .route("/target", post(|| async { StatusCode::OK }));
+        let server = tokio::spawn(async move {
+            axum::serve(selected, app).await.unwrap();
+        });
+        let ep = PlatformEndpoint {
+            base,
+            vm_id: "vm".into(),
+            secret: "signing-secret".into(),
+        };
+        let body = serde_json::json!({"phase":"complete","callbackTargetId":"retained"});
+        assert!(
+            post_signed_endpoint(&ep, "/callback", body.clone(), Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        let (headers, sent) = observed.lock().unwrap().take().unwrap();
+        assert_eq!(headers["x-codeg-vm"], "vm");
+        let ts: u64 = headers["x-codeg-ts"].to_str().unwrap().parse().unwrap();
+        assert_eq!(
+            headers["x-codeg-sig"],
+            sign("signing-secret", ts, "POST", "/callback", &sent)
+        );
+        assert_eq!(serde_json::from_str::<Value>(&sent).unwrap(), body);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), other.accept())
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 }

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 pub async fn get_relay_capabilities() -> Json<Value> {
     Json(
-        json!({"channelIngressVersion":1,"deliveryVersion":2,"legacyHermesTelegramVersion":1,"kinds":["telegram","slack"],"nativeSlackStreaming":true,"cancelByTurnId":true,"resultFormats":["legacy","compact-v1"]}),
+        json!({"channelIngressVersion":1,"channelCallbackVersion":1,"deliveryVersion":2,"legacyHermesTelegramVersion":1,"kinds":["telegram","slack"],"nativeSlackStreaming":true,"cancelByTurnId":true,"resultFormats":["legacy","compact-v1"]}),
     )
 }
 #[derive(Deserialize)]

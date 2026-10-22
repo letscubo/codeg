@@ -182,13 +182,15 @@ pub struct AcpPromptParams {
     /// fork(letscubo)专属: 本轮边生成边推到渠道(见 chat_channel::turn_relay)。
     #[serde(default)]
     pub outbound: Option<crate::chat_channel::turn_relay::OutboundSpec>,
+    #[serde(default)]
+    pub callback_target_id: Option<String>,
 }
 
 pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPromptParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    if params.outbound.is_some() {
+    if params.outbound.is_some() || params.callback_target_id.is_some() {
         // A disconnected HTTP caller must not strand a committed running marker
         // between relay registration and prompt submission.
         tokio::spawn(acp_prompt_inner(state, params))
@@ -209,8 +211,8 @@ async fn acp_prompt_inner(
         "transport_mismatch",
     )
     .await?;
-    let prompt_guard = if params.outbound.is_some() {
-        Some(
+    let prompt_guard = if params.outbound.is_some() || params.callback_target_id.is_some() {
+        Some(Arc::new(
             state
                 .connection_manager
                 .clone_prompt_lock(&params.connection_id)
@@ -218,24 +220,49 @@ async fn acp_prompt_inner(
                 .map_err(|_| AppCommandError::not_found("connection_not_found"))?
                 .lock_owned()
                 .await,
+        ))
+    } else {
+        None
+    };
+    let callback_reservation = if prompt_guard.is_some() {
+        crate::chat_channel::channel_callback::pin_prompt(
+            &state,
+            &params.connection_id,
+            params.callback_target_id.as_deref(),
+            params.outbound.as_ref(),
         )
+        .await
+        .map_err(crate::chat_channel::turn_relay::admission_error)?
     } else {
         None
     };
     // 须在提交之前登记,这一轮的事件才不会漏
     let relay_turn = match params.outbound.take() {
-        Some(spec) => crate::chat_channel::turn_relay::register_for_prompt(
-            &state,
-            &params.connection_id,
-            params.conversation_id,
-            spec,
-        )
-        .await
-        .map_err(crate::chat_channel::turn_relay::admission_error)?,
-        None => None,
+        Some(spec) => {
+            crate::chat_channel::turn_relay::register_for_prompt(
+                &state,
+                &params.connection_id,
+                params.conversation_id,
+                spec,
+            )
+            .await
+        }
+        None => Ok(None),
+    };
+    let relay_turn = match relay_turn {
+        Ok(turn) => turn,
+        Err(error) => {
+            let _ = crate::chat_channel::channel_callback::abort_prompt_pin(
+                &state.db.conn,
+                &params.connection_id,
+                callback_reservation.as_deref(),
+            )
+            .await;
+            return Err(crate::chat_channel::turn_relay::admission_error(error));
+        }
     };
     let connection_id = params.connection_id.clone();
-    state
+    let sent = state
         .connection_manager
         .send_prompt_linked_under_lock(
             &state.db,
@@ -245,24 +272,28 @@ async fn acp_prompt_inner(
             params.conversation_id,
             None,
             params.client_message_id,
-            prompt_guard,
+            prompt_guard.clone(),
         )
-        .await
-        .map_err(|e| {
-            if let Some(turn_id) = &relay_turn {
-                crate::chat_channel::turn_relay::abort(&connection_id, turn_id);
-            }
-            let message = e.to_string();
-            // A concurrent send while a turn is in flight is an expected,
-            // recoverable condition (409), not a server fault (500). The
-            // frontend re-queues the draft. Other errors stay 500.
-            match e {
-                AcpError::TurnInProgress => {
-                    AppCommandError::new(AppErrorCode::TurnInProgress, message)
-                }
-                _ => AppCommandError::task_execution_failed(message),
-            }
-        })?;
+        .await;
+    if let Err(e) = sent {
+        let _ = crate::chat_channel::channel_callback::abort_prompt_pin(
+            &state.db.conn,
+            &connection_id,
+            callback_reservation.as_deref(),
+        )
+        .await;
+        if let Some(turn_id) = &relay_turn {
+            crate::chat_channel::turn_relay::abort(&connection_id, turn_id);
+        }
+        let message = e.to_string();
+        // A concurrent send while a turn is in flight is an expected,
+        // recoverable condition (409), not a server fault (500). The
+        // frontend re-queues the draft. Other errors stay 500.
+        return Err(match e {
+            AcpError::TurnInProgress => AppCommandError::new(AppErrorCode::TurnInProgress, message),
+            _ => AppCommandError::task_execution_failed(message),
+        });
+    }
     Ok(Json(()))
 }
 
@@ -1579,6 +1610,42 @@ mod tests {
     use super::*;
 
     use crate::acp::agent_mentions::append_agent_routes;
+
+    #[tokio::test]
+    async fn rejected_isolated_prompt_does_not_route_a_later_ordinary_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new_for_test(db, dir.path().to_owned()));
+        crate::db::service::app_metadata_service::upsert_value(&state.db.conn, crate::chat_channel::event_subscriber::EVENT_WEBHOOKS_KEY,
+            &serde_json::json!([{"url":"https://global.example/api/codeg/events?vmId=vm&s=secret","enabled":true}]).to_string()).await.unwrap();
+        let target = crate::chat_channel::channel_callback::register(
+            &state.db.conn,
+            "slack",
+            "https://slack.example",
+        )
+        .await
+        .unwrap();
+        state
+            .connection_manager
+            .insert_test_connection(
+                "rejected-isolated",
+                crate::models::agent::AgentType::ClaudeCode,
+                None,
+                state.emitter.clone(),
+            )
+            .await;
+        let params = serde_json::from_value(serde_json::json!({"connectionId":"rejected-isolated","blocks":[],"callbackTargetId":target})).unwrap();
+        assert!(acp_prompt_inner(state.clone(), params).await.is_err());
+        assert_eq!(
+            crate::chat_channel::channel_callback::prompt_target(
+                &state.db.conn,
+                "rejected-isolated",
+                1
+            )
+            .await,
+            None
+        );
+    }
 
     #[test]
     fn prompt_params_deserialize_camel_case_fields() {

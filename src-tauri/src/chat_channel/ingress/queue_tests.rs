@@ -87,6 +87,7 @@ async fn fixture() -> (
 fn request(id: &str, session: &str) -> Request {
     Request {
         request_id: id.into(),
+        callback_target_id: None,
         session_ref: session.into(),
         source: Source {
             channel_type: "telegram".into(),
@@ -298,6 +299,7 @@ async fn restart_marks_unfinished_unknown_without_replaying_private_input() {
         completion_acknowledged: false,
         operation: Operation {
             request_id: "old".into(),
+            callback_target_id: None,
             session_ref: "a".into(),
             status: Status::Running,
             phase: "callback".into(),
@@ -834,5 +836,41 @@ async fn model_control_uses_current_connection_after_discovery_reconnect() {
     assert!(!control_active("obsolete-discovery"));
     drop(control);
     assert!(!control_blocks(&state.connection_manager, "current-after-discovery", None).await);
+    server.abort();
+}
+
+#[tokio::test]
+async fn callback_target_validation_happens_before_admission_and_legacy_hash_is_unchanged() {
+    let (state, platform, server, _dir) = fixture().await;
+    let engine = Arc::new(Engine::new());
+    let mut req = request("bad-target", "a");
+    let legacy = serde_json::to_value(&req).unwrap();
+    assert!(legacy.get("callbackTargetId").is_none());
+    let expected = format!("{:x}", Sha256::digest(serde_json::to_vec(&req).unwrap()));
+    assert_eq!(fingerprint(&req).unwrap(), expected);
+    req.callback_target_id = Some("0".repeat(64));
+    assert_eq!(
+        engine.submit(state.clone(), req.clone()).await.unwrap_err(),
+        "invalid_channel_callback_target"
+    );
+    assert!(load(&state, "bad-target").await.unwrap().is_none());
+    let id =
+        super::super::channel_callback::register(&state.db.conn, "slack", "https://slack.example")
+            .await
+            .unwrap();
+    req.callback_target_id = Some(id.clone());
+    assert_eq!(
+        engine.submit(state.clone(), req).await.unwrap_err(),
+        "invalid_channel_callback_target"
+    );
+    assert!(platform.dispatches.lock().unwrap().is_empty());
+    // The target lives in the durable operation and survives serde/restart;
+    // absent fields in old operations still deserialize as None.
+    let old = json!({"requestId":"old","sessionRef":"a","status":"running","phase":"dispatch","cancelRequested":false});
+    let mut op: Operation = serde_json::from_value(old).unwrap();
+    assert!(op.callback_target_id.is_none());
+    op.callback_target_id = Some(id.clone());
+    let restored: Operation = serde_json::from_value(serde_json::to_value(op).unwrap()).unwrap();
+    assert_eq!(restored.callback_target_id.as_deref(), Some(id.as_str()));
     server.abort();
 }

@@ -1281,7 +1281,7 @@ impl ConnectionManager {
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
-        prompt_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        prompt_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1335,7 +1335,7 @@ impl ConnectionManager {
         // it can't double-create a conversation row.
         let _prompt_guard = match prompt_guard {
             Some(guard) => guard,
-            None => self.clone_prompt_lock(conn_id).await?.lock_owned().await,
+            None => Arc::new(self.clone_prompt_lock(conn_id).await?.lock_owned().await),
         };
         let mut conversation_guard =
             crate::chat_channel::ingress::prompt_admission_gate(self, conn_id, conversation_id)
@@ -5161,7 +5161,7 @@ mod tests {
         let mgr = ConnectionManager::new();
         let id = "relay-admission-lock";
         let mut rx = insert_live_connection(&mgr, id, AgentType::Codex, None).await;
-        let guard = mgr.clone_prompt_lock(id).await.unwrap().lock_owned().await;
+        let guard = Arc::new(mgr.clone_prompt_lock(id).await.unwrap().lock_owned().await);
         let ordinary = mgr.send_prompt(id, one_text_block());
         tokio::pin!(ordinary);
         assert!(
@@ -5177,14 +5177,47 @@ mod tests {
             None,
             None,
             Some("channel-message".into()),
-            Some(guard),
+            Some(guard.clone()),
         )
         .await
         .unwrap();
+        drop(guard);
         assert!(matches!(ordinary.await, Err(AcpError::TurnInProgress)));
         let messages = drain_prompt_user_messages(&mut rx);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].as_ref().unwrap().0, "channel-message");
+    }
+
+    #[tokio::test]
+    async fn rejected_channel_prompt_keeps_shared_guard_until_handler_rollback_finishes() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let id = "channel-admission-rollback";
+        let _rx = insert_live_connection(&mgr, id, AgentType::Codex, None).await;
+        let guard = Arc::new(mgr.clone_prompt_lock(id).await.unwrap().lock_owned().await);
+        assert!(mgr
+            .send_prompt_linked_under_lock(
+                &db,
+                id,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                Some(guard.clone())
+            )
+            .await
+            .is_err());
+        let ordinary = mgr.send_prompt(id, one_text_block());
+        tokio::pin!(ordinary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut ordinary)
+                .await
+                .is_err(),
+            "ordinary admission must wait until the handler revokes its failed callback pin"
+        );
+        drop(guard);
+        assert!(ordinary.await.is_ok());
     }
 
     /// Mirror what a live `active` goal snapshot leaves on the state.

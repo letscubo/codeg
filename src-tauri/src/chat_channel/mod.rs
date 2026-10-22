@@ -24,6 +24,7 @@ mod relay_input;
 mod telegram_typing;
 
 pub mod ingress;
+pub mod channel_callback;
 pub mod legacy_runtime;
 
 pub mod legacy_openclaw_inspect;

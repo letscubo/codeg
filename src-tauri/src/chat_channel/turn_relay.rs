@@ -50,6 +50,8 @@ pub enum OutboundSpec {
         result_format: ResultFormat,
         #[serde(default)]
         result_webhook_url: Option<String>,
+        #[serde(default)]
+        result_callback_target_id: Option<String>,
         #[serde(flatten)]
         presentation: super::relay_input::Presentation,
         bot_token: String,
@@ -69,6 +71,8 @@ pub enum OutboundSpec {
         result_format: ResultFormat,
         #[serde(default)]
         result_webhook_url: Option<String>,
+        #[serde(default)]
+        result_callback_target_id: Option<String>,
         #[serde(flatten)]
         presentation: super::relay_input::Presentation,
         bot_token: String,
@@ -883,19 +887,36 @@ async fn register_with_state(
             )
         }
     };
+    let callback_target_id = match &spec {
+        OutboundSpec::Telegram {
+            result_callback_target_id: Some(_),
+            ..
+        } => return Err("invalid_channel_callback_target".into()),
+        OutboundSpec::Slack {
+            result_callback_target_id: Some(id),
+            ..
+        } => {
+            if version < 2 || callback.is_some() {
+                return Err("invalid_channel_callback_target".into());
+            }
+            super::channel_callback::endpoint(&state.db.conn, id, "slack").await?;
+            Some(id.clone())
+        }
+        _ => None,
+    };
     let callback_hash = if version >= 2 {
         super::relay_outbox::validated_target(&state.db.conn, callback).await
     } else {
         None
     };
     if version >= 2 {
-        super::relay_outbox::save(&state.db.conn, spec.turn_id(), serde_json::json!({
+        super::relay_outbox::save_with_target(&state.db.conn, spec.turn_id(), serde_json::json!({
             "event_id":uuid::Uuid::new_v4().to_string(), "event":"relay_result", "relay_version":2,
             "relay_turn_id":spec.turn_id(), "relay_kind":kind, "connection_id":connection_id,
             "conversation_id":conversation_id, "delivery_status":"running",
             "fallback_allowed":false, "text_complete":false, "final_text":"", "segments":[],
             "target":target, "occurred_at":chrono::Utc::now().to_rfc3339(), "source":"codeg"
-        }), callback_hash.clone(), format).await.map_err(|_| "relay_storage_unavailable".to_string())?;
+        }), callback_hash.clone(), callback_target_id, format).await.map_err(|_| "relay_storage_unavailable".to_string())?;
     }
     register(
         &state.acp_event_bus,
@@ -982,6 +1003,13 @@ fn register(
             ..
         } => (presentation.clone(), *result_format),
     };
+    let callback_target_id = match &spec {
+        OutboundSpec::Slack {
+            result_callback_target_id,
+            ..
+        } => result_callback_target_id.clone(),
+        _ => None,
+    };
     let rx = super::relay_input::wrap(rx, presentation);
     let connection_id = connection_id.to_string();
     let tid = turn_id.clone();
@@ -1064,9 +1092,16 @@ fn register(
                 "failure_code": if report.delivery_unknown { Some("write_outcome_unknown") } else if !report.text_complete { Some("incomplete_event_stream") } else if report.delivery_failed { Some("platform_write_failed") } else { None },
                 "occurred_at": chrono::Utc::now().to_rfc3339(), "source": "codeg",
             });
-            if super::relay_outbox::save(&relay.db, &tid, payload, callback_hash, result_format)
-                .await
-                .is_err()
+            if super::relay_outbox::save_with_target(
+                &relay.db,
+                &tid,
+                payload,
+                callback_hash,
+                callback_target_id,
+                result_format,
+            )
+            .await
+            .is_err()
             {
                 tracing::error!("[TurnRelay] terminal result persistence failed");
             }
@@ -1861,6 +1896,52 @@ mod regression_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn isolated_callback_rejects_missing_targets_other_channels_and_ambiguous_urls() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::app_state::AppState::new_for_test(db, directory.path().to_owned());
+        crate::db::service::app_metadata_service::upsert_value(&state.db.conn, super::super::event_subscriber::EVENT_WEBHOOKS_KEY,
+            &serde_json::json!([{"url":"https://global.example/api/codeg/events?vmId=vm&s=secret","enabled":true}]).to_string()).await.unwrap();
+        let id = super::super::channel_callback::register(
+            &state.db.conn,
+            "slack",
+            "https://slack.example",
+        )
+        .await
+        .unwrap();
+        for (kind, target, url, version) in [
+            ("slack", "0".repeat(64), None, 2),
+            ("telegram", id.clone(), None, 2),
+            (
+                "slack",
+                id.clone(),
+                Some("https://global.example/api/codeg/events?vmId=vm&s=secret"),
+                2,
+            ),
+            ("slack", id, None, 1),
+        ] {
+            let mut value = serde_json::json!({"kind":kind,"turnId":"not-admitted-callback","deliveryVersion":version,"resultCallbackTargetId":target,"botToken":"unused","chatId":1,"channel":"C","threadTs":"1.0","recipientUserId":"U","recipientTeamId":"T"});
+            if let Some(url) = url {
+                value["resultWebhookUrl"] = url.into();
+            }
+            let spec = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                register_with_state(&state, "external-callback-test", None, spec, true)
+                    .await
+                    .unwrap_err(),
+                "invalid_channel_callback_target"
+            );
+            assert!(get_result(
+                &state.db.conn,
+                "not-admitted-callback",
+                ResultFormat::Legacy
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
     }
     #[derive(Default)]
     struct Scripted {

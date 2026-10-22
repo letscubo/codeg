@@ -280,36 +280,45 @@ async fn process_envelope(
     // session for this connection — see the fallback in the webhook fan-out.
     conn_mgr: &ConnectionManager,
 ) {
-    let Some((event_type, msg)) = parse_acp_event(&envelope.payload, config.lang) else {
+    let is_terminal = matches!(
+        &envelope.payload,
+        AcpEvent::TurnComplete { .. } | AcpEvent::Error { terminal: true, .. }
+    );
+    let selected_callback = if matches!(
+        &envelope.payload,
+        AcpEvent::TurnComplete { .. } | AcpEvent::Error { .. }
+    ) {
+        super::channel_callback::prompt_target(db_conn, &envelope.connection_id, envelope.seq).await
+    } else {
+        None
+    };
+    let parsed = parse_acp_event(&envelope.payload, config.lang);
+    let globally_supported = parsed.is_some();
+    let private_terminal = match &envelope.payload {
+        AcpEvent::TurnComplete {
+            stop_reason,
+            agent_type,
+            ..
+        } if selected_callback.is_some() => Some((
+            "turn_complete".to_owned(),
+            message_formatter::format_turn_complete(agent_type, stop_reason, config.lang),
+        )),
+        _ => None,
+    };
+    let Some((event_type, msg)) = parsed.or(private_terminal) else {
         return;
     };
-
-    // Fail closed unless the global filter reflects a clean read for the latest
-    // config. An unread/unreadable filter (cold-start DB error or corrupt value)
-    // must NOT fall back to the broad default set, and a filter left stale by a
-    // config change whose new value couldn't be loaded must NOT keep gating with a
-    // possibly-broader rule. Both leave `filter_known == false`; neither
-    // `global_filter == None` nor the cached value can distinguish those states on
-    // their own, so gate on the explicit known flag.
-    if !config.filter_known {
+    // Explicit per-turn callbacks are operational receipts, independent of the
+    // user's global notification filter. The original filter still governs all
+    // ordinary hooks and IM channel notifications.
+    let global_allowed = globally_supported
+        && config.filter_known
+        && match &config.global_filter {
+            Some(filter) => filter.contains(&event_type),
+            None => !DEFAULT_OFF_EVENTS.contains(&event_type.as_str()),
+        };
+    if !global_allowed && selected_callback.is_none() {
         return;
-    }
-
-    // Global event filter first — a filtered-out event needs no bridge lock or
-    // fan-out work. A null filter is the default set: opt-in events that export
-    // prompt text (DEFAULT_OFF_EVENTS) stay off until the user enables them
-    // (which materializes an explicit filter list containing the id).
-    match &config.global_filter {
-        Some(filter) => {
-            if !filter.contains(&event_type) {
-                return;
-            }
-        }
-        None => {
-            if DEFAULT_OFF_EVENTS.contains(&event_type.as_str()) {
-                return;
-            }
-        }
     }
 
     // A permission request from a session that was started FROM a chat channel
@@ -327,7 +336,7 @@ async fn process_envelope(
     // independent of the per-channel filter and the debounce below. Built once
     // and delivered fire-and-forget so an unreachable endpoint can't stall the
     // subscriber loop. Runs even with zero enabled IM channels.
-    if !config.webhooks.is_empty() {
+    if (global_allowed && !config.webhooks.is_empty()) || selected_callback.is_some() {
         let context = {
             let guard = bridge.lock().await;
             guard.get(&envelope.connection_id).map(|session| {
@@ -434,11 +443,44 @@ async fn process_envelope(
         ) {
             payload["relay_turn_id"] = serde_json::json!(turn_id);
         }
-        super::webhook::spawn_webhook_delivery(
-            webhook_client.clone(),
-            config.webhooks.clone(),
-            payload,
-        );
+        let mut hooks = if global_allowed {
+            config.webhooks.clone()
+        } else {
+            Vec::new()
+        };
+        if let Some(target) = selected_callback {
+            hooks.retain(|url| {
+                reqwest::Url::parse(url).map_or(true, |url| url.path() != "/api/codeg/events")
+            });
+            let mut private_payload = payload.clone();
+            if let AcpEvent::TurnComplete { stop_reason, .. } = &envelope.payload {
+                private_payload["stop_reason"] = stop_reason.clone().into();
+            }
+            if super::channel_callback::route_prompt_event(
+                db_conn,
+                &envelope.connection_id,
+                envelope.seq,
+                target.as_deref(),
+                private_payload,
+            )
+            .await
+            .is_err()
+            {
+                tracing::error!("[ChatChannel] isolated terminal event persistence failed");
+            }
+        }
+        super::webhook::spawn_webhook_delivery(webhook_client.clone(), hooks, payload);
+    }
+
+    if is_terminal
+        && super::channel_callback::close_prompt(db_conn, &envelope.connection_id, envelope.seq)
+            .await
+            .is_err()
+    {
+        tracing::error!("[ChatChannel] isolated terminal boundary persistence failed");
+    }
+    if !global_allowed {
+        return;
     }
 
     // Some events bypass the per-(channel, event) debounce. That debounce
@@ -1874,6 +1916,159 @@ mod permission_push_tests {
         assert!(
             request.contains("\"event\":\"question_request\""),
             "got: {request}"
+        );
+    }
+    #[tokio::test]
+    async fn slack_prompt_terminal_uses_durable_private_target_and_preserves_ordinary_hooks() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::app_state::AppState::new_for_test(db, dir.path().to_owned());
+        let (chat, _rec) = manager_with_recorder(7).await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let global = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ordinary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let global_url = format!(
+            "http://{}/api/codeg/events?vmId=vm&s=secret",
+            global.local_addr().unwrap()
+        );
+        let ordinary_url = format!("http://{}/hook", ordinary.local_addr().unwrap());
+        app_metadata_service::upsert_value(&state.db.conn, EVENT_WEBHOOKS_KEY,
+            &serde_json::json!([{"url":global_url,"enabled":true},{"url":ordinary_url,"enabled":true}]).to_string()).await.unwrap();
+        let id = super::super::channel_callback::register(
+            &state.db.conn,
+            "slack",
+            "https://slack.example",
+        )
+        .await
+        .unwrap();
+        state
+            .connection_manager
+            .insert_test_connection(
+                "isolated-slack",
+                AgentType::ClaudeCode,
+                None,
+                state.emitter.clone(),
+            )
+            .await;
+        super::super::channel_callback::pin_prompt(&state, "isolated-slack", Some(&id), None)
+            .await
+            .unwrap();
+        let mut config = config_all_on(7);
+        config.webhooks = vec![global_url, ordinary_url];
+        let ordinary_server = tokio::spawn(async move { accept_request(&ordinary).await });
+        process_envelope(
+            &turn_complete_envelope("isolated-slack"),
+            &bridge,
+            &chat,
+            &state.db.conn,
+            &config,
+            &mut HashMap::new(),
+            &test_client(),
+            &state.connection_manager,
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), global.accept())
+                .await
+                .is_err()
+        );
+        let delivered = tokio::time::timeout(Duration::from_secs(2), ordinary_server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delivered.contains("turn_complete"));
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let rows = crate::db::entities::app_metadata::Entity::find()
+            .filter(
+                crate::db::entities::app_metadata::Column::Key
+                    .starts_with("channel_relay_result:channel-event-"),
+            )
+            .all(&state.db.conn)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(&rows[0].value).unwrap();
+        assert_eq!(row["callback_target_id"], id);
+        assert_eq!(row["result"]["callback_target_id"], id);
+        assert_eq!(row["result"]["event"], "turn_complete");
+        assert_eq!(row["acknowledged"], false);
+        assert!(!rows[0].value.contains("secret"));
+        state
+            .connection_manager
+            .get_state("isolated-slack")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .event_seq = 1;
+        super::super::channel_callback::pin_prompt(&state, "isolated-slack", Some(&id), None)
+            .await
+            .unwrap();
+        config.filter_known = false;
+        let mut cancelled = turn_complete_envelope("isolated-slack");
+        cancelled.seq = 2;
+        if let AcpEvent::TurnComplete { stop_reason, .. } = &mut cancelled.payload {
+            *stop_reason = "cancelled".into();
+        }
+        process_envelope(
+            &cancelled,
+            &bridge,
+            &chat,
+            &state.db.conn,
+            &config,
+            &mut HashMap::new(),
+            &test_client(),
+            &state.connection_manager,
+        )
+        .await;
+        let rows = crate::db::entities::app_metadata::Entity::find()
+            .filter(
+                crate::db::entities::app_metadata::Column::Key
+                    .starts_with("channel_relay_result:channel-event-"),
+            )
+            .all(&state.db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "independent completion must bypass global filter"
+        );
+        assert!(rows
+            .iter()
+            .any(
+                |row| serde_json::from_str::<serde_json::Value>(&row.value).unwrap()["result"]
+                    ["stop_reason"]
+                    == "cancelled"
+            ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), global.accept())
+                .await
+                .is_err()
+        );
+        config.filter_known = true;
+        config.webhooks.truncate(1);
+        let global_server = tokio::spawn(async move { accept_request(&global).await });
+        let mut ordinary_turn = turn_complete_envelope("isolated-slack");
+        ordinary_turn.seq = 3;
+        process_envelope(
+            &ordinary_turn,
+            &bridge,
+            &chat,
+            &state.db.conn,
+            &config,
+            &mut HashMap::new(),
+            &test_client(),
+            &state.connection_manager,
+        )
+        .await;
+        let ordinary_result = tokio::time::timeout(Duration::from_secs(2), global_server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ordinary_result.contains("turn_complete"),
+            "a later non-HTTP prompt must not inherit Slack routing"
         );
     }
 }

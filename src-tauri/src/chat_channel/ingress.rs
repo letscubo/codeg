@@ -54,6 +54,8 @@ pub struct Request {
     pub session_ref: String,
     pub source: Source,
     pub input: Input,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_target_id: Option<String>,
     #[serde(default)]
     pub context: Value,
 }
@@ -120,6 +122,8 @@ impl Status {
 pub struct Operation {
     pub request_id: String,
     pub session_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_target_id: Option<String>,
     pub status: Status,
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,6 +333,11 @@ impl Engine {
         request: Request,
     ) -> Result<Operation, &'static str> {
         validate(&request)?;
+        if let Some(id) = request.callback_target_id.as_deref() {
+            super::channel_callback::endpoint(&state.db.conn, id, &request.source.channel_type)
+                .await
+                .map_err(|_| "invalid_channel_callback_target")?;
+        }
         let hash = fingerprint(&request)?;
         let _admission = self.admission.lock().await;
         self.initialize(state.clone()).await?;
@@ -357,6 +366,7 @@ impl Engine {
         let operation = Operation {
             request_id: request.request_id.clone(),
             session_ref: request.session_ref.clone(),
+            callback_target_id: request.callback_target_id.clone(),
             status: Status::Queued,
             phase: "waiting".into(),
             turn_id: None,
@@ -504,8 +514,10 @@ impl Engine {
             body["phase"] = "resolve".into();
             body["parsedCommand"] =
                 serde_json::to_value(&parsed).map_err(|_| (Status::Failed, "invalid_request"))?;
-            let response = crate::commands::myclaw_platform::post_signed(
+            let response = super::channel_callback::post_signed(
                 &state.db,
+                pending.stored.operation.callback_target_id.as_deref(),
+                &pending.stored.source.channel_type,
                 CALLBACK,
                 body,
                 Duration::from_secs(30),
@@ -573,8 +585,10 @@ impl Engine {
         body["parsedCommand"] =
             serde_json::to_value(parsed).map_err(|_| (Status::Failed, "invalid_request"))?;
         body["phase"] = "dispatch".into();
-        let response = crate::commands::myclaw_platform::post_signed(
+        let response = super::channel_callback::post_signed(
             &state.db,
+            pending.stored.operation.callback_target_id.as_deref(),
+            &pending.stored.source.channel_type,
             CALLBACK,
             body,
             CALLBACK_TIMEOUT,
@@ -699,9 +713,14 @@ impl Engine {
                         outcome["result"] = receipt;
                     }
                 }
-                let body = json!({"phase":"complete","requestId":stored.operation.request_id,"sessionRef":stored.operation.session_ref,"source":stored.source,"context":stored.completion_context,"outcome":outcome});
-                if crate::commands::myclaw_platform::post_signed(
+                let mut body = json!({"phase":"complete","requestId":stored.operation.request_id,"sessionRef":stored.operation.session_ref,"source":stored.source,"context":stored.completion_context,"outcome":outcome});
+                if let Some(id) = &stored.operation.callback_target_id {
+                    body["callbackTargetId"] = id.clone().into();
+                }
+                if super::channel_callback::post_signed(
                     &state.db,
+                    stored.operation.callback_target_id.as_deref(),
+                    &stored.source.channel_type,
                     CALLBACK,
                     body,
                     Duration::from_secs(30),
@@ -1129,9 +1148,14 @@ async fn reconcile_unknown(
         }
     }
     if resolved.is_none() {
-        let body = json!({"phase":"status","requestId":stored.operation.request_id,"sessionRef":stored.operation.session_ref,"source":stored.source,"context":stored.completion_context});
-        if let Ok(response) = crate::commands::myclaw_platform::post_signed(
+        let mut body = json!({"phase":"status","requestId":stored.operation.request_id,"sessionRef":stored.operation.session_ref,"source":stored.source,"context":stored.completion_context});
+        if let Some(id) = &stored.operation.callback_target_id {
+            body["callbackTargetId"] = id.clone().into();
+        }
+        if let Ok(response) = super::channel_callback::post_signed(
             &state.db,
+            stored.operation.callback_target_id.as_deref(),
+            &stored.source.channel_type,
             CALLBACK,
             body,
             Duration::from_secs(15),

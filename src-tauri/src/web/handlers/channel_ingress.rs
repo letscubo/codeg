@@ -14,9 +14,30 @@ fn error(code: &'static str) -> AppCommandError {
         "request_id_conflict" | "prior_operation_unknown" | "channel_queue_full" => {
             AppCommandError::new(AppErrorCode::TurnInProgress, code)
         }
-        "invalid_request" | "request_too_large" => AppCommandError::invalid_input(code),
+        "invalid_request" | "request_too_large" | "invalid_channel_callback_target" => {
+            AppCommandError::invalid_input(code)
+        }
         _ => AppCommandError::task_execution_failed(code),
     }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisterCallbackRequest {
+    channel_type: String,
+    origin: String,
+}
+pub async fn register_channel_callback(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(request): Json<RegisterCallbackRequest>,
+) -> Result<Json<Value>, AppCommandError> {
+    crate::chat_channel::channel_callback::register(
+        &state.db.conn,
+        &request.channel_type,
+        &request.origin,
+    )
+    .await
+    .map(|id| Json(json!({"targetId":id})))
+    .map_err(|_| AppCommandError::invalid_input("invalid_channel_callback_target"))
 }
 pub async fn channel_submit(
     Extension(state): Extension<Arc<AppState>>,

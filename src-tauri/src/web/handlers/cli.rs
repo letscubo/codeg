@@ -54,6 +54,8 @@ pub struct CliPromptParams {
     /// fork(letscubo)专属: 本轮边生成边推到渠道(见 chat_channel::turn_relay)。
     #[serde(default)]
     pub outbound: Option<crate::chat_channel::turn_relay::OutboundSpec>,
+    #[serde(default)]
+    pub callback_target_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -74,7 +76,7 @@ pub async fn cli_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<CliPromptParams>,
 ) -> Result<Json<CliPromptResult>, AppCommandError> {
-    if params.outbound.is_some() {
+    if params.outbound.is_some() || params.callback_target_id.is_some() {
         tokio::spawn(cli_prompt_inner(state, params))
             .await
             .map_err(|_| AppCommandError::task_execution_failed("relay submission interrupted"))?
@@ -122,15 +124,36 @@ async fn cli_prompt_inner(
         }
     }
 
-    let prompt_guard = if params.outbound.is_some() {
-        Some(
+    let prompt_guard = if params.outbound.is_some() || params.callback_target_id.is_some() {
+        Some(Arc::new(
             manager
                 .clone_prompt_lock(&connection_id)
                 .await
                 .map_err(prompt_error)?
                 .lock_owned()
                 .await,
+        ))
+    } else {
+        None
+    };
+    let callback_reservation = if prompt_guard.is_some() {
+        match crate::chat_channel::channel_callback::pin_prompt(
+            &state,
+            &connection_id,
+            params.callback_target_id.as_deref(),
+            params.outbound.as_ref(),
         )
+        .await
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                drop(prompt_guard);
+                if created {
+                    let _ = manager.disconnect(&connection_id).await;
+                }
+                return Err(crate::chat_channel::turn_relay::admission_error(error));
+            }
+        }
     } else {
         None
     };
@@ -150,6 +173,12 @@ async fn cli_prompt_inner(
     let relay_turn = match relay_turn {
         Ok(turn) => turn,
         Err(error) => {
+            let _ = crate::chat_channel::channel_callback::abort_prompt_pin(
+                &state.db.conn,
+                &connection_id,
+                callback_reservation.as_deref(),
+            )
+            .await;
             drop(prompt_guard);
             if created {
                 let _ = manager.disconnect(&connection_id).await;
@@ -166,21 +195,29 @@ async fn cli_prompt_inner(
             params.conversation_id,
             None,
             params.client_message_id,
-            prompt_guard,
+            prompt_guard.clone(),
         )
         .await;
     let conversation_id = match sent {
         Ok(conversation_id) => conversation_id,
         Err(err) => {
+            let _ = crate::chat_channel::channel_callback::abort_prompt_pin(
+                &state.db.conn,
+                &connection_id,
+                callback_reservation.as_deref(),
+            )
+            .await;
             if let Some(turn_id) = &relay_turn {
                 crate::chat_channel::turn_relay::abort(&connection_id, turn_id);
             }
+            drop(prompt_guard);
             if created {
                 let _ = manager.disconnect(&connection_id).await;
             }
             return Err(prompt_error(err));
         }
     };
+    drop(prompt_guard);
     let session_id = match manager.get_state(&connection_id).await {
         Some(session) => session.read().await.external_id.clone(),
         None => None,
