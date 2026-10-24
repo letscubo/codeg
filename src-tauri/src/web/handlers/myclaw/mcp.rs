@@ -68,8 +68,12 @@
 //! 例外是 **`ask_user_question` + 会话凭证**(2026-10-18):请求带了
 //! [`crate::acp::question::HTTP_SESSION_HEADER`],且值在委派凭证表里认得出(pi 驱动按连接
 //! 签发、每轮放进 `MYCLAW_CODEG_SESSION`,平台在 pi 的 mcp.json 里写成 `${…}`),这个会话
-//! 才多开 `ask` 一组;登记、等回答、渲染与 stdio 那条同一套。没带 / 认不出照旧只有上面这些。
-//! openclaw 是常驻网关、所有会话共用一个进程,带不出会话身份,仍然没有 ask。
+//! 才多开 `ask` 一组;登记、等回答、渲染与 stdio 那条同一套。
+//!
+//! openclaw 是常驻网关、所有会话共用一个进程,MCP 请求头是静态的,带不出会话身份。它按 URL
+//! 末段的平台 agent(`va-<uuid>`)找落点(2026-10-24):提问功能开着时同样列出 `ask`,真正调用时
+//! 取这个 agent **恰好一个**正在跑一轮的连接挂卡片;一个都没有或不止一个就立刻回错误、让模型
+//! 改用文字问,不挂住,也不会挂到别的会话上。
 //!
 //! 内置 Office 四组与内置浏览器(`browser`,整个实例一份,见 `commands::myclaw_browser`)也不需要
 //! 会话,与 stdio 同一份实现。
@@ -412,9 +416,13 @@ pub async fn rpc(
     let Some(id) = req.id else {
         return StatusCode::ACCEPTED.into_response();
     };
-    // fork: 带了认得出的会话凭证(pi 每轮由 codeg 设),这个会话才多开 ask。
+    // fork: 带了认得出的会话凭证(pi 每轮由 codeg 设),或者(openclaw 这类带不出会话身份的)
+    // 提问功能开着、URL 末段认得出是哪个平台 agent —— 都多开 ask。后者到真正调用时才按 agent
+    // 找会话(见 agent_session),找不到唯一的一个就立刻回错误,不挂住。
     let session = session_of(&state, &headers).await;
-    let features = CompanionFeatures::parse(Some(&features_for(session.is_some())));
+    let ask_offered = session.is_some()
+        || (agent_uuid(&agent).is_some() && state.question_config.is_enabled().await);
+    let features = CompanionFeatures::parse(Some(&features_for(ask_offered)));
     let body = match req.method.as_str() {
         "initialize" => {
             let overview = platform_overview_for_init(&StateUpload(&state.db)).await;
@@ -424,21 +432,32 @@ pub async fn rpc(
             Ok(result) => envelope_ok(id, result),
             Err(e) => envelope_err(id, -32603, e),
         },
-        "tools/call" => match &session {
-            Some(s) if requested_tool(&req.params) == Some("ask_user_question") => {
-                ask_user_question(&state, s, id, req.params).await
+        "tools/call" if requested_tool(&req.params) == Some("ask_user_question") && ask_offered => {
+            match session {
+                Some(s) => ask_user_question(&state, &s, id, req.params).await,
+                None => match agent_session(&state, &agent).await {
+                    Ok(s) => ask_user_question(&state, &s, id, req.params).await,
+                    Err(why) => envelope_ok(id, ask_unavailable_result(&why)),
+                },
             }
-            _ => call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await,
-        },
+        }
+        "tools/call" => call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await,
         other => envelope_err(id, -32601, format!("method not found: {other}")),
     };
     Json(body).into_response()
 }
 
-/// fork: 认出来的会话 —— 凭证本身(收尾前要再核一次)与它登记的连接。
+/// fork: 认出来的会话 —— 怎么认出来的(收尾前要按同一条路再核一次)与它的连接。
 struct SessionRef {
-    token: String,
+    via: SessionVia,
     connection_id: String,
+}
+
+enum SessionVia {
+    /// 请求头里的会话凭证(pi):再核 = 凭证还在委派表里。
+    Token(String),
+    /// 按平台 agent 找到的唯一一个正在跑的连接(openclaw):再核 = 它仍是这个 agent 正在跑的连接。
+    Agent(String),
 }
 
 /// 读 [`crate::acp::question::HTTP_SESSION_HEADER`],到委派凭证表里找连接(与 stdio
@@ -455,15 +474,79 @@ async fn session_of(state: &AppState, headers: &HeaderMap) -> Option<SessionRef>
     }
     let entry = state.delegation_tokens.lookup(token).await?;
     Some(SessionRef {
-        token: token.to_string(),
+        via: SessionVia::Token(token.to_string()),
         connection_id: entry.parent_connection_id,
     })
 }
 
-/// 有会话时在 [`http_features`] 上加 `ask`。
-fn features_for(has_session: bool) -> String {
+/// URL 末段 `va-<uuid>` → 连接上记的平台 agent 标识(小写 uuid,见 `acp::myclaw_memory`)。
+fn agent_uuid(agent: &str) -> Option<String> {
+    let id = agent.strip_prefix("va-")?;
+    let ok = id.len() == 36
+        && id.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    ok.then(|| id.to_ascii_lowercase())
+}
+
+/// fork: 给**带不出会话身份**的 runtime(openclaw:常驻网关、所有会话共用一个进程、MCP
+/// 请求头是静态的)找提问落点 —— 这个 agent 此刻**恰好一个**正在跑一轮的连接。
+/// 一个都没有(不在一轮里)或不止一个(同一 agent 并行几个会话,分不清是谁问的)都不挂,
+/// 返回原因给模型,让它改用文字提问;宁可不问,也不把卡片挂到别的会话上。
+async fn agent_session(state: &AppState, agent: &str) -> Result<SessionRef, String> {
+    if !state.question_config.is_enabled().await {
+        return Err("ask_user_question is turned off on this instance".into());
+    }
+    let Some(key) = agent_uuid(agent) else {
+        return Err("this endpoint is not bound to a platform agent".into());
+    };
+    let live = state
+        .connection_manager
+        .prompting_connections_for_agent(&key)
+        .await;
+    match live.as_slice() {
+        [only] => Ok(SessionRef {
+            via: SessionVia::Agent(key),
+            connection_id: only.clone(),
+        }),
+        [] => Err("no conversation of this agent is running a turn right now".into()),
+        _ => Err(format!(
+            "this agent is running {} conversations at once, so the question cannot be routed to one of them",
+            live.len()
+        )),
+    }
+}
+
+/// 找不到落点时回给模型的结果:说明原因、让它改用文字问 —— 立刻返回,不让这一轮挂住。
+fn ask_unavailable_result(why: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "ask_user_question is unavailable here ({why}). Ask the user in your reply text instead, then continue with their answer."
+            ),
+        }],
+        "isError": true,
+    })
+}
+
+/// 等回答前再核一次:落点还有效吗(会话正在拆 → 撤卡)。
+async fn session_still_live(state: &AppState, session: &SessionRef) -> bool {
+    match &session.via {
+        SessionVia::Token(token) => state.delegation_tokens.lookup(token).await.is_some(),
+        SessionVia::Agent(key) => state
+            .connection_manager
+            .prompting_connections_for_agent(key)
+            .await
+            .contains(&session.connection_id),
+    }
+}
+
+/// 开放提问时在 [`http_features`] 上加 `ask`。
+fn features_for(ask: bool) -> String {
     let base = http_features();
-    if has_session {
+    if ask {
         format!("{base},ask")
     } else {
         base
@@ -525,11 +608,27 @@ async fn ask_user_question(
         Ok(qs) => qs,
         Err(msg) => return envelope_err(id, -32602, msg),
     };
-    let Some(reg) = state
-        .connection_manager
-        .register_question(&session.connection_id, questions)
+    let manager = &state.connection_manager;
+    let reg = match manager
+        .register_question(&session.connection_id, questions.clone())
         .await
-    else {
+    {
+        Some(reg) => Some(reg),
+        // 这条连接已挂着一个提问:agent 停在提问里时发不出第二个,所以旧的那个一定是调用方
+        // 已经放弃的(openclaw 的 MCP 请求超时断开,而服务端没察觉、卡片还挂着 ——
+        // 2026-10-24 C10 实测:超时后模型重问,第二次直接被回「已跳过」)。撤掉旧的再登记一次;
+        // 旧请求若还在等,会随之收到「已跳过」。
+        None if manager.has_pending_question(&session.connection_id).await => {
+            manager
+                .cancel_questions_by_parent(&session.connection_id)
+                .await;
+            manager
+                .register_question(&session.connection_id, questions)
+                .await
+        }
+        None => None,
+    };
+    let Some(reg) = reg else {
         return declined(id);
     };
     let mut pending = PendingAsk {
@@ -538,8 +637,8 @@ async fn ask_user_question(
         question_id: reg.question_id,
         settled: false,
     };
-    // 与 listener 同一道收尾竞态:凭证在登记前后被回收(会话正在拆),立刻撤掉。
-    if state.delegation_tokens.lookup(&session.token).await.is_none() {
+    // 与 listener 同一道收尾竞态:落点在登记前后失效(会话正在拆 / 这一轮已结束),立刻撤掉。
+    if !session_still_live(state, session).await {
         return declined(id); // pending 在这里 drop,撤卡
     }
     let outcome = reg.answer_rx.await;
@@ -1008,6 +1107,30 @@ mod tests {
         }
         let names = tool_names(&tools_list_result(with).unwrap());
         assert!(names.contains(&"ask_user_question".to_string()));
+    }
+
+    /// openclaw 的条目末段是 `va-<uuid>`;只有它能按 agent 找会话,别的形状一律不认。
+    #[test]
+    fn agent_uuid_reads_only_platform_agent_segments() {
+        assert_eq!(
+            agent_uuid("va-50B84922-b250-4af4-997b-71a5fac47f32").as_deref(),
+            Some("50b84922-b250-4af4-997b-71a5fac47f32"),
+            "转成连接上记的小写形式"
+        );
+        assert_eq!(agent_uuid("50b84922-b250-4af4-997b-71a5fac47f32"), None, "缺 va- 前缀");
+        assert_eq!(agent_uuid("va-50b84922"), None, "截断的 id");
+        assert_eq!(agent_uuid("va-50b84922_b250_4af4_997b_71a5fac47f32"), None, "分隔符不对");
+        assert_eq!(agent_uuid("va-zzzzzzzz-b250-4af4-997b-71a5fac47f32"), None, "非十六进制");
+    }
+
+    /// 找不到落点:立刻回一个错误结果(不挂住),并告诉模型改用文字问。
+    #[test]
+    fn unroutable_ask_tells_the_model_to_ask_in_text() {
+        let r = ask_unavailable_result("no conversation of this agent is running a turn right now");
+        assert_eq!(r["isError"], true);
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no conversation of this agent"), "{text}");
+        assert!(text.contains("Ask the user in your reply text"), "{text}");
     }
 
     #[test]

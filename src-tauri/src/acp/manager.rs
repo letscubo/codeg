@@ -3477,6 +3477,28 @@ impl ConnectionManager {
         }
     }
 
+    /// fork(letscubo): 平台 agent(`myclaw_agent_key`,即 vm agent 的 uuid)此刻**正在跑一轮**
+    /// (`Prompting`)的连接。HTTP 伴生据此给**带不出会话身份**的 runtime 找提问的落点 ——
+    /// openclaw 是常驻网关、所有会话共用一个进程,MCP 条目的请求头是静态的
+    /// (见 `web::handlers::myclaw::mcp` 的 `agent_session`)。只认 `Prompting`:提问只会
+    /// 发生在一轮之中,空闲的连接不可能是调用方。
+    pub async fn prompting_connections_for_agent(&self, agent_key: &str) -> Vec<String> {
+        let candidates: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>)> = {
+            let map = self.connections.lock().await;
+            map.values().map(|c| (c.id.clone(), c.state.clone())).collect()
+        };
+        let mut out = Vec::new();
+        for (id, state) in candidates {
+            let s = state.read().await;
+            if s.status == ConnectionStatus::Prompting
+                && s.myclaw_agent_key.as_deref() == Some(agent_key)
+            {
+                out.push(id);
+            }
+        }
+        out
+    }
+
     /// Register a blocking `ask_user_question` on a connection: park a one-shot
     /// in `pending_questions` keyed by a fresh `question_id`, broadcast the
     /// `QuestionRequest` (so every attached client renders the interactive card
@@ -3647,6 +3669,15 @@ impl ConnectionManager {
             )
             .await;
         }
+    }
+
+    /// fork(letscubo): 这条连接此刻是否挂着一个待答提问(HTTP 伴生据此认出被调用方放弃的旧提问)。
+    pub async fn has_pending_question(&self, conn_id: &str) -> bool {
+        self.pending_questions
+            .lock()
+            .await
+            .values()
+            .any(|e| e.parent_connection_id == conn_id)
     }
 
     /// Cancel every pending `ask_user_question` parked on a connection that is
