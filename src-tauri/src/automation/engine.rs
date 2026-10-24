@@ -451,7 +451,12 @@ impl AutomationEngine {
             return Err("prompt is empty".to_string());
         }
 
-        let cwd = self.resolve_cwd(auto, run_id).await?;
+        let mut cwd = self.resolve_cwd(auto, run_id).await?;
+        // A caller-pinned cwd (see `AutomationConfig::working_dir`) wins for the
+        // spawn; folder/worktree bookkeeping above stays as resolved.
+        if let Some(dir) = cfg.working_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            cwd.working_dir = dir.to_string();
+        }
 
         // Announce the resolved working folder so every client's sidebar knows it
         // BEFORE the conversation upsert below lands — a conversation in a fresh
@@ -468,17 +473,23 @@ impl AutomationEngine {
         // when a run *settles*, so it names the previous run here, never this one.
         // A deleted conversation (or one that never got an ACP session id) leaves
         // this `None` and the run falls through to the fresh path below.
+        // Before the first run has settled, `seed_conversation_id` names the
+        // conversation to continue (the chat the automation was set up in).
         let reuse_conversation_id = if cfg.reuse_session {
-            auto.last_run_conversation_id
+            auto.last_run_conversation_id.or(cfg.seed_conversation_id)
         } else {
             None
         };
+        // Only a live conversation of this same agent can be continued: a
+        // deleted one would swallow the run invisibly, and another agent's
+        // session id means nothing to this CLI.
         let resume_session_id = match reuse_conversation_id {
             Some(conv_id) => conversation::Entity::find_by_id(conv_id)
                 .one(&self.db.conn)
                 .await
                 .ok()
                 .flatten()
+                .filter(|c| c.deleted_at.is_none() && c.agent_type == auto.agent_type)
                 .and_then(|c| c.external_id),
             None => None,
         };

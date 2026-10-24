@@ -106,6 +106,21 @@ pub struct AutomationConfig {
     /// deserializes as the legacy default and nothing queries automations by it.
     #[serde(default)]
     pub reuse_session: bool,
+    /// With `reuse_session`: the conversation the FIRST run continues, before any
+    /// run has settled (`last_run_conversation_id` is still `None`). Lets a
+    /// caller start an automation inside an existing chat — e.g. the conversation
+    /// in which the task was set up — instead of a fresh one. Ignored once a run
+    /// has settled, and when the conversation is gone or belongs to another agent.
+    #[serde(default)]
+    pub seed_conversation_id: Option<i32>,
+    /// Spawn the agent in this directory instead of the resolved folder path.
+    /// Continuing a conversation that was chatted in elsewhere needs the cwd it
+    /// was chatted in: CLI agents key their session files by cwd (Claude Code:
+    /// `<config>/projects/<cwd>/<session>.jsonl`), and a live connection on that
+    /// session is only reused for the same cwd. Ignored when blank; the run's
+    /// conversation still lives in the automation's folder.
+    #[serde(default)]
+    pub working_dir: Option<String>,
     /// Per-RUN env overlay, merged over the agent-setting env at spawn — the
     /// automation-side twin of `AcpConnectParams::runtime_env`, carried for the
     /// same reason. A value like `OPENCLAW_SESSION_KEY` names *which* sub-agent
@@ -114,4 +129,23 @@ pub struct AutomationConfig {
     /// type (channel bridges included) to one sub-agent.
     #[serde(default)]
     pub runtime_env: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutomationConfig;
+
+    #[test]
+    fn seed_conversation_id_is_optional_and_round_trips() {
+        let legacy: AutomationConfig =
+            serde_json::from_str(r#"{"reuse_session":true}"#).expect("legacy config");
+        assert_eq!(legacy.seed_conversation_id, None);
+        let seeded: AutomationConfig =
+            serde_json::from_str(r#"{"reuse_session":true,"seed_conversation_id":5}"#)
+                .expect("seeded config");
+        assert_eq!(seeded.seed_conversation_id, Some(5));
+        assert_eq!(legacy.working_dir, None);
+        let back = serde_json::to_value(&seeded).expect("encode");
+        assert_eq!(back["seed_conversation_id"], 5);
+    }
 }

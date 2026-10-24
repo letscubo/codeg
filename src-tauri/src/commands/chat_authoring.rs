@@ -240,6 +240,8 @@ impl ChatAuthoringAccess for DbChatAuthoring {
             // Chat-authored automations keep the historical per-run conversation;
             // opting into a continuous thread is an explicit editor choice.
             reuse_session: false,
+            seed_conversation_id: None,
+            working_dir: None,
             runtime_env: BTreeMap::new(),
         };
         let config = match serde_json::to_value(&config) {
