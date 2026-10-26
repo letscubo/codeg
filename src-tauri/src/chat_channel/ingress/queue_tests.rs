@@ -6,6 +6,7 @@ struct Platform {
     dispatches: Mutex<Vec<Value>>,
     completions: Mutex<Vec<Value>>,
     blocked_started: Notify,
+    blocked_requests: Mutex<HashSet<String>>,
     release: Notify,
     malformed: AtomicBool,
     reject_completion: AtomicBool,
@@ -39,10 +40,13 @@ async fn callback(
             json!({"code":if platform.reject_completion.load(Ordering::Acquire) { 1 } else { 0 },"data":{}}),
         );
     }
-    let first = body["requestId"] == "first";
+    let blocked = body["requestId"] == "first"
+        || body["requestId"]
+            .as_str()
+            .is_some_and(|id| platform.blocked_requests.lock().unwrap().contains(id));
     let model = body["parsedCommand"]["name"] == "model";
     platform.dispatches.lock().unwrap().push(body);
-    if first {
+    if blocked {
         platform.blocked_started.notify_one();
         platform.release.notified().await;
     }
@@ -173,6 +177,124 @@ async fn same_session_order_dedup_and_independent_sessions() {
     assert!(!stored.contains("private input"));
     assert!(!stored.contains("never-persist"));
     server.abort();
+}
+#[tokio::test]
+async fn portable_model_is_ordered_between_prompts_for_managed_and_retained_sessions() {
+    for (entry, channel, runtime_session) in [
+        ("managed", "slack", "codeg:987660"),
+        ("legacy_slack", "slack", "agent:main:direct:slack-retained"),
+        ("legacy_telegram", "telegram", "hermes:retained-session"),
+    ] {
+        let (state, platform, server, _dir) = fixture().await;
+        let engine = Arc::new(Engine::new());
+        platform
+            .blocked_requests
+            .lock()
+            .unwrap()
+            .insert("model".into());
+        let make_request = |id: &str, text: &str| {
+            let mut input = request(id, "stable-target-session");
+            input.source.channel_type = channel.into();
+            input.input = Input::Text { text: text.into() };
+            input.context = json!({
+                "entry": entry,
+                "jobId": id,
+                "sessionKey": runtime_session,
+                "chatId": "target-chat",
+                "threadId": "target-thread",
+                "senderId": "authorized-sender",
+            });
+            input
+        };
+        engine
+            .submit(state.clone(), make_request("first", "first prompt"))
+            .await
+            .unwrap();
+        platform.blocked_started.notified().await;
+        engine
+            .submit(
+                state.clone(),
+                make_request("model", "!model provider/model"),
+            )
+            .await
+            .unwrap();
+        engine
+            .submit(state.clone(), make_request("after", "next prompt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            load(&state, "model")
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            Status::Queued
+        );
+        assert_eq!(
+            load(&state, "after")
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            Status::Queued
+        );
+        assert_eq!(platform.dispatches.lock().unwrap().len(), 1);
+
+        platform.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), platform.blocked_started.notified())
+            .await
+            .unwrap();
+        {
+            let dispatches = platform.dispatches.lock().unwrap();
+            assert_eq!(dispatches.len(), 2);
+            assert_eq!(dispatches[1]["requestId"], "model");
+            assert_eq!(
+                dispatches[1]["parsedCommand"],
+                json!({
+                    "name": "model", "arguments": "provider/model",
+                })
+            );
+            assert_eq!(dispatches[1]["sessionRef"], "stable-target-session");
+            assert_eq!(dispatches[1]["context"]["sessionKey"], runtime_session);
+            assert_eq!(dispatches[1]["context"]["chatId"], "target-chat");
+            assert_eq!(dispatches[1]["context"]["threadId"], "target-thread");
+            assert_eq!(dispatches[1]["context"]["senderId"], "authorized-sender");
+        }
+        assert_eq!(
+            platform.resolutions.lock().unwrap().len(),
+            usize::from(entry == "managed")
+        );
+        assert_eq!(
+            load(&state, "after")
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            Status::Queued
+        );
+
+        platform.release.notify_one();
+        assert_eq!(
+            finished(&state, "model").await.operation.status,
+            Status::Completed
+        );
+        assert_eq!(
+            finished(&state, "after").await.operation.status,
+            Status::Completed
+        );
+        let ids: Vec<_> = platform
+            .dispatches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| body["requestId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids, ["first", "model", "after"]);
+        server.abort();
+    }
 }
 #[tokio::test]
 async fn conflicting_duplicate_is_rejected_without_dispatch() {

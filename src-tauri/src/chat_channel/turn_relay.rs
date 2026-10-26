@@ -56,6 +56,9 @@ pub enum OutboundSpec {
         presentation: super::relay_input::Presentation,
         bot_token: String,
         chat_id: i64,
+        /// 原平台消息的 topic；缺省时维持原有非 topic 投递。
+        #[serde(default)]
+        message_thread_id: Option<i64>,
         /// 草稿 id 基数(非 0);不给就由 turn_id 派生。每段正文用 `基数 + 段号`。
         #[serde(default)]
         draft_id: Option<i64>,
@@ -376,8 +379,19 @@ fn tool_status(description: Option<&str>, title: &str) -> Option<String> {
 pub(crate) struct TelegramTurn {
     pub api: Arc<dyn TgApi>,
     pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
     pub draft_base: i64,
     pub texts: RelayTexts,
+}
+
+/// Preserve the originating topic on new messages, drafts, typing and receipts.
+/// Edits use the already-scoped message ID; editMessageText has no topic parameter.
+pub(super) fn telegram_target(chat_id: i64, message_thread_id: Option<i64>) -> serde_json::Value {
+    let mut target = serde_json::json!({"chat_id": chat_id});
+    if let Some(id) = message_thread_id {
+        target["message_thread_id"] = id.into();
+    }
+    target
 }
 
 impl TelegramTurn {
@@ -605,6 +619,9 @@ impl TelegramTurn {
             if let Some(id) = segment.message_id {
                 body["message_id"] = id.into();
                 plain["message_id"] = id.into();
+            } else if let Some(id) = self.message_thread_id {
+                body["message_thread_id"] = id.into();
+                plain["message_thread_id"] = id.into();
             }
             match self.send_with_plain_fallback(method, body, plain).await {
                 Ok(id) => {
@@ -662,14 +679,17 @@ impl TelegramTurn {
         blocked_until: &mut Option<Instant>,
     ) {
         *last_update = Some(Instant::now());
-        match self
-            .api
-            .call(
-                "sendMessageDraft",
-                serde_json::json!({"chat_id":self.chat_id,"draft_id":self.draft_base,"text":text}),
-            )
-            .await
-        {
+        // sendMessageDraft only supports private chats. Bot API group/channel
+        // IDs are negative; retain the refresh checkpoint without a failed API
+        // call or a status-only message. Native typing runs independently.
+        if self.chat_id < 0 {
+            *draft_shown = Some(text.to_owned());
+            return;
+        }
+        let mut body = telegram_target(self.chat_id, self.message_thread_id);
+        body["draft_id"] = self.draft_base.into();
+        body["text"] = text.into();
+        match self.api.call("sendMessageDraft", body).await {
             Ok(_) => {
                 *draft_shown = Some(text.to_owned());
                 *blocked_until = None;
@@ -832,6 +852,12 @@ async fn register_with_state(
     if spec.turn_id().is_empty() || spec.turn_id().len() > 200 {
         return Err("invalid_relay_turn_id".into());
     }
+    if matches!(
+        &spec,
+        OutboundSpec::Telegram { message_thread_id: Some(id), .. } if *id <= 0
+    ) {
+        return Err("invalid_telegram_relay_target".into());
+    }
     if super::relay_outbox::get(&state.db.conn, spec.turn_id())
         .await
         .map_err(|_| "relay_storage_unavailable".to_string())?
@@ -857,13 +883,14 @@ async fn register_with_state(
         OutboundSpec::Telegram {
             delivery_version,
             chat_id,
+            message_thread_id,
             result_webhook_url,
             result_format,
             ..
         } => (
             *delivery_version,
             "telegram",
-            serde_json::json!({"chat_id":chat_id}),
+            telegram_target(*chat_id, *message_thread_id),
             result_webhook_url.as_deref(),
             *result_format,
         ),
@@ -974,11 +1001,12 @@ fn register(
         OutboundSpec::Telegram {
             delivery_version,
             chat_id,
+            message_thread_id,
             ..
         } => (
             *delivery_version,
             "telegram",
-            serde_json::json!({"chat_id":chat_id}),
+            telegram_target(*chat_id, *message_thread_id),
         ),
         OutboundSpec::Slack {
             delivery_version,
@@ -1018,6 +1046,7 @@ fn register(
             OutboundSpec::Telegram {
                 bot_token,
                 chat_id,
+                message_thread_id,
                 draft_id,
                 texts,
                 ..
@@ -1028,6 +1057,7 @@ fn register(
                         token: bot_token,
                     }),
                     chat_id,
+                    message_thread_id,
                     draft_base: draft_id
                         .filter(|d| *d > 0)
                         .unwrap_or_else(|| derive_draft_base(&tid)),
@@ -1254,6 +1284,34 @@ mod tests {
         assert!(dbg.contains("redacted"));
     }
 
+    #[test]
+    fn telegram_topic_is_optional_and_kept_in_receipt_target() {
+        for topic in [None, Some(42)] {
+            let mut value = serde_json::json!({
+                "kind": "telegram", "turnId": "topic-test", "botToken": "unused", "chatId": -1001,
+            });
+            if let Some(id) = topic {
+                value["messageThreadId"] = id.into();
+            }
+            let spec: OutboundSpec = serde_json::from_value(value).unwrap();
+            let OutboundSpec::Telegram {
+                chat_id,
+                message_thread_id,
+                ..
+            } = spec
+            else {
+                panic!()
+            };
+            assert_eq!(message_thread_id, topic);
+            let target = telegram_target(chat_id, message_thread_id);
+            assert_eq!(target["chat_id"], -1001);
+            match topic {
+                Some(id) => assert_eq!(target["message_thread_id"], id),
+                None => assert_eq!(target, serde_json::json!({"chat_id": -1001})),
+            }
+        }
+    }
+
     // ── worker(假 Telegram,记录调用)──
 
     #[derive(Default)]
@@ -1358,6 +1416,7 @@ mod tests {
         TelegramTurn {
             api: api as Arc<dyn TgApi>,
             chat_id: 1,
+            message_thread_id: None,
             draft_base: 100,
             texts: RelayTexts::default(),
         }
@@ -1462,6 +1521,27 @@ mod tests {
 
         tx.send(complete("end_turn")).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_group_drafts_advance_the_refresh_checkpoint() {
+        let api = Arc::new(FakeTg::default());
+        let mut turn = turn_with(Arc::clone(&api));
+        turn.chat_id = -10012345;
+        let mut shown = None;
+        let mut updated = None;
+        let mut blocked = None;
+        turn.draft("thinking", &mut shown, &mut updated, &mut blocked)
+            .await;
+        assert_eq!(shown.as_deref(), Some("thinking"));
+        assert_eq!(updated, Some(Instant::now()));
+        tokio::time::advance(DRAFT_HEARTBEAT).await;
+        turn.draft("tool", &mut shown, &mut updated, &mut blocked)
+            .await;
+        assert_eq!(shown.as_deref(), Some("tool"));
+        assert_eq!(updated, Some(Instant::now()));
+        assert!(drafts(&api).is_empty());
+        assert!(messages(&api).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1898,6 +1978,31 @@ mod regression_tests {
         );
     }
     #[tokio::test]
+    async fn invalid_telegram_topic_is_rejected_before_delivery_is_admitted() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::app_state::AppState::new_for_test(db, directory.path().to_owned());
+        for topic in [0, -1] {
+            let spec = serde_json::from_value(serde_json::json!({
+                "kind": "telegram", "turnId": "invalid-topic", "deliveryVersion": 2,
+                "botToken": "unused", "chatId": -1001, "messageThreadId": topic,
+            }))
+            .unwrap();
+            assert_eq!(
+                register_with_state(&state, "topic-validation", None, spec, true)
+                    .await
+                    .unwrap_err(),
+                "invalid_telegram_relay_target"
+            );
+            assert!(
+                get_result(&state.db.conn, "invalid-topic", ResultFormat::Legacy)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    #[tokio::test]
     async fn slack_logical_dm_keys_are_rejected_before_delivery_is_admitted() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let directory = tempfile::tempdir().unwrap();
@@ -1996,6 +2101,7 @@ mod regression_tests {
         TelegramTurn {
             api,
             chat_id: 1,
+            message_thread_id: None,
             draft_base: 1,
             texts: RelayTexts::default(),
         }
@@ -2020,6 +2126,44 @@ mod regression_tests {
             agent_type: "codex".into(),
             duration_ms: None,
         })
+    }
+    #[tokio::test(start_paused = true)]
+    async fn plain_fallback_preserves_topic_and_edits_use_only_message_id() {
+        let api = Arc::new(Scripted::default());
+        api.replies.lock().unwrap().extend([
+            Err(TgError::Other("can't parse entities".into())),
+            Ok(Some(7)),
+        ]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut worker = turn(api.clone());
+        worker.message_thread_id = Some(42);
+        let task = tokio::spawn(worker.run(rx));
+        tx.send(delta("hello")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(delta(" world")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(done()).unwrap();
+        assert!(!task.await.unwrap().delivery_failed);
+        let calls = api.calls.lock().unwrap();
+        let sends: Vec<_> = calls
+            .iter()
+            .filter(|(method, _)| method == "sendMessage")
+            .collect();
+        assert_eq!(sends.len(), 2);
+        assert!(sends[0].1.get("parse_mode").is_some());
+        assert!(sends[1].1.get("parse_mode").is_none());
+        for (_, body) in sends {
+            assert_eq!(body["message_thread_id"], 42);
+        }
+        let edits: Vec<_> = calls
+            .iter()
+            .filter(|(method, _)| method == "editMessageText")
+            .collect();
+        assert!(!edits.is_empty());
+        for (_, body) in edits {
+            assert_eq!(body["message_id"], 7);
+            assert!(body.get("message_thread_id").is_none());
+        }
     }
     #[tokio::test(start_paused = true)]
     async fn unknown_send_is_never_replayed_as_plain_or_next_tick() {

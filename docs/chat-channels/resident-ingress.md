@@ -13,7 +13,7 @@ POST /api/channel_submit
   "requestId": "durable-platform-job-id",
   "sessionRef": "stable-platform-conversation-scope",
   "source": { "channelType": "telegram", "accountId": "account-id" },
-  "input": { "kind": "text", "text": "/model provider/model" },
+  "input": { "kind": "text", "text": "!model provider/model" },
   "context": {
     "entry": "managed",
     "jobId": "durable-platform-job-id",
@@ -23,9 +23,27 @@ POST /api/channel_submit
 }
 ```
 
-Native commands use `input: { "kind": "command", "name": "/model", "arguments": "provider/model" }`.
-Text commands must occupy the whole command input. A normal sentence mentioning `/model` stays a prompt.
-Only the `model` command is implemented; `/new` is not intercepted.
+`!model` is the portable ordinary-text command: `!model`, `!model list 2`, or
+`!model provider/model`. It does not require platform-native slash-command registration.
+Existing `/model`, Telegram `/model@Bot`, and normalized native commands remain compatible.
+Native commands use `input: { "kind": "command", "name": "model", "arguments": "provider/model" }`.
+Text commands must occupy the whole command input. A normal sentence mentioning
+`!model` or `/model` stays a prompt; codeg does not ask an agent to infer intent.
+Only the `model` command is implemented; `!new` and `/new` are not intercepted.
+
+Channel adapters authorize the sender, target App/Agent, and exact conversation
+before submission. They remove only a verified mention of the target bot before
+passing the command text. Delivery rules remain platform-specific: in a shared
+channel the bot must actually receive the message and be the intended recipient.
+The portable text syntax cannot grant a bot access to unreadable group messages.
+
+`sessionRef` must be the same stable scope used for ordinary messages to that
+Agent/session, including existing thread/topic mappings. Do not derive a new
+session from the command spelling or from the sender of a shared conversation.
+If a new conversation has several possible Agents, the platform requests a
+selection before changing a model. Ambiguous targets never fall back to the
+latest session. Retained sessions keep their original mapping; a visible reply
+thread does not itself prove that the runtime has a separate session.
 
 `POST /api/channel_operation` and `POST /api/channel_cancel` take `{ "requestId": "..." }`.
 Repeated IDs with matching input return the original operation; a conflicting payload is rejected.
@@ -40,6 +58,11 @@ Calls use the existing HMAC protocol; request data cannot choose an arbitrary ca
 - `dispatch`: platform verifies the original job, sender/account/VM/session and parsed command; returns a turn, retained-runtime request, or command reply.
 - `complete`: carries compact receipt and safe job references. The platform owns existing history and delivery state.
 - `status`: read-only recovery check; never reapplies a model or prompts an agent.
+
+Ordinary messages and model commands share the same per-`sessionRef` FIFO. A
+queued model command runs after the current operation and before the next prompt;
+it does not change a running turn mid-flight. This applies to both managed
+`kind=all` instances and retained Hermes/OpenClaw channel inputs.
 
 Codeg's execution guard orders connected and reconnecting ACP prompts against a model callback.
 The guard remains logically active after an unknown model result until a read-only receipt proves the outcome.
@@ -62,6 +85,21 @@ New Telegram routing entries use a separate `.codeg-telegram` routing scope in t
 The original Telegram adapter must be fully stopped before adoption; otherwise both the runtime and codeg could send replies.
 
 Hermes uses `POST /api/sessions/{id}/chat/stream` exactly once per admitted codeg operation. An explicit model/provider pair uses `require_model_lock`; tool events drive loading, assistant events drive text, and reasoning progress is filtered. The original HTTP API does not offer prompt idempotency, so interrupted or uncertain submissions are not retried. Cancellation targets the same observed run ID and waits for its terminal event.
+
+Telegram outbound accepts optional `messageThreadId`, taken from the authorized
+incoming message's `message_thread_id`. New messages, typing, supported drafts,
+and durable receipt targets retain it; omission preserves existing private-chat
+requests. Invalid non-positive IDs are rejected before delivery admission.
+`get_relay_capabilities` advertises `telegramMessageThreadVersion: 1`. Before
+submitting a topic target, the platform requires this capability so an older
+codeg cannot ignore the field and send to the main group instead.
+Telegram's [`sendMessageDraft`](https://core.telegram.org/bots/api#sendmessagedraft)
+only supports private chats. The relay skips drafts for negative group/channel
+[Bot API IDs](https://core.telegram.org/api/bots/ids); group loading uses native
+typing, then the existing streamed message edits and tool status on that message.
+It does not create a separate status-only message. Private chats, including their
+topics, retain draft loading. A channel's unsupported typing action remains
+best effort and does not fail message delivery.
 
 The relay uses the existing Telegram typing/draft and Slack loading/streaming implementation. Thinking records remain excluded from visible response text.
 Legacy Slack `thread_message` may suppress `[[MYCLAW_NO_REPLY]]` without exposing a partial sentinel.

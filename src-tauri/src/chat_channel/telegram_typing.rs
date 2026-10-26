@@ -76,6 +76,7 @@ async fn forward(
 async fn heartbeat(
     api: Arc<dyn TgApi>,
     chat_id: i64,
+    message_thread_id: Option<i64>,
     stopped: oneshot::Receiver<()>,
     mut refresh: mpsc::Receiver<()>,
 ) {
@@ -85,14 +86,10 @@ async fn heartbeat(
             // next attempt; it must not cause a second immediate request.
             while refresh.try_recv().is_ok() {}
             let started = Instant::now();
-            let result = tokio::time::timeout(
-                REQUEST_TIMEOUT,
-                api.call(
-                    "sendChatAction",
-                    serde_json::json!({"chat_id": chat_id, "action": "typing"}),
-                ),
-            )
-            .await;
+            let mut body = super::turn_relay::telegram_target(chat_id, message_thread_id);
+            body["action"] = "typing".into();
+            let result =
+                tokio::time::timeout(REQUEST_TIMEOUT, api.call("sendChatAction", body)).await;
             match result {
                 Ok(Err(TgError::RetryAfter(seconds))) => {
                     // Message notifications must not bypass Telegram's 429.
@@ -129,6 +126,7 @@ pub(super) async fn run(
 ) -> TurnReport {
     let api = Arc::clone(&turn.api);
     let chat_id = turn.chat_id;
+    let message_thread_id = turn.message_thread_id;
     let (refresh_tx, refresh_rx) = mpsc::channel(1);
     turn.api = Arc::new(RefreshAfterMessage {
         inner: Arc::clone(&api),
@@ -140,7 +138,7 @@ pub(super) async fn run(
         tokio::join!(
             biased;
             forward(input, forward_tx, stop_tx),
-            heartbeat(api, chat_id, stop_rx, refresh_rx),
+            heartbeat(api, chat_id, message_thread_id, stop_rx, refresh_rx),
         );
     };
     let delivery = turn.run_delivery(forward_rx);

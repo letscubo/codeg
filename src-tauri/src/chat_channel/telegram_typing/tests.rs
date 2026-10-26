@@ -163,11 +163,20 @@ fn error(terminal: bool) -> RelayInput {
 }
 
 fn start(api: Arc<MockTelegram>) -> (mpsc::UnboundedSender<RelayInput>, JoinHandle<TurnReport>) {
+    start_at(api, 12345, None)
+}
+
+fn start_at(
+    api: Arc<MockTelegram>,
+    chat_id: i64,
+    message_thread_id: Option<i64>,
+) -> (mpsc::UnboundedSender<RelayInput>, JoinHandle<TurnReport>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(
         TelegramTurn {
             api,
-            chat_id: -10012345,
+            chat_id,
+            message_thread_id,
             draft_base: 77,
             texts: RelayTexts::default(),
         }
@@ -194,10 +203,7 @@ async fn typing_starts_and_renews_while_draft_loading_remains() {
     settle().await;
     let first = api.calls("sendChatAction");
     assert_eq!(first.len(), 1);
-    assert_eq!(
-        first[0].body,
-        json!({"chat_id": -10012345, "action": "typing"})
-    );
+    assert_eq!(first[0].body, json!({"chat_id": 12345, "action": "typing"}));
     assert_eq!(
         api.calls("sendMessageDraft")[0].body["text"],
         RelayTexts::default().thinking
@@ -213,6 +219,77 @@ async fn typing_starts_and_renews_while_draft_loading_remains() {
     let count = api.calls("sendChatAction").len();
     advance(HEARTBEAT * 3).await;
     assert_eq!(api.calls("sendChatAction").len(), count);
+}
+
+#[tokio::test(start_paused = true)]
+async fn private_topic_is_retained_on_typing_loading_and_message_delivery() {
+    let api = Arc::new(MockTelegram::default());
+    let (tx, task) = start_at(api.clone(), 12345, Some(42));
+    settle().await;
+    advance(HEARTBEAT).await;
+    tx.send(delta("topic reply")).unwrap();
+    settle().await;
+    advance(MIN_REFRESH_INTERVAL).await;
+    tx.send(complete("end_turn")).unwrap();
+    assert!(!task.await.unwrap().delivery_failed);
+    for method in ["sendChatAction", "sendMessageDraft", "sendMessage"] {
+        let calls = api.calls(method);
+        assert!(!calls.is_empty(), "{method}");
+        for call in calls {
+            assert_eq!(call.body["chat_id"], 12345);
+            assert_eq!(call.body["message_thread_id"], 42);
+        }
+    }
+    let count = api.calls("sendChatAction").len();
+    advance(HEARTBEAT * 3).await;
+    assert_eq!(api.calls("sendChatAction").len(), count);
+}
+
+#[tokio::test(start_paused = true)]
+async fn group_typing_and_streaming_skip_private_drafts_and_keep_topic() {
+    for topic in [None, Some(42)] {
+        let api = Arc::new(MockTelegram::default());
+        let (tx, task) = start_at(api.clone(), -10012345, topic);
+        settle().await;
+        advance(HEARTBEAT).await;
+        advance(HEARTBEAT).await;
+        assert_eq!(api.calls("sendChatAction").len(), 3);
+        assert!(api.calls("sendMessageDraft").is_empty());
+        assert!(
+            api.calls("sendMessage").is_empty(),
+            "loading adds no history message"
+        );
+
+        tx.send(delta("first")).unwrap();
+        settle().await;
+        advance(MIN_REFRESH_INTERVAL).await;
+        assert_eq!(api.calls("sendMessage")[0].body["text"], "first");
+        tx.send(delta(" second")).unwrap();
+        settle().await;
+        advance(MIN_REFRESH_INTERVAL).await;
+        assert_eq!(
+            api.calls("editMessageText").last().unwrap().body["text"],
+            "first second"
+        );
+        tx.send(complete("end_turn")).unwrap();
+        let report = task.await.unwrap();
+        assert_eq!(report.outcome, Outcome::Completed);
+        assert!(!report.delivery_failed);
+        assert_eq!(api.calls("sendMessage").len(), 1);
+        assert!(api.calls("sendMessageDraft").is_empty());
+        for method in ["sendChatAction", "sendMessage"] {
+            for call in api.calls(method) {
+                assert_eq!(call.body["chat_id"], -10012345);
+                assert_eq!(
+                    call.body.get("message_thread_id").and_then(Value::as_i64),
+                    topic
+                );
+            }
+        }
+        let count = api.calls("sendChatAction").len();
+        advance(HEARTBEAT * 3).await;
+        assert_eq!(api.calls("sendChatAction").len(), count);
+    }
 }
 
 #[tokio::test(start_paused = true)]

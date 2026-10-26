@@ -66,8 +66,9 @@ pub struct ParsedCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
 }
-/// Only an entire command message is recognized. A sentence mentioning /model
-/// remains ordinary conversation. Keep the grammar aligned with MyClaw adapters.
+/// Only an entire command message is recognized. `!model` is the portable text
+/// form; `/model` and Telegram recipients remain compatible. A sentence mentioning
+/// either form remains conversation. Keep the grammar aligned with MyClaw adapters.
 pub fn parse_command(input: &Input) -> Option<ParsedCommand> {
     match input {
         Input::Command {
@@ -1241,12 +1242,25 @@ mod tests {
     use super::*;
     #[test]
     fn exact_commands_only() {
-        for text in ["/model", "/MODEL@My_Bot provider/model", " !model list 2 "] {
+        for text in [
+            "/model",
+            "/MODEL@My_Bot provider/model",
+            "!model",
+            "!MODEL provider/model",
+            " !model list 2 ",
+        ] {
             assert!(parse_command(&Input::Text { text: text.into() }).is_some());
         }
         for text in [
             "我想知道可不可以切换模型，比如/model命令",
             "What is /model?",
+            "我想知道能否用 !model 切换模型",
+            "Explain\n!model provider/model",
+            "`!model`",
+            "!models",
+            "!model.json",
+            "!model@My_Bot",
+            "!new",
             "`/model`",
             "/models",
             "/new",
@@ -1283,6 +1297,38 @@ mod tests {
                 text: "/model@My_Bot a/b".into()
             })
         );
+    }
+    #[test]
+    fn portable_text_and_compatible_inputs_have_the_same_command() {
+        let expected = ParsedCommand {
+            name: "model",
+            arguments: "provider/model".into(),
+            recipient: None,
+        };
+        for text in ["!model provider/model", "/model provider/model"] {
+            assert_eq!(
+                parse_command(&Input::Text { text: text.into() }),
+                Some(expected.clone()),
+            );
+        }
+        for name in ["model", "!model", "/model"] {
+            assert_eq!(
+                parse_command(&Input::Command {
+                    name: name.into(),
+                    arguments: " provider/model ".into(),
+                    recipient: None,
+                }),
+                Some(expected.clone()),
+            );
+        }
+        for name in ["models", "!models", "/new", "model provider/model"] {
+            assert!(parse_command(&Input::Command {
+                name: name.into(),
+                arguments: String::new(),
+                recipient: None,
+            })
+            .is_none());
+        }
     }
     #[test]
     fn completion_context_cannot_store_credentials() {
