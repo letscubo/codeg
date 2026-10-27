@@ -91,6 +91,9 @@ pub async fn execute(
         }
         | OutboundSpec::Slack {
             delivery_version, ..
+        }
+        | OutboundSpec::WhatsappAgent {
+            delivery_version, ..
         } => *delivery_version,
     };
     if version < 2 {

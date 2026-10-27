@@ -1,4 +1,4 @@
-//! Per-turn Telegram and Slack delivery. Tokens live only in worker memory.
+//! Per-turn Telegram, Slack and WhatsApp Agent Platform delivery. Tokens live only in worker memory.
 //! `relay_turn_id` is a delivery claim, never a success acknowledgement. V2
 //! consumers wait for the durable `relay_result` after the worker stops writing.
 //! Unknown non-idempotent writes are never blindly replayed.
@@ -86,6 +86,25 @@ pub enum OutboundSpec {
         #[serde(default)]
         texts: RelayTexts,
     },
+    #[serde(rename = "whatsapp_agent", rename_all = "camelCase")]
+    WhatsappAgent {
+        turn_id: String,
+        delivery_version: u8,
+        #[serde(default)]
+        result_format: ResultFormat,
+        #[serde(default)]
+        result_webhook_url: Option<String>,
+        #[serde(default)]
+        result_callback_target_id: Option<String>,
+        #[serde(flatten)]
+        presentation: super::relay_input::Presentation,
+        api_token: String,
+        agent_id: String,
+        recipient: String,
+        inbound_message_id: String,
+        #[serde(default)]
+        texts: RelayTexts,
+    },
 }
 
 impl std::fmt::Debug for OutboundSpec {
@@ -111,6 +130,14 @@ impl std::fmt::Debug for OutboundSpec {
                 .field("thread_ts", thread_ts)
                 .field("bot_token", &"<redacted>")
                 .finish(),
+            OutboundSpec::WhatsappAgent {
+                turn_id, agent_id, ..
+            } => f
+                .debug_struct("WhatsappAgent")
+                .field("turn_id", turn_id)
+                .field("agent_id", agent_id)
+                .field("api_token", &"<redacted>")
+                .finish(),
         }
     }
 }
@@ -118,7 +145,9 @@ impl std::fmt::Debug for OutboundSpec {
 impl OutboundSpec {
     pub fn turn_id(&self) -> &str {
         match self {
-            OutboundSpec::Telegram { turn_id, .. } | OutboundSpec::Slack { turn_id, .. } => turn_id,
+            OutboundSpec::Telegram { turn_id, .. }
+            | OutboundSpec::Slack { turn_id, .. }
+            | OutboundSpec::WhatsappAgent { turn_id, .. } => turn_id,
         }
     }
 }
@@ -302,6 +331,8 @@ pub(crate) struct DeliverySegment {
     pub message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<String>,
     pub delivered: bool,
     #[serde(skip)]
     pub unknown: bool,
@@ -314,6 +345,7 @@ impl DeliverySegment {
             text,
             message_id: None,
             message_ts: None,
+            message_key: None,
             delivered: false,
             unknown: false,
         }
@@ -830,6 +862,9 @@ pub async fn register_external(
         }
         | OutboundSpec::Slack {
             delivery_version, ..
+        }
+        | OutboundSpec::WhatsappAgent {
+            delivery_version, ..
         } => *delivery_version,
     };
     if version < 2 {
@@ -913,6 +948,34 @@ async fn register_with_state(
                 *result_format,
             )
         }
+        OutboundSpec::WhatsappAgent {
+            delivery_version,
+            agent_id,
+            recipient,
+            api_token,
+            inbound_message_id,
+            result_webhook_url,
+            result_format,
+            ..
+        } => {
+            if *delivery_version != 2
+                || !super::whatsapp_agent_relay::valid_target(
+                    agent_id,
+                    recipient,
+                    inbound_message_id,
+                    api_token,
+                )
+            {
+                return Err("invalid_whatsapp_agent_relay_target".into());
+            }
+            (
+                *delivery_version,
+                "whatsapp_agent",
+                serde_json::json!({"agent_id":agent_id,"recipient":recipient}),
+                result_webhook_url.as_deref(),
+                *result_format,
+            )
+        }
     };
     let callback_target_id = match &spec {
         OutboundSpec::Telegram {
@@ -927,6 +990,16 @@ async fn register_with_state(
                 return Err("invalid_channel_callback_target".into());
             }
             super::channel_callback::endpoint(&state.db.conn, id, "slack").await?;
+            Some(id.clone())
+        }
+        OutboundSpec::WhatsappAgent {
+            result_callback_target_id: Some(id),
+            ..
+        } => {
+            if callback.is_some() {
+                return Err("invalid_channel_callback_target".into());
+            }
+            super::channel_callback::endpoint(&state.db.conn, id, "whatsapp_agent").await?;
             Some(id.clone())
         }
         _ => None,
@@ -1018,6 +1091,16 @@ fn register(
             "slack",
             serde_json::json!({"channel":channel,"thread_ts":thread_ts}),
         ),
+        OutboundSpec::WhatsappAgent {
+            delivery_version,
+            agent_id,
+            recipient,
+            ..
+        } => (
+            *delivery_version,
+            "whatsapp_agent",
+            serde_json::json!({"agent_id":agent_id,"recipient":recipient}),
+        ),
     };
     let (presentation, result_format) = match &spec {
         OutboundSpec::Telegram {
@@ -1029,10 +1112,19 @@ fn register(
             presentation,
             result_format,
             ..
+        }
+        | OutboundSpec::WhatsappAgent {
+            presentation,
+            result_format,
+            ..
         } => (presentation.clone(), *result_format),
     };
     let callback_target_id = match &spec {
         OutboundSpec::Slack {
+            result_callback_target_id,
+            ..
+        }
+        | OutboundSpec::WhatsappAgent {
             result_callback_target_id,
             ..
         } => result_callback_target_id.clone(),
@@ -1090,6 +1182,27 @@ fn register(
                 .run(rx)
                 .await
             }
+            OutboundSpec::WhatsappAgent {
+                api_token,
+                agent_id,
+                recipient,
+                inbound_message_id,
+                texts,
+                ..
+            } => {
+                super::whatsapp_agent_relay::WhatsappTurn {
+                    api: Arc::new(super::whatsapp_agent_relay::HttpWhatsapp {
+                        client: relay.client.clone(),
+                        token: api_token,
+                    }),
+                    agent_id,
+                    recipient,
+                    inbound_message_id,
+                    texts,
+                }
+                .run(rx)
+                .await
+            }
         };
         tracing::info!(
             "[TurnRelay] turn {tid} on {connection_id}: {:?} (delivery_failed={})",
@@ -1116,7 +1229,7 @@ fn register(
                 "conversation_id": conversation_id, "outcome": report.outcome,
                 "delivery_status": status,
                 "execution_status": if report.outcome == Outcome::Unknown { "unknown" } else { "terminal" },
-                "fallback_allowed": report.delivery_failed && !report.delivery_unknown && report.text_complete,
+                "fallback_allowed": kind != "whatsapp_agent" && report.delivery_failed && !report.delivery_unknown && report.text_complete,
                 "text_complete": report.text_complete, "final_text": report.final_text,
                 "segments": report.segments, "target": target,
                 "failure_code": if report.delivery_unknown { Some("write_outcome_unknown") } else if !report.text_complete { Some("incomplete_event_stream") } else if report.delivery_failed { Some("platform_write_failed") } else { None },

@@ -66,7 +66,7 @@ pub struct ParsedCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
 }
-/// Only an entire command message is recognized. `!model` is the portable text
+/// Only an entire command message is recognized. `\model` is the portable text
 /// form; `/model` and Telegram recipients remain compatible. A sentence mentioning
 /// either form remains conversation. Keep the grammar aligned with MyClaw adapters.
 pub fn parse_command(input: &Input) -> Option<ParsedCommand> {
@@ -78,7 +78,7 @@ pub fn parse_command(input: &Input) -> Option<ParsedCommand> {
         } => {
             let name = name
                 .strip_prefix('/')
-                .or_else(|| name.strip_prefix('!'))
+                .or_else(|| name.strip_prefix('\\'))
                 .unwrap_or(name);
             name.eq_ignore_ascii_case("model").then(|| ParsedCommand {
                 name: "model",
@@ -90,7 +90,7 @@ pub fn parse_command(input: &Input) -> Option<ParsedCommand> {
             static RE: OnceLock<regex::Regex> = OnceLock::new();
             let re = RE.get_or_init(|| {
                 regex::Regex::new(
-                    r"(?is)^\s*(?:/model(?:@([A-Za-z0-9_]+))?|!model)(?:\s+([\s\S]*))?\s*$",
+                    r"(?is)^\s*(?:/model(?:@([A-Za-z0-9_]+))?|\\model)(?:\s+([\s\S]*))?\s*$",
                 )
                 .unwrap()
             });
@@ -1245,21 +1245,26 @@ mod tests {
         for text in [
             "/model",
             "/MODEL@My_Bot provider/model",
-            "!model",
-            "!MODEL provider/model",
-            " !model list 2 ",
+            r"\model",
+            r"\MODEL provider/model",
+            r" \model list 2 ",
         ] {
             assert!(parse_command(&Input::Text { text: text.into() }).is_some());
         }
         for text in [
             "我想知道可不可以切换模型，比如/model命令",
             "What is /model?",
-            "我想知道能否用 !model 切换模型",
-            "Explain\n!model provider/model",
-            "`!model`",
-            "!models",
-            "!model.json",
-            "!model@My_Bot",
+            r"我想知道能否用 \model 切换模型",
+            "Explain\n\\model provider/model",
+            r"`\model`",
+            "```\n\\model provider/model\n```",
+            r"\models",
+            r"\model.json",
+            r"\model@My_Bot",
+            r"\\model",
+            r"\new",
+            "!model",
+            "!model provider/model",
             "!new",
             "`/model`",
             "/models",
@@ -1283,6 +1288,16 @@ mod tests {
                 recipient: Some("my_bot".into())
             }
         );
+        assert_eq!(
+            parse_command(&Input::Text {
+                text: " \\model list 2 \n".into()
+            }),
+            Some(ParsedCommand {
+                name: "model",
+                arguments: "list 2".into(),
+                recipient: None,
+            })
+        );
     }
     #[test]
     fn native_and_text_have_same_command() {
@@ -1305,13 +1320,13 @@ mod tests {
             arguments: "provider/model".into(),
             recipient: None,
         };
-        for text in ["!model provider/model", "/model provider/model"] {
+        for text in [r"\model provider/model", "/model provider/model"] {
             assert_eq!(
                 parse_command(&Input::Text { text: text.into() }),
                 Some(expected.clone()),
             );
         }
-        for name in ["model", "!model", "/model"] {
+        for name in ["model", r"\model", r"\MODEL", "/model"] {
             assert_eq!(
                 parse_command(&Input::Command {
                     name: name.into(),
@@ -1321,7 +1336,16 @@ mod tests {
                 Some(expected.clone()),
             );
         }
-        for name in ["models", "!models", "/new", "model provider/model"] {
+        for name in [
+            "models",
+            r"\models",
+            r"\\model",
+            r"\model@My_Bot",
+            "!model",
+            "!models",
+            "/new",
+            "model provider/model",
+        ] {
             assert!(parse_command(&Input::Command {
                 name: name.into(),
                 arguments: String::new(),

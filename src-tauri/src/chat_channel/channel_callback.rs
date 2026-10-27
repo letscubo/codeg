@@ -62,7 +62,7 @@ pub async fn register(
     channel_type: &str,
     origin: &str,
 ) -> Result<String, String> {
-    if channel_type != "slack" {
+    if !matches!(channel_type, "slack" | "whatsapp_agent") {
         return Err(INVALID.into());
     }
     let origin = normalize_origin(origin)?;
@@ -96,8 +96,17 @@ pub(crate) async fn endpoint(
     id: &str,
     channel_type: &str,
 ) -> Result<PlatformEndpoint, String> {
-    if channel_type != "slack"
-        || id.len() != 64
+    if !matches!(channel_type, "slack" | "whatsapp_agent") {
+        return Err(INVALID.into());
+    }
+    endpoint_for_target(db, id, Some(channel_type)).await
+}
+async fn endpoint_for_target(
+    db: &DatabaseConnection,
+    id: &str,
+    expected_channel: Option<&str>,
+) -> Result<PlatformEndpoint, String> {
+    if id.len() != 64
         || !id
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -110,7 +119,8 @@ pub(crate) async fn endpoint(
         .ok_or(INVALID)?;
     let target: Target = serde_json::from_str(&stored).map_err(|_| INVALID)?;
     let current = platform(db).await?;
-    if target.channel_type != channel_type
+    if !matches!(target.channel_type.as_str(), "slack" | "whatsapp_agent")
+        || expected_channel.is_some_and(|channel| target.channel_type != channel)
         || target.vm_id != current.vm_id
         || target_id(&target) != id
         || normalize_origin(&target.origin)? != target.origin
@@ -139,7 +149,7 @@ pub(crate) async fn post_signed(
     }
 }
 pub(crate) async fn result_url(db: &DatabaseConnection, id: &str) -> Result<String, String> {
-    let ep = endpoint(db, id, "slack").await?;
+    let ep = endpoint_for_target(db, id, None).await?;
     let mut url =
         reqwest::Url::parse(&format!("{}/api/codeg/events", ep.base)).map_err(|_| INVALID)?;
     url.query_pairs_mut()
@@ -186,21 +196,46 @@ pub(crate) async fn pin_prompt(
         Some(super::turn_relay::OutboundSpec::Slack {
             result_callback_target_id,
             ..
+        })
+        | Some(super::turn_relay::OutboundSpec::WhatsappAgent {
+            result_callback_target_id,
+            ..
         }) => result_callback_target_id.as_deref(),
         _ => None,
     });
     if let Some(id) = target_id {
-        endpoint(&state.db.conn, id, "slack").await?;
+        match outbound {
+            Some(super::turn_relay::OutboundSpec::WhatsappAgent { .. }) => {
+                endpoint(&state.db.conn, id, "whatsapp_agent").await?;
+            }
+            Some(_) => {
+                endpoint(&state.db.conn, id, "slack").await?;
+            }
+            None => {
+                endpoint_for_target(&state.db.conn, id, None).await?;
+            }
+        }
         match outbound {
             Some(super::turn_relay::OutboundSpec::Telegram { .. }) => return Err(INVALID.into()),
             Some(super::turn_relay::OutboundSpec::Slack {
                 result_webhook_url: Some(_),
                 ..
+            })
+            | Some(super::turn_relay::OutboundSpec::WhatsappAgent {
+                result_webhook_url: Some(_),
+                ..
             }) => return Err(INVALID.into()),
             Some(super::turn_relay::OutboundSpec::Slack {
                 delivery_version, ..
+            })
+            | Some(super::turn_relay::OutboundSpec::WhatsappAgent {
+                delivery_version, ..
             }) if *delivery_version < 2 => return Err(INVALID.into()),
             Some(super::turn_relay::OutboundSpec::Slack {
+                result_callback_target_id: Some(result_id),
+                ..
+            })
+            | Some(super::turn_relay::OutboundSpec::WhatsappAgent {
                 result_callback_target_id: Some(result_id),
                 ..
             }) if result_id != id => return Err(INVALID.into()),
@@ -454,6 +489,39 @@ mod tests {
             assert!(normalize_origin(input).is_err(), "{input}");
         }
     }
+    #[tokio::test]
+    async fn whatsapp_callback_is_independent_and_cannot_use_a_slack_binding() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        hooks(&db.conn, "https://telegram.example", "vm-a", "secret-a").await;
+        let wa = register(&db.conn, "whatsapp_agent", "https://wa.example")
+            .await
+            .unwrap();
+        let slack = register(&db.conn, "slack", "https://slack.example")
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint(&db.conn, &wa, "whatsapp_agent")
+                .await
+                .unwrap()
+                .base,
+            "https://wa.example"
+        );
+        assert!(endpoint(&db.conn, &wa, "slack").await.is_err());
+        assert!(endpoint(&db.conn, &slack, "whatsapp_agent").await.is_err());
+        assert!(result_url(&db.conn, &wa)
+            .await
+            .unwrap()
+            .starts_with("https://wa.example/api/codeg/events?"));
+        assert!(result_url(&db.conn, &slack)
+            .await
+            .unwrap()
+            .starts_with("https://slack.example/api/codeg/events?"));
+        assert_eq!(
+            platform(&db.conn).await.unwrap().base,
+            "https://telegram.example"
+        );
+    }
+
     #[tokio::test]
     async fn registered_targets_are_immutable_scoped_and_do_not_change_global_hooks() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;

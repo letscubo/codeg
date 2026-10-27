@@ -214,7 +214,7 @@ async fn portable_model_is_ordered_between_prompts_for_managed_and_retained_sess
         engine
             .submit(
                 state.clone(),
-                make_request("model", "!model provider/model"),
+                make_request("model", r"\model provider/model"),
             )
             .await
             .unwrap();

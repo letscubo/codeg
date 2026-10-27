@@ -13,7 +13,7 @@ POST /api/channel_submit
   "requestId": "durable-platform-job-id",
   "sessionRef": "stable-platform-conversation-scope",
   "source": { "channelType": "telegram", "accountId": "account-id" },
-  "input": { "kind": "text", "text": "!model provider/model" },
+  "input": { "kind": "text", "text": "\\model provider/model" },
   "context": {
     "entry": "managed",
     "jobId": "durable-platform-job-id",
@@ -23,13 +23,13 @@ POST /api/channel_submit
 }
 ```
 
-`!model` is the portable ordinary-text command: `!model`, `!model list 2`, or
-`!model provider/model`. It does not require platform-native slash-command registration.
-Existing `/model`, Telegram `/model@Bot`, and normalized native commands remain compatible.
+`\model` is the portable ordinary-text command: `\model`, `\model list 2`, or
+`\model provider/model`. It does not require platform-native slash-command registration.
+The former `!model` syntax is ordinary conversation. Existing `/model`, Telegram `/model@Bot`, and normalized native commands remain compatible.
 Native commands use `input: { "kind": "command", "name": "model", "arguments": "provider/model" }`.
 Text commands must occupy the whole command input. A normal sentence mentioning
-`!model` or `/model` stays a prompt; codeg does not ask an agent to infer intent.
-Only the `model` command is implemented; `!new` and `/new` are not intercepted.
+`\model` or `/model` stays a prompt; codeg does not ask an agent to infer intent.
+Only the `model` command is implemented; `\new` and `/new` are not intercepted.
 
 Channel adapters authorize the sender, target App/Agent, and exact conversation
 before submission. They remove only a verified mention of the target bot before
@@ -114,3 +114,58 @@ Legacy Slack `thread_message` may suppress `[[MYCLAW_NO_REPLY]]` without exposin
 - The activity API includes queued/unknown operations. MyClaw applies instance sleep/wake policy only to `kind=all`; retained Hermes/OpenClaw are not enrolled in that lifecycle.
 
 See MyClaw `docs/channels-resident-codeg.md` for authenticated prepare/activate/adopt endpoints and deployment acceptance steps.
+
+## WhatsApp Agent Platform (new managed instances)
+
+`get_relay_capabilities` advertises `whatsappAgentPlatformVersion: 1`,
+`whatsappIncrementalMessages: true`, and the `whatsapp_agent` kind. This is
+incremental delivery as **separate messages**, not an editable native stream:
+the official Agent Platform v1 has no message-edit, draft, or streaming endpoint.
+
+The platform binds an individual MyClaw Agent to the numeric `entry.id` verified
+by the official updates API. It retains the exact `user:...` sender and inbound
+`wamid...` message ID. After durable enqueue and instance wake-up, ordinary text
+and `\model` use the existing `channel_submit` queue and exact session binding.
+`source.channelType` and `register_channel_callback.channelType` are both
+`whatsapp_agent`; its private callback origin does not replace Telegram or Slack.
+
+The prompt/command reply outbound contract is:
+
+```json
+{
+  "kind": "whatsapp_agent",
+  "turnId": "durable-platform-turn-id",
+  "deliveryVersion": 2,
+  "resultFormat": "compact-v1",
+  "resultCallbackTargetId": "registered-channel-target-id",
+  "apiToken": "opaque-agent-api-key",
+  "agentId": "123456789",
+  "recipient": "user:987654321",
+  "inboundMessageId": "wamid.inbound"
+}
+```
+
+Tokens exist only in the HTTP worker's memory. Receipts use `relay_kind` =
+`whatsapp_agent`, target `{ "agent_id": "123456789", "recipient": "user:987654321" }`,
+and opaque `segments[].message_key` IDs. Compact receipts retain one final body.
+
+Native typing refreshes about every 20 seconds while processing. Each message
+clears typing; it is refreshed while generation or normal final delivery continues.
+Normal completion stops refreshing after the last queued chunk. Failed,
+cancel-pending, cancelled and uncertain turns stop refreshing immediately. There is no stop-typing
+API: a final reply clears it, or it expires within the documented 25 seconds.
+Only main assistant text is delivered; reasoning and tool output are excluded.
+Completed paragraphs/sentences are coalesced, with a conservative 3800 UTF-16
+unit ceiling per message. Partial unpunctuated text waits for the size bound or
+terminal flush. Both API endpoint quotas are independently limited per Agent;
+sends are serialized with at least six seconds between attempts.
+
+Only explicit 429 and 503/error.code 131016 non-acceptance can retry, with bounded
+backoff. Network loss, unreadable success bodies, and other server failures are
+unknown delivery outcomes and never replay automatically. All WhatsApp relay
+receipts set `fallback_allowed: false`; platform reconciliation must not send the
+whole answer again after partial delivery. Existing durable turn-ID admission
+and restart-unknown behavior apply unchanged.
+
+API reference: https://www.whatsapp.com/developer/WhatsApp-Agent-Platform-Developer-Manual.pdf
+(version 1, 25 August 2026; request/response, retry, typing and rate-limit sections).
