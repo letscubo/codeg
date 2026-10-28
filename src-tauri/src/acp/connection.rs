@@ -2520,6 +2520,29 @@ pub async fn spawn_agent_connection(
     let deepseek_mcp_store = (agent_type == AgentType::DeepSeek)
         .then(|| crate::commands::mcp::deepseek_mcp_json_path_for_launch(&runtime_env));
 
+    // Hermes: a session this launch's own `state.db` does not hold cannot be
+    // resumed, and 0.21.3 does not say so — it answers `session/resume` with
+    // success and the next prompt comes back an empty `refusal` (see
+    // `parsers::hermes::session_known_in_home`). Flagged here because it needs
+    // the launch's `HERMES_HOME` from `runtime_env`; `run_connection` then
+    // skips resume/load and opens a new session linked back to this one, so
+    // the turns already recorded keep rendering as the same conversation.
+    let session_absent = match session_id.as_deref() {
+        Some(sid) if agent_type == AgentType::Hermes => {
+            let home = crate::commands::acp::hermes_home_for_launch(&runtime_env);
+            let absent =
+                crate::parsers::hermes::session_known_in_home(&home, sid).await == Some(false);
+            if absent {
+                tracing::warn!(
+                    "[ACP][Hermes] session {sid} is not in {}/state.db; starting a new session instead of resuming",
+                    home.display()
+                );
+            }
+            absent
+        }
+        _ => false,
+    };
+
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
     // This makes `git fetch`/`git push` issued through the ACP
@@ -2613,6 +2636,7 @@ pub async fn spawn_agent_connection(
             fs_policy,
             host_tools,
             deepseek_mcp_store,
+            session_absent,
             stderr_tail,
         )
         .await;
@@ -5602,6 +5626,10 @@ async fn run_connection(
     // reason as `fs_policy`: it needs the full `runtime_env`. `None` unless
     // the agent is DeepSeek.
     deepseek_mcp_store: Option<PathBuf>,
+    // The agent is known not to hold `session_id` (Hermes only, see
+    // `spawn_agent_connection`): skip resume/load and go straight to the
+    // linked `session/new` fallback.
+    session_absent: bool,
     // Connection-scoped agent stderr buffer, shared with the `with_debug`
     // callback installed by `build_agent`. Read only when a turn ends without
     // agent output, to attach evidence to the synthesized error.
@@ -6230,7 +6258,7 @@ async fn run_connection(
                 // parser, not the ACP wire). On any non-terminal resume failure
                 // we fall through to the session/load block below, so the
                 // effective chain is resume → load → new.
-                if supports_resume {
+                if supports_resume && !session_absent {
                     let resume_req = build_resume_session_request(
                         agent_type,
                         SessionId::new(sid.clone()),
@@ -6393,7 +6421,9 @@ async fn run_connection(
                 // agents that advertise `loadSession: true` and then answer
                 // "Method not found" are real, so the whole error ladder below
                 // stays exactly as it was.
-                let attempted_load = init_resp.agent_capabilities.load_session;
+                // A session known to be absent skips load the same way: the
+                // agent would only report what codeg already knows.
+                let attempted_load = init_resp.agent_capabilities.load_session && !session_absent;
                 // Armed before the request so the replay that precedes the
                 // response is captured, not parked for the live stream.
                 let load_gate = attempted_load
@@ -6594,6 +6624,11 @@ async fn run_connection(
                         if attempted_load {
                             tracing::warn!(
                                 "[ACP] session/load failed ({err_str}), falling back to session/new"
+                            );
+                        } else if session_absent {
+                            tracing::info!(
+                                "[ACP] agent does not hold session {sid}; opening a new session \
+                                 and linking its history"
                             );
                         } else {
                             tracing::info!(

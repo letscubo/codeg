@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -51,8 +52,29 @@ impl HermesParser {
         Self { base_dir }
     }
 
-    fn sqlite_db_path(&self) -> PathBuf {
-        self.base_dir.join("state.db")
+    /// Every Hermes session DB this home holds, newest-owner first: one per
+    /// MyClaw identity under `profiles/<vmAgentId>/state.db` (sorted), then the
+    /// home's own `state.db`.
+    ///
+    /// MyClaw kind=all instances give each Hermes identity its own profile
+    /// (`~/.hermes/profiles/<vmAgentId>`, reached through the per-agent
+    /// `HERMES_HOME` symlink), so its history is in that profile's DB, not in
+    /// `~/.hermes/state.db`. The home's own DB still holds the sessions written
+    /// before that move. Only existing files are returned.
+    fn sqlite_db_paths(&self) -> Vec<PathBuf> {
+        let mut profile_dbs: Vec<PathBuf> = std::fs::read_dir(self.base_dir.join("profiles"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("state.db"))
+            .filter(|db| db.is_file())
+            .collect();
+        profile_dbs.sort();
+        let home_db = self.base_dir.join("state.db");
+        if home_db.is_file() {
+            profile_dbs.push(home_db);
+        }
+        profile_dbs
     }
 
     fn block_on<F, T>(&self, fut: F) -> Result<T, ParseError>
@@ -69,8 +91,7 @@ impl HermesParser {
     /// Open the Hermes state DB read-only. `mode=ro` reads committed WAL frames
     /// even while the Hermes ACP server is actively writing (verified against a
     /// live process), and guarantees codeg never mutates Hermes data.
-    async fn open_sqlite_connection(&self) -> Result<DatabaseConnection, ParseError> {
-        let db_path = self.sqlite_db_path();
+    async fn open_sqlite_connection(db_path: &Path) -> Result<DatabaseConnection, ParseError> {
         let db_url = format!(
             "sqlite:{}?mode=ro",
             urlencoding::encode(&db_path.to_string_lossy())
@@ -93,8 +114,11 @@ impl HermesParser {
         Ok(conn)
     }
 
-    async fn list_conversations_from_sqlite(&self) -> Result<Vec<ConversationSummary>, ParseError> {
-        let conn = self.open_sqlite_connection().await?;
+    async fn list_conversations_from_sqlite(
+        &self,
+        db_path: &Path,
+    ) -> Result<Vec<ConversationSummary>, ParseError> {
+        let conn = Self::open_sqlite_connection(db_path).await?;
 
         let rows = conn
             .query_all(Statement::from_string(
@@ -185,9 +209,10 @@ impl HermesParser {
 
     async fn get_conversation_from_sqlite(
         &self,
+        db_path: &Path,
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
-        let conn = self.open_sqlite_connection().await?;
+        let conn = Self::open_sqlite_connection(db_path).await?;
         let summary = self
             .sqlite_summary_by_id(&conn, conversation_id)
             .await?
@@ -402,22 +427,92 @@ impl HermesParser {
     }
 }
 
+impl HermesParser {
+    /// The DB holding the most complete copy of `conversation_id`.
+    ///
+    /// A session can sit in several DBs: when MyClaw moves identities into
+    /// profiles it gives each one a copy of the old shared DB, and only the
+    /// identity that owns the session keeps writing to its copy. Turns are only
+    /// ever appended, so the copy with the most messages is the live one. A DB
+    /// that fails to open is skipped rather than failing the lookup.
+    async fn db_for_conversation(
+        &self,
+        dbs: &[PathBuf],
+        conversation_id: &str,
+    ) -> Option<PathBuf> {
+        let mut best: Option<(u32, &PathBuf)> = None;
+        for db in dbs {
+            let Ok(conn) = Self::open_sqlite_connection(db).await else {
+                continue;
+            };
+            if let Ok(Some(summary)) = self.sqlite_summary_by_id(&conn, conversation_id).await {
+                if best.is_none_or(|(count, _)| summary.message_count > count) {
+                    best = Some((summary.message_count, db));
+                }
+            }
+        }
+        best.map(|(_, db)| db.clone())
+    }
+}
+
 impl AgentParser for HermesParser {
     fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
-        if !self.sqlite_db_path().exists() {
+        let dbs = self.sqlite_db_paths();
+        if dbs.is_empty() {
             return Ok(Vec::new());
         }
-        self.block_on(self.list_conversations_from_sqlite())
+        self.block_on(async {
+            // Same session in several DBs (see `db_for_conversation`): keep the
+            // copy with the most messages.
+            let mut by_id: HashMap<String, ConversationSummary> = HashMap::new();
+            for db in &dbs {
+                for summary in self.list_conversations_from_sqlite(db).await? {
+                    match by_id.get(&summary.id) {
+                        Some(kept) if kept.message_count >= summary.message_count => {}
+                        _ => {
+                            by_id.insert(summary.id.clone(), summary);
+                        }
+                    }
+                }
+            }
+            let mut conversations: Vec<ConversationSummary> = by_id.into_values().collect();
+            conversations.sort_by_key(|c| std::cmp::Reverse(c.started_at));
+            Ok(conversations)
+        })
     }
 
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
-        if !self.sqlite_db_path().exists() {
-            return Err(ParseError::ConversationNotFound(
-                conversation_id.to_string(),
-            ));
-        }
-        self.block_on(self.get_conversation_from_sqlite(conversation_id))
+        let dbs = self.sqlite_db_paths();
+        self.block_on(async {
+            let db = self
+                .db_for_conversation(&dbs, conversation_id)
+                .await
+                .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
+            self.get_conversation_from_sqlite(&db, conversation_id).await
+        })
     }
+}
+
+/// Whether the Hermes launched with `hermes_home` can resume `session_id`:
+/// `Some(false)` only when that home's own `state.db` exists, opens, and has no
+/// such session. `None` when it cannot tell (no DB yet, open/query failed), so
+/// callers keep their existing behaviour.
+///
+/// Resuming a session the DB lacks fails silently on hermes 0.21.3: the
+/// adapter answers `session/resume` with success under a fresh session id, and
+/// the next `session/prompt` on the requested id comes back `stopReason:
+/// refusal` with no text — the user sees an empty reply.
+pub(crate) async fn session_known_in_home(hermes_home: &Path, session_id: &str) -> Option<bool> {
+    let db = hermes_home.join("state.db");
+    if !db.is_file() {
+        return None;
+    }
+    let parser = HermesParser {
+        base_dir: hermes_home.to_path_buf(),
+    };
+    let conn = HermesParser::open_sqlite_connection(&db).await.ok()?;
+    let summary = parser.sqlite_summary_by_id(&conn, session_id).await.ok()?;
+    Some(summary.is_some())
 }
 
 /// Hermes config/data directory. Mirrors `commands::acp::hermes_home_dir`
@@ -798,6 +893,92 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Hermes `state.db` holding `sessions` with `n` alternating user /
+    /// assistant messages each (same DDL as the `parsers_snapshot` fixture).
+    fn write_state_db(dir: &Path, sessions: &[(&str, usize)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, \
+             model_config TEXT, parent_session_id TEXT, started_at REAL, ended_at REAL, \
+             cwd TEXT, title TEXT, archived INTEGER DEFAULT 0, input_tokens INTEGER, \
+             output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, \
+             role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, \
+             reasoning TEXT, reasoning_content TEXT, timestamp REAL, finish_reason TEXT, \
+             active INTEGER DEFAULT 1);",
+        )
+        .unwrap();
+        for (i, (id, n)) in sessions.iter().enumerate() {
+            let t0 = 1_780_000_000.0 + (i as f64) * 100.0;
+            conn.execute(
+                "INSERT INTO sessions (id, source, model, model_config, started_at, cwd, title) \
+                 VALUES (?1, 'acp', 'claude-opus-5', '', ?2, '/work', ?1)",
+                rusqlite::params![id, t0],
+            )
+            .unwrap();
+            for m in 0..*n {
+                let role = if m % 2 == 0 { "user" } else { "assistant" };
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp, active) \
+                     VALUES (?1, ?2, ?3, ?4, 1)",
+                    rusqlite::params![id, role, format!("{role} {m}"), t0 + m as f64],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// MyClaw kind=all layout after identities move into profiles: the home DB
+    /// keeps the pre-move sessions, and every profile got a copy of it. The
+    /// owner (profile `a`) kept writing to `shared-1`; profile `b`'s copy is stale.
+    fn profiles_fixture() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_state_db(home, &[("shared-1", 2), ("old-only", 2)]);
+        write_state_db(&home.join("profiles/a"), &[("shared-1", 4), ("new-a", 2)]);
+        write_state_db(&home.join("profiles/b"), &[("shared-1", 2)]);
+        temp
+    }
+
+    #[test]
+    fn get_conversation_reads_the_most_complete_copy_across_profiles() {
+        let temp = profiles_fixture();
+        let parser = HermesParser::with_base_dir(temp.path().to_path_buf());
+        assert_eq!(parser.get_conversation("shared-1").unwrap().summary.message_count, 4);
+        assert_eq!(parser.get_conversation("new-a").unwrap().summary.message_count, 2);
+        assert_eq!(parser.get_conversation("old-only").unwrap().summary.message_count, 2);
+        assert!(matches!(
+            parser.get_conversation("missing"),
+            Err(ParseError::ConversationNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn list_conversations_spans_profiles_once_per_session() {
+        let temp = profiles_fixture();
+        let parser = HermesParser::with_base_dir(temp.path().to_path_buf());
+        let list = parser.list_conversations().unwrap();
+        let mut ids: Vec<(&str, u32)> =
+            list.iter().map(|c| (c.id.as_str(), c.message_count)).collect();
+        ids.sort();
+        assert_eq!(ids, vec![("new-a", 2), ("old-only", 2), ("shared-1", 4)]);
+    }
+
+    #[test]
+    fn session_known_in_home_reads_only_that_home() {
+        let temp = profiles_fixture();
+        let profile_a = temp.path().join("profiles/a");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            assert_eq!(session_known_in_home(&profile_a, "new-a").await, Some(true));
+            // In the home DB but not in this profile's: resuming it here would fail.
+            assert_eq!(session_known_in_home(&profile_a, "old-only").await, Some(false));
+            // No DB yet (identity never ran): cannot tell, keep the old behaviour.
+            assert_eq!(session_known_in_home(&temp.path().join("profiles/c"), "x").await, None);
+        });
+    }
 
     #[test]
     fn resolve_hermes_home_matches_acp_semantics() {

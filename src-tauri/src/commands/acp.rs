@@ -456,7 +456,22 @@ async fn prewarm_uvx_agent(
     Ok(())
 }
 
+/// Commands whose npm-global copy outranks `PATH`.
+///
+/// `hermes`: Hermes' own package manager (`hermes pm install`, `hermes update`)
+/// writes `hermes` / `hermes-acp` launchers into `~/.local/bin`, which sits
+/// ahead of the npm prefix on `PATH`. Once there they silently replace the
+/// copy MyClaw pins in the image — measured on C9 2026-10-27: after a
+/// `pm install` the launcher pointed at a different 0.22.5 checkout. The
+/// npm-global install is the version the image and `registry.rs` agree on.
+const NPM_PREFIX_FIRST: &[&str] = &["hermes"];
+
 pub(crate) async fn resolve_npx_command(cmd: &str) -> Option<PathBuf> {
+    if NPM_PREFIX_FIRST.contains(&cmd) {
+        if let Some(path) = resolve_npx_command_from_current_npm_prefix(cmd).await {
+            return Some(path);
+        }
+    }
     if let Some(path) = resolve_command_on_path(cmd) {
         return Some(path);
     }
@@ -475,21 +490,29 @@ impl NpxCommandResolver {
             return cached.clone();
         }
 
-        let resolved = if let Some(path) = resolve_command_on_path(cmd) {
-            Some(path)
+        let from_prefix = if NPM_PREFIX_FIRST.contains(&cmd) {
+            self.npm_prefix_path(cmd).await
         } else {
-            let prefix = if let Some(prefix) = &self.request_npm_prefix {
-                prefix.clone()
-            } else {
-                let resolved_prefix = cached_npm_global_prefix().await;
-                self.request_npm_prefix = Some(resolved_prefix.clone());
-                resolved_prefix
-            };
-            prefix.and_then(|p| resolve_npx_command_from_npm_prefix(cmd, &p))
+            None
+        };
+        let resolved = match from_prefix.or_else(|| resolve_command_on_path(cmd)) {
+            Some(path) => Some(path),
+            None => self.npm_prefix_path(cmd).await,
         };
 
         self.per_cmd_cache.insert(cmd.to_string(), resolved.clone());
         resolved
+    }
+
+    async fn npm_prefix_path(&mut self, cmd: &str) -> Option<PathBuf> {
+        let prefix = if let Some(prefix) = &self.request_npm_prefix {
+            prefix.clone()
+        } else {
+            let resolved_prefix = cached_npm_global_prefix().await;
+            self.request_npm_prefix = Some(resolved_prefix.clone());
+            resolved_prefix
+        };
+        prefix.and_then(|p| resolve_npx_command_from_npm_prefix(cmd, &p))
     }
 }
 
@@ -8264,7 +8287,7 @@ fn plan_hermes_base_url_reconcile(
 /// back to the default `~/.hermes` (it does NOT re-inherit the parent). With no
 /// override the child inherits the parent env, so defer to `hermes_home_dir()`
 /// (codeg's existing resolution, shared with the settings panel).
-fn hermes_home_for_launch(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+pub(crate) fn hermes_home_for_launch(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     match runtime_env.get("HERMES_HOME") {
         Some(raw) => {
             let trimmed = raw.trim();
