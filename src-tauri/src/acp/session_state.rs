@@ -828,7 +828,14 @@ impl SessionState {
                     self.async_task_activity_at = None;
                 }
                 self.external_id = Some(session_id.clone());
-                self.status = ConnectionStatus::Connected;
+                // fork(letscubo): CLI 通道(claude / codex / dsh / pi 的 driver)新会话的第一轮是先发
+                // Prompting、跑起来才拿到会话 id 发 SessionStarted —— 这时一轮还在跑,不能退回
+                // Connected。退回去的话整个第一轮都不算「在跑」:ask_user_question 与平台的工具确认卡
+                // 找不到落点(确认卡因此被当成弹不了、工具照常执行,2026-10-28 A3 codex 实测)、
+                // 空闲回收会把它当闲置、activity 记成一轮已结束。一轮的结束由 TurnComplete 等收。
+                if self.status != ConnectionStatus::Prompting {
+                    self.status = ConnectionStatus::Connected;
+                }
                 // Fire the dedup waiter (if any). Take()-and-send is
                 // single-shot: a duplicate SessionStarted (replay, agent
                 // re-init) finds None here and is a no-op, which is
@@ -1033,11 +1040,13 @@ impl SessionState {
             AcpEvent::QuestionRequest {
                 question_id,
                 questions,
+                form,
             } => {
                 self.pending_question = Some(PendingQuestionState {
                     question_id: question_id.clone(),
                     questions: questions.clone(),
                     created_at: Utc::now(),
+                    form: form.clone(),
                 });
             }
             AcpEvent::QuestionResolved { question_id } => {
@@ -2519,6 +2528,34 @@ mod tests {
         });
         assert!(s.async_tasks.is_empty());
         assert!(!s.has_active_background_work(Utc::now()));
+    }
+
+    /// CLI 通道新会话的第一轮:先 Prompting,跑起来才拿到会话 id。SessionStarted 不能把还在跑的一轮
+    /// 打回 Connected(否则提问 / 工具确认卡整轮都找不到落点);连接刚建好时照常进 Connected。
+    #[test]
+    fn session_started_mid_turn_keeps_the_turn_running() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        });
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "thread-1".into(),
+        });
+        assert_eq!(s.status, ConnectionStatus::Prompting);
+        assert_eq!(s.external_id.as_deref(), Some("thread-1"));
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "thread-1".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+            duration_ms: None,
+        });
+        assert_eq!(s.status, ConnectionStatus::Connected);
+
+        let mut fresh = fresh_state();
+        fresh.apply_event(&AcpEvent::SessionStarted {
+            session_id: "s1".into(),
+        });
+        assert_eq!(fresh.status, ConnectionStatus::Connected);
     }
 
     #[test]

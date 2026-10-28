@@ -324,10 +324,18 @@ async fn translate(bridge: &Bridge, client: Client, auth: &str, model: &str, req
     let engine = TranslationEngine::default();
     let policy = TranslationPolicy::default();
     let stream = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut chat = match engine.translate_request(client.wire(), WireFormat::OpenAiChat, request, &policy) {
+    // 分两步(解码成中间形态 → 编成 Chat),留住中间形态的 extensions:codex 工具的 namespace 映射
+    // 记在那里,回程靠它把展平的工具名拆回去(见 ToolNames)。
+    let decoded = match engine.decode_request(client.wire(), request, &policy) {
+        Ok(out) => out,
+        Err(e) => return client.error(StatusCode::BAD_REQUEST, format!("cannot translate request: {e}")),
+    };
+    let extensions = decoded.request.extensions.clone();
+    let mut chat = match engine.encode_request(WireFormat::OpenAiChat, &decoded.request, &policy) {
         Ok(out) => {
-            if !out.diagnostics.is_empty() {
-                tracing::debug!("[llm-bridge] {model} 请求转换诊断 {} 条", out.diagnostics.len());
+            let count = decoded.diagnostics.len() + out.diagnostics.len();
+            if count > 0 {
+                tracing::debug!("[llm-bridge] {model} 请求转换诊断 {count} 条");
             }
             out.body
         }
@@ -364,22 +372,115 @@ async fn translate(bridge: &Bridge, client: Client, auth: &str, model: &str, req
         return client.error(status, message);
     }
     if stream {
-        return stream_back(up, engine, client);
+        return stream_back(up, engine, client, ToolNames::from_request(&extensions));
     }
     let mut body: Value = match up.json().await {
         Ok(v) => v,
         Err(e) => return client.error(StatusCode::BAD_GATEWAY, format!("invalid upstream response: {e}")),
     };
     normalize_gateway_usage(&mut body);
-    match engine.translate_response(WireFormat::OpenAiChat, client.wire(), &body, &policy) {
-        Ok(out) => (StatusCode::OK, [("content-type", "application/json")], out.body.to_string()).into_response(),
+    let encoded = engine
+        .decode_response(WireFormat::OpenAiChat, &body, &policy)
+        .and_then(|out| engine.encode_response_with_extensions(client.wire(), &out.response, &extensions, &policy));
+    match encoded {
+        Ok(mut out) => {
+            ToolNames::from_request(&extensions).restore(&mut out.body);
+            (StatusCode::OK, [("content-type", "application/json")], out.body.to_string()).into_response()
+        }
         Err(e) => client.error(StatusCode::BAD_GATEWAY, format!("cannot translate response: {e}")),
+    }
+}
+
+/// codex 工具的 namespace 还原(流式回程用)。
+///
+/// codex 把 MCP 服务器(`mcp__myclaw__`)、`multi_agent_v1` 这类工具编成 `namespace` 组,按「工具名 +
+/// namespace」分派:回来的调用必须是 `{"name": "scheduled_tasks", "namespace": "mcp__myclaw__"}`。
+/// 转成 Chat 时转换库把组展平成 `<namespace>__<工具>` 的普通函数,并把映射记在请求中间形态的
+/// extensions 里;逐事件的 `translate_event` 不会拆回去,库里做这件事的函数又不公开 —— 于是在这里
+/// 照库的规则补:精确名优先,其次去掉 `mcp__` 前缀的写法、只有一个组认领的裸工具名。
+///
+/// 另加一种库没有的写法:codex 的 MCP 组名自带结尾 `__`(`mcp__myclaw__`),展平后模型看到的是
+/// `mcp__myclaw____scheduled_tasks`(四个下划线),而模型几乎总是回 codex 自己显示用的
+/// `mcp__myclaw__scheduled_tasks`(codex `join_tool_name`:组名去掉结尾 `_`,工具名去掉开头 `_`,
+/// 中间一个 `__`;codeg 给模型的说明里也是这么写的)。所以非流式回程也走这里,不只靠库。
+///
+/// 不补的后果(2026-10-28 A3 实测):codex 选「均衡」(deepseek)等非 GPT 模型时,模型回
+/// `mcp__myclaw__scheduled_tasks`,codex 认不出,每个平台工具都回 `unsupported call`。
+#[derive(Default)]
+pub(crate) struct ToolNames(std::collections::HashMap<String, (String, String)>);
+
+/// 转换库存映射用的 extensions 键(`switchyard-translation` 0.3 `codex_namespaces::TOOL_NAMESPACES_KEY`,
+/// 该模块不公开)。库改名时 `codex_tool_namespaces_survive_the_stream` 会挂。
+const CODEX_TOOL_NAMESPACES_KEY: &str = "switchyard_codex_tool_namespaces";
+
+impl ToolNames {
+    pub(crate) fn from_request(extensions: &switchyard_translation::ProviderExtensions) -> Self {
+        let Some(map) = extensions.fields.get(CODEX_TOOL_NAMESPACES_KEY).and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let split: Vec<(&str, String, String)> = map
+            .iter()
+            .filter_map(|(qualified, v)| {
+                let namespace = v.as_str().or_else(|| v.get("namespace").and_then(Value::as_str))?;
+                let tool = qualified.strip_prefix(namespace)?.strip_prefix("__")?;
+                Some((qualified.as_str(), tool.to_string(), namespace.to_string()))
+            })
+            .collect();
+        let mut claims: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, tool, _) in &split {
+            *claims.entry(tool.as_str()).or_default() += 1;
+        }
+        let mut origins = std::collections::HashMap::new();
+        for (qualified, tool, namespace) in &split {
+            let origin = (tool.clone(), namespace.clone());
+            let displayed = format!("{}__{}", namespace.trim_end_matches('_'), tool.trim_start_matches('_'));
+            if !map.contains_key(&displayed) {
+                origins.entry(displayed).or_insert_with(|| origin.clone());
+            }
+            if let Some(stripped) = namespace.strip_prefix("mcp__") {
+                let spelling = format!("{stripped}__{tool}");
+                if !map.contains_key(&spelling) {
+                    origins.entry(spelling).or_insert_with(|| origin.clone());
+                }
+            }
+            if claims.get(tool.as_str()) == Some(&1) && !map.contains_key(tool) {
+                origins.entry(tool.clone()).or_insert_with(|| origin.clone());
+            }
+            origins.insert(qualified.to_string(), origin);
+        }
+        Self(origins)
+    }
+
+    /// 走遍整个事件:`function_call` 项(`output_item.added` / `.done`、`response.completed` 里的
+    /// output)和 `response.function_call_arguments.done` 的顶层 name。已带 namespace 的不动。
+    pub(crate) fn restore(&self, value: &mut Value) {
+        if self.0.is_empty() {
+            return;
+        }
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(|v| self.restore(v)),
+            Value::Object(object) => {
+                let is_call = matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("function_call" | "response.function_call_arguments.done")
+                );
+                if is_call {
+                    if let Some((tool, namespace)) = object.get("name").and_then(Value::as_str).and_then(|n| self.0.get(n)) {
+                        let (tool, namespace) = (tool.clone(), namespace.clone());
+                        object.insert("name".into(), Value::String(tool));
+                        object.entry("namespace").or_insert(Value::String(namespace));
+                    }
+                }
+                object.values_mut().for_each(|v| self.restore(v));
+            }
+            _ => {}
+        }
     }
 }
 
 /// 把网关的 OpenAI SSE 逐行解析、逐事件转成客户端协议的 SSE(`event: <type>\ndata: <json>\n\n`,
 /// Anthropic 与 Responses 都是这个形状)。
-fn stream_back(up: reqwest::Response, engine: TranslationEngine, client: Client) -> Response {
+fn stream_back(up: reqwest::Response, engine: TranslationEngine, client: Client, names: ToolNames) -> Response {
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let mut state = StreamTranslationState::new(WireFormat::OpenAiChat, client.wire());
@@ -391,15 +492,17 @@ fn stream_back(up: reqwest::Response, engine: TranslationEngine, client: Client)
             buf.extend_from_slice(&chunk);
             while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
-                let Some(events) = translate_sse_line(&engine, &mut state, &mut indexes, client.wire(), &line) else {
+                let Some(mut events) = translate_sse_line(&engine, &mut state, &mut indexes, client.wire(), &line) else {
                     continue;
                 };
+                events.iter_mut().for_each(|e| names.restore(e));
                 if !events.is_empty() && tx.send(Ok(encode_events(events))).await.is_err() {
                     break 'read; // CLI 断开了
                 }
             }
         }
-        if let Ok(events) = engine.finish_stream(&mut state, client.wire()) {
+        if let Ok(mut events) = engine.finish_stream(&mut state, client.wire()) {
+            events.iter_mut().for_each(|e| names.restore(e));
             if !events.is_empty() {
                 let _ = tx.send(Ok(encode_events(events))).await;
             }
@@ -693,6 +796,14 @@ mod tests {
                         if req["model"] == "broken-model" {
                             return (StatusCode::BAD_REQUEST, [("content-type", "application/json")], r#"{"error":{"message":"model not available"}}"#.to_string());
                         }
+                        if req["model"] == "tool-model" {
+                            // 模型回 codex 显示用的写法,不是请求里展平的四下划线名
+                            let body = json!({"id":"c1","object":"chat.completion","model":"tool-model",
+                                "choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                                    "tool_calls":[{"id":"call_9","type":"function",
+                                        "function":{"name":"mcp__myclaw__scheduled_tasks","arguments":"{\"action\":\"list\"}"}}]}}]});
+                            return (StatusCode::OK, [("content-type", "application/json")], body.to_string());
+                        }
                         let body = json!({"id":"c1","object":"chat.completion","model":req["model"],
                             "choices":[{"index":0,"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}],
                             "usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":1013,"cached_prompt_tokens":1000}});
@@ -866,6 +977,9 @@ mod tests {
                 {"type": "namespace", "name": "multi_agent_v1", "description": "sub-agents",
                     "tools": [{"type": "function", "name": "spawn_agent", "description": "spawn",
                         "parameters": {"type": "object", "properties": {}}}]},
+                {"type": "namespace", "name": "mcp__myclaw__", "description": "MyClaw companion",
+                    "tools": [{"type": "function", "name": "scheduled_tasks", "description": "tasks",
+                        "parameters": {"type": "object", "properties": {"action": {"type": "string"}}}}]},
                 {"type": "web_search", "external_web_access": true}
             ],
             "tool_choice": "auto", "parallel_tool_calls": true});
@@ -887,7 +1001,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].0, "/v1/responses session=sess-1", "GPT 走网关 /v1/responses,会话头一起带上");
         assert_eq!(seen[0].1, "Bearer tok-123");
-        assert_eq!(seen[0].2["tools"][2]["type"], "web_search", "透传不动请求体");
+        assert_eq!(seen[0].2["tools"][3]["type"], "web_search", "透传不动请求体");
     }
 
     #[tokio::test]
@@ -922,7 +1036,95 @@ mod tests {
             .collect();
         assert!(names.contains(&"exec_command"), "{names:?}");
         assert!(names.contains(&"multi_agent_v1__spawn_agent"), "namespace 工具展平成普通函数:{names:?}");
-        assert_eq!(names.len(), 2, "托管的 web_search 在 Chat 里没有对应物,丢掉:{names:?}");
+        assert!(names.contains(&"mcp__myclaw____scheduled_tasks"), "MCP 组名自带结尾 __:{names:?}");
+        assert_eq!(names.len(), 3, "托管的 web_search 在 Chat 里没有对应物,丢掉:{names:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_tool_calls_get_their_namespace_back() {
+        let (upstream, _seen) = mock_gateway().await;
+        let (status, body) = json_of(router(upstream).oneshot(responses_request("tool-model", false)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let call = body["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function_call item");
+        assert_eq!(call["name"], "scheduled_tasks", "{call}");
+        assert_eq!(call["namespace"], "mcp__myclaw__", "{call}");
+    }
+
+    #[test]
+    fn codex_tool_namespaces_survive_the_stream() {
+        let engine = TranslationEngine::default();
+        let policy = TranslationPolicy::default();
+        let request = json!({"model": "kimi-k3", "stream": true,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [
+                {"type": "namespace", "name": "multi_agent_v1", "tools": [{"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}]},
+                {"type": "namespace", "name": "mcp__myclaw__", "tools": [{"type": "function", "name": "scheduled_tasks", "parameters": {"type": "object"}}]},
+                {"type": "function", "name": "exec_command", "parameters": {"type": "object"}}
+            ]});
+        let decoded = engine.decode_request(WireFormat::OpenAiResponses, &request, &policy).unwrap();
+        assert!(
+            decoded.request.extensions.fields.contains_key(CODEX_TOOL_NAMESPACES_KEY),
+            "转换库换了存映射的键,ToolNames 拿不到映射"
+        );
+        let names = ToolNames::from_request(&decoded.request.extensions);
+
+        let mut state = StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::OpenAiResponses);
+        let mut indexes = ToolCallIndexes::default();
+        let call = |i: u64, id: &str, name: &str| {
+            format!(r#"data: {{"id":"c1","model":"kimi-k3","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{i},"id":"{id}","type":"function","function":{{"name":"{name}","arguments":"{{}}"}}}}]}}}}]}}"#)
+        };
+        let lines = [
+            call(0, "call_a", "mcp__myclaw__scheduled_tasks"), // codex 显示用写法
+            call(1, "call_b", "multi_agent_v1__spawn_agent"),  // 精确的展平名
+            call(2, "call_c", "exec_command"),                 // 不在组里的,不动
+            r#"data: {"id":"c1","model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+        let mut events = Vec::new();
+        for line in &lines {
+            if let Some(evs) = translate_sse_line(&engine, &mut state, &mut indexes, WireFormat::OpenAiResponses, line.as_bytes()) {
+                events.extend(evs);
+            }
+        }
+        events.extend(engine.finish_stream(&mut state, WireFormat::OpenAiResponses).unwrap());
+        events.iter_mut().for_each(|e| names.restore(e));
+
+        let done = |id: &str| {
+            events
+                .iter()
+                .find(|e| e["type"] == "response.output_item.done" && e["item"]["call_id"] == id)
+                .map(|e| e["item"].clone())
+                .unwrap_or_else(|| panic!("no done item for {id}"))
+        };
+        assert_eq!((done("call_a")["name"].clone(), done("call_a")["namespace"].clone()), (json!("scheduled_tasks"), json!("mcp__myclaw__")));
+        assert_eq!((done("call_b")["name"].clone(), done("call_b")["namespace"].clone()), (json!("spawn_agent"), json!("multi_agent_v1")));
+        assert_eq!(done("call_c")["name"], "exec_command");
+        assert!(done("call_c").get("namespace").is_none());
+        // 收尾的 response.completed 里的 output 也要还原
+        let completed = events.iter().find(|e| e["type"] == "response.completed").unwrap();
+        let out_a = completed["response"]["output"].as_array().unwrap().iter().find(|i| i["call_id"] == "call_a").unwrap();
+        assert_eq!(out_a["namespace"], "mcp__myclaw__");
+    }
+
+    #[test]
+    fn ambiguous_bare_tool_names_are_left_alone() {
+        let mut ext = switchyard_translation::ProviderExtensions::default();
+        ext.fields.insert(
+            CODEX_TOOL_NAMESPACES_KEY.into(),
+            json!({"mcp__a____search": "mcp__a__", "mcp__b____search": "mcp__b__"}),
+        );
+        let names = ToolNames::from_request(&ext);
+        let mut bare = json!({"type": "function_call", "name": "search"});
+        names.restore(&mut bare);
+        assert!(bare.get("namespace").is_none(), "两个组都有 search,猜不出是哪个");
+        let mut shown = json!({"type": "function_call", "name": "mcp__b__search"});
+        names.restore(&mut shown);
+        assert_eq!(shown, json!({"type": "function_call", "name": "search", "namespace": "mcp__b__"}));
     }
 
     #[test]

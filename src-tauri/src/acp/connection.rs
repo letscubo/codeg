@@ -7142,6 +7142,7 @@ async fn try_bridge_pi_select_ask(
                     outcome
                 } else {
                     crate::acp::question::QuestionOutcome {
+                        form_result: None,
                         answers: Vec::new(),
                         declined: true,
                     }

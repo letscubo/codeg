@@ -1111,6 +1111,7 @@ fn authoring_response(outcome: AuthoringOutcome) -> std::io::Result<BrokerRespon
 /// as "the user didn't answer; proceed with your own judgment".
 fn ask_declined_response() -> std::io::Result<BrokerResponse> {
     ask_response(&QuestionOutcome {
+        form_result: None,
         answers: Vec::new(),
         declined: true,
     })
@@ -2901,6 +2902,7 @@ mod tests {
             .answer(
                 "q-1",
                 QuestionOutcome {
+                    form_result: None,
                     answers: vec![QuestionAnsweredItem {
                         question: "Which approach?".into(),
                         header: "Approach".into(),

@@ -114,6 +114,10 @@ pub struct PendingQuestionState {
     pub question_id: String,
     pub questions: Vec<QuestionSpec>,
     pub created_at: DateTime<Utc>,
+    /// fork(letscubo): 工具确认卡的表单定义(见 [`sanitize_form_payload`])。只有平台
+    /// 以主 token 发起的提问才带;普通 ask 为 `None`,线上不出现这个字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<Value>,
 }
 
 /// One question's answer (frontend → backend). `labels` carries the selected
@@ -136,6 +140,10 @@ pub struct QuestionAnswer {
     pub answers: Vec<QuestionAnswerItem>,
     #[serde(default)]
     pub declined: bool,
+    /// fork(letscubo): 表单卡的回答(确认 / 让 Agent 改 / 取消 + 字段值),codeg 不解析。
+    /// 只在待答问题本身带了 `form` 时才交回调用方(见 `ConnectionManager::answer_question`)。
+    #[serde(default, alias = "formResult", skip_serializing_if = "Option::is_none")]
+    pub form_result: Option<Value>,
 }
 
 /// One answered question, joined with its prompt text so the result is
@@ -156,6 +164,9 @@ pub struct QuestionOutcome {
     pub answers: Vec<QuestionAnsweredItem>,
     #[serde(default)]
     pub declined: bool,
+    /// fork(letscubo): 表单卡的回答,原样交回发起提问的平台(见 [`QuestionAnswer::form_result`])。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_result: Option<Value>,
 }
 
 /// What [`SessionQuestionAccess::register_question`] hands back to the listener:
@@ -413,6 +424,7 @@ pub fn build_outcome(questions: &[QuestionSpec], answer: &QuestionAnswer) -> Que
         return QuestionOutcome {
             answers: Vec::new(),
             declined: true,
+            form_result: None,
         };
     }
     let answers = questions
@@ -453,7 +465,31 @@ pub fn build_outcome(questions: &[QuestionSpec], answer: &QuestionAnswer) -> Que
     QuestionOutcome {
         answers,
         declined: false,
+        form_result: None,
     }
+}
+
+/// fork(letscubo): 工具确认卡 —— 平台以主 token 发起提问时带来的表单定义 / 前端交回的
+/// 表单回答。codeg 只做两道检查(必须是 JSON 对象、序列化后不超过
+/// [`MAX_FORM_BYTES`]),内容原样存、原样转,不解析字段。
+pub const MAX_FORM_BYTES: usize = 64 * 1024;
+
+/// 校验一份表单载荷:缺省或 `null` 视为没带;不是对象或超出大小上限时报错。
+pub fn sanitize_form_payload(value: Option<&Value>) -> Result<Option<Value>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if !value.is_object() {
+        return Err("form must be a JSON object".to_string());
+    }
+    let size = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX);
+    if size > MAX_FORM_BYTES {
+        return Err(format!("form is too large ({size} bytes, limit {MAX_FORM_BYTES})"));
+    }
+    Ok(Some(value.clone()))
 }
 
 /// Some native asks carry NO `header` (the short category chip codeg renders):
@@ -2373,6 +2409,7 @@ mod tests {
 
         // The typed answer rides the main field verbatim.
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![QuestionAnswerItem {
                 question_id: "q1".into(),
                 labels: vec!["Ada Lovelace".into()],
@@ -2470,6 +2507,7 @@ mod tests {
             .collect();
         assert_eq!(labels, ["Rust", "TS"]);
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![QuestionAnswerItem {
                 question_id: q.specs[0].id.clone(),
                 labels: vec!["Rust".into(), "TS".into()],
@@ -2503,6 +2541,7 @@ mod tests {
         assert_eq!(labels, ["Yes", "No"]);
 
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![
                 QuestionAnswerItem {
                     question_id: "confirm".into(),
@@ -2550,6 +2589,7 @@ mod tests {
         let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
         assert_eq!(q.specs[0].options[0].label, "Production (EU)");
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![QuestionAnswerItem {
                 question_id: "env".into(),
                 labels: vec!["Production (EU)".into()],
@@ -2691,6 +2731,7 @@ mod tests {
         let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Codex(None)).unwrap());
         // Simulate the user picking "Blue" through the normal answer path.
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![QuestionAnswerItem {
                 question_id: "colour".into(),
                 labels: vec!["Blue".into()],
@@ -2708,6 +2749,7 @@ mod tests {
     #[test]
     fn build_elicitation_response_declined_maps_to_decline() {
         let outcome = QuestionOutcome {
+            form_result: None,
             answers: vec![],
             declined: true,
         };
@@ -2863,6 +2905,7 @@ mod tests {
         let qs = parse_questions(&valid_args()).unwrap();
         let qid = qs[0].id.clone();
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![
                 QuestionAnswerItem {
                     question_id: qid,
@@ -2923,6 +2966,7 @@ mod tests {
         let outcome = build_outcome(
             &qs,
             &QuestionAnswer {
+                form_result: None,
                 answers: items,
                 declined: false,
             },
@@ -2959,6 +3003,7 @@ mod tests {
         let qid = qs[0].id.clone();
         let huge = "x".repeat(MAX_QUESTION_TEXT_CHARS + 50);
         let answer = QuestionAnswer {
+            form_result: None,
             answers: vec![
                 QuestionAnswerItem {
                     question_id: qid.clone(),
@@ -2989,6 +3034,7 @@ mod tests {
         let outcome = build_outcome(
             &qs,
             &QuestionAnswer {
+                form_result: None,
                 answers: vec![QuestionAnswerItem {
                     question_id: qs[0].id.clone(),
                     labels: vec!["   ".into(), "".into()],
@@ -3005,6 +3051,7 @@ mod tests {
         let outcome = build_outcome(
             &qs,
             &QuestionAnswer {
+                form_result: None,
                 answers: vec![],
                 declined: true,
             },
@@ -3225,6 +3272,7 @@ mod tests {
     fn pi_select_option_id_maps_pick_and_cancels_what_pi_cannot_take() {
         let ask = parse_pi_select_ask(&pi_select_tool_call(), &pi_select_options()).unwrap();
         let answered = |labels: Vec<&str>| QuestionOutcome {
+            form_result: None,
             answers: vec![QuestionAnsweredItem {
                 question: ask.spec.question.clone(),
                 header: ask.spec.header.clone(),
@@ -3241,6 +3289,7 @@ mod tests {
         assert_eq!(
             pi_select_option_id(
                 &QuestionOutcome {
+                    form_result: None,
                     answers: vec![],
                     declined: true
                 },
@@ -3260,6 +3309,7 @@ mod tests {
     #[test]
     fn build_grok_ext_response_single_select_is_bare_string() {
         let outcome = QuestionOutcome {
+            form_result: None,
             answers: vec![QuestionAnsweredItem {
                 question: "What is your favorite color?".into(),
                 header: "What is your".into(),
@@ -3278,6 +3328,7 @@ mod tests {
     #[test]
     fn build_grok_ext_response_multi_select_is_array() {
         let outcome = QuestionOutcome {
+            form_result: None,
             answers: vec![QuestionAnsweredItem {
                 question: "Which modules?".into(),
                 header: "Which module".into(),
@@ -3294,6 +3345,7 @@ mod tests {
     #[test]
     fn build_grok_ext_response_declined_is_skip_interview() {
         let outcome = QuestionOutcome {
+            form_result: None,
             answers: vec![],
             declined: true,
         };
@@ -3332,6 +3384,7 @@ mod tests {
     #[test]
     fn grok_result_card_output_single_select_empty_header() {
         let outcome = QuestionOutcome {
+            form_result: None,
             answers: vec![QuestionAnsweredItem {
                 question: "你更喜欢哪种演示方式？".into(),
                 header: "你更喜欢哪种".into(), // synthesized upstream; must be dropped here
@@ -3352,6 +3405,7 @@ mod tests {
     #[test]
     fn grok_result_card_output_multi_and_declined() {
         let multi = QuestionOutcome {
+            form_result: None,
             answers: vec![QuestionAnsweredItem {
                 question: "Which colors?".into(),
                 header: "Which colors".into(),
@@ -3365,6 +3419,7 @@ mod tests {
             json!(["Red", "Green"])
         );
         let declined = QuestionOutcome {
+            form_result: None,
             answers: vec![],
             declined: true,
         };
@@ -3390,6 +3445,7 @@ mod tests {
         let outcome = build_outcome(
             &specs,
             &QuestionAnswer {
+                form_result: None,
                 answers: vec![QuestionAnswerItem {
                     question_id: specs[0].id.clone(),
                     labels: vec!["A".into()],
@@ -3404,5 +3460,47 @@ mod tests {
             output["answers"][0]["question"]
         );
         assert_eq!(output["answers"][0]["header"], "");
+    }
+}
+
+#[cfg(test)]
+mod form_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn absent_or_null_form_is_none() {
+        assert_eq!(sanitize_form_payload(None), Ok(None));
+        assert_eq!(sanitize_form_payload(Some(&Value::Null)), Ok(None));
+    }
+
+    #[test]
+    fn object_form_passes_through_unchanged() {
+        let form = json!({ "kind": "tool_confirm", "userFields": [{ "id": "cron" }] });
+        assert_eq!(sanitize_form_payload(Some(&form)), Ok(Some(form.clone())));
+    }
+
+    #[test]
+    fn non_object_or_oversized_form_is_rejected() {
+        assert!(sanitize_form_payload(Some(&json!("x"))).is_err());
+        assert!(sanitize_form_payload(Some(&json!([1, 2]))).is_err());
+        let big = json!({ "blob": "a".repeat(MAX_FORM_BYTES) });
+        assert!(sanitize_form_payload(Some(&big)).is_err());
+    }
+
+    #[test]
+    fn form_fields_stay_off_the_wire_when_absent() {
+        // 普通 ask 的线上形状不变:没有表单就不出现 form / form_result。
+        let outcome = QuestionOutcome {
+            answers: Vec::new(),
+            declined: true,
+            form_result: None,
+        };
+        let v = serde_json::to_value(&outcome).unwrap();
+        assert!(v.get("form_result").is_none());
+        let answer: QuestionAnswer =
+            serde_json::from_value(json!({ "answers": [], "formResult": { "action": "cancel" } }))
+                .unwrap();
+        assert_eq!(answer.form_result, Some(json!({ "action": "cancel" })));
     }
 }

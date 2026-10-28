@@ -207,6 +207,18 @@ fn authorized(headers: &HeaderMap, secret: &str, agent: &str) -> bool {
     }
 }
 
+/// fork(letscubo): 调用方出示的是不是 codeg **主 token**(平台),而不是写进 agent 配置的
+/// 派生凭证。工具确认卡(`ask_user_question` 带 `form` / `conversation_id`)只认主 token:
+/// 派生凭证模型读得到,放开就能伪造一张「批准扣费」卡。先过 [`authorized`] 再调。
+fn presented_master_token(headers: &HeaderMap, secret: &str) -> bool {
+    !secret.is_empty()
+        && headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            == Some(secret)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
     /// 通知没有 id —— MCP 的 `notifications/*` 走这条,不需要响应体。
@@ -433,12 +445,24 @@ pub async fn rpc(
             Err(e) => envelope_err(id, -32603, e),
         },
         "tools/call" if requested_tool(&req.params) == Some("ask_user_question") && ask_offered => {
-            match session {
-                Some(s) => ask_user_question(&state, &s, id, req.params).await,
-                None => match agent_session(&state, &agent).await {
-                    Ok(s) => ask_user_question(&state, &s, id, req.params).await,
-                    Err(why) => envelope_ok(id, ask_unavailable_result(&why)),
-                },
+            // fork(letscubo): 平台(主 token)发起的工具确认卡可以指定对话、带表单;
+            // agent 自己调时这两个参数一律忽略。
+            let platform = presented_master_token(&headers, &secret);
+            let target = if platform {
+                requested_conversation(&req.params)
+            } else {
+                None
+            };
+            let routed = match (session, target) {
+                (_, Some(conversation_id)) => {
+                    conversation_session(&state, &agent, conversation_id).await
+                }
+                (Some(s), None) => Ok(s),
+                (None, None) => agent_session(&state, &agent).await,
+            };
+            match routed {
+                Ok(s) => ask_user_question(&state, &s, id, req.params, platform).await,
+                Err(why) => envelope_ok(id, ask_unavailable_result(&why)),
             }
         }
         "tools/call" => call_tool(&StateUpload(&state.db), &agent, id, features, req.params).await,
@@ -458,6 +482,9 @@ enum SessionVia {
     Token(String),
     /// 按平台 agent 找到的唯一一个正在跑的连接(openclaw):再核 = 它仍是这个 agent 正在跑的连接。
     Agent(String),
+    /// fork(letscubo): 平台按对话 id 指定的落点(工具确认卡):再核 = 这段对话仍由这条连接
+    /// 在跑一轮。
+    Conversation { conversation_id: i32, agent_key: String },
 }
 
 /// 读 [`crate::acp::question::HTTP_SESSION_HEADER`],到委派凭证表里找连接(与 stdio
@@ -540,6 +567,54 @@ async fn session_still_live(state: &AppState, session: &SessionRef) -> bool {
             .prompting_connections_for_agent(key)
             .await
             .contains(&session.connection_id),
+        SessionVia::Conversation {
+            conversation_id,
+            agent_key,
+        } => {
+            state
+                .connection_manager
+                .prompting_connection_for_conversation(*conversation_id, agent_key)
+                .await
+                .as_deref()
+                == Some(session.connection_id.as_str())
+        }
+    }
+}
+
+/// fork(letscubo): 平台指定的对话 id(`arguments.conversation_id`,正整数)。
+fn requested_conversation(params: &Option<Value>) -> Option<i32> {
+    let n = params.as_ref()?.get("arguments")?.get("conversation_id")?.as_i64()?;
+    i32::try_from(n).ok().filter(|n| *n > 0)
+}
+
+/// fork(letscubo): 按平台指定的对话找提问落点 —— 这段对话此刻由这个 agent 的一条连接
+/// 在跑一轮。找不到就立刻回原因,不挂住(与 [`agent_session`] 同一约定)。
+async fn conversation_session(
+    state: &AppState,
+    agent: &str,
+    conversation_id: i32,
+) -> Result<SessionRef, String> {
+    if !state.question_config.is_enabled().await {
+        return Err("ask_user_question is turned off on this instance".into());
+    }
+    let Some(key) = agent_uuid(agent) else {
+        return Err("this endpoint is not bound to a platform agent".into());
+    };
+    match state
+        .connection_manager
+        .prompting_connection_for_conversation(conversation_id, &key)
+        .await
+    {
+        Some(connection_id) => Ok(SessionRef {
+            via: SessionVia::Conversation {
+                conversation_id,
+                agent_key: key,
+            },
+            connection_id,
+        }),
+        None => Err(format!(
+            "conversation {conversation_id} of this agent is not running a turn right now"
+        )),
     }
 }
 
@@ -592,6 +667,7 @@ async fn ask_user_question(
     session: &SessionRef,
     id: Value,
     params: Option<Value>,
+    platform: bool,
 ) -> Value {
     let declined = |id: Value| {
         envelope_ok(
@@ -608,9 +684,18 @@ async fn ask_user_question(
         Ok(qs) => qs,
         Err(msg) => return envelope_err(id, -32602, msg),
     };
+    // fork(letscubo): 工具确认卡的表单只收平台(主 token)的。
+    let form = if platform {
+        match crate::acp::question::sanitize_form_payload(arguments.get("form")) {
+            Ok(form) => form,
+            Err(msg) => return envelope_err(id, -32602, msg),
+        }
+    } else {
+        None
+    };
     let manager = &state.connection_manager;
     let reg = match manager
-        .register_question(&session.connection_id, questions.clone())
+        .register_question_with_form(&session.connection_id, questions.clone(), form.clone())
         .await
     {
         Some(reg) => Some(reg),
@@ -623,7 +708,7 @@ async fn ask_user_question(
                 .cancel_questions_by_parent(&session.connection_id)
                 .await;
             manager
-                .register_question(&session.connection_id, questions)
+                .register_question_with_form(&session.connection_id, questions, form)
                 .await
         }
         None => None,
@@ -644,10 +729,28 @@ async fn ask_user_question(
     let outcome = reg.answer_rx.await;
     pending.settled = true;
     match outcome.ok().and_then(|o| serde_json::to_value(o).ok()) {
-        Some(o) => envelope_ok(id, render_ask_result(&o)),
+        Some(o) => envelope_ok(id, with_form_result(render_ask_result(&o), &o, platform)),
         // 发送端被丢(连接拆了 / 本轮结束被回收):按「已跳过」收
         None => declined(id),
     }
+}
+
+/// fork(letscubo): 平台发起的提问,把表单回答(`form_result`)并进 `structuredContent`
+/// 交回平台;给模型看的文字与 agent 自己调时完全一样。
+fn with_form_result(mut result: Value, outcome: &Value, platform: bool) -> Value {
+    if !platform {
+        return result;
+    }
+    let Some(form_result) = outcome.get("form_result").filter(|v| !v.is_null()) else {
+        return result;
+    };
+    if let Some(structured) = result
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        structured.insert("form_result".to_string(), form_result.clone());
+    }
+    result
 }
 
 /// 一条 agent 的 MCP 条目,平台照抄进 runtime 自己的配置文件。
@@ -764,6 +867,48 @@ mod tests {
         async fn upload(&self, _path: &str) -> Result<String, String> {
             self.0.clone()
         }
+    }
+
+    #[test]
+    fn only_the_master_token_counts_as_platform() {
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::AUTHORIZATION, v.parse().unwrap());
+            h
+        };
+        assert!(presented_master_token(&with("Bearer s3cret"), "s3cret"));
+        assert!(!presented_master_token(&with("Bearer cmcp_abc"), "s3cret"));
+        assert!(!presented_master_token(&with("Bearer other"), "s3cret"));
+        assert!(!presented_master_token(&HeaderMap::new(), "s3cret"));
+        assert!(!presented_master_token(&with("Bearer "), ""));
+    }
+
+    #[test]
+    fn requested_conversation_reads_positive_ids_only() {
+        let p = |v: Value| Some(json!({ "name": "ask_user_question", "arguments": v }));
+        assert_eq!(requested_conversation(&p(json!({ "conversation_id": 25 }))), Some(25));
+        assert_eq!(requested_conversation(&p(json!({ "conversation_id": 0 }))), None);
+        assert_eq!(requested_conversation(&p(json!({ "conversation_id": "25" }))), None);
+        assert_eq!(requested_conversation(&p(json!({}))), None);
+        assert_eq!(requested_conversation(&None), None);
+    }
+
+    #[test]
+    fn form_result_reaches_the_platform_only() {
+        let outcome = json!({
+            "answers": [], "declined": false,
+            "form_result": { "action": "confirm", "values": { "cron": "0 8 * * *" } },
+        });
+        let rendered = render_ask_result(&outcome);
+        let platform = with_form_result(rendered.clone(), &outcome, true);
+        assert_eq!(
+            platform["structuredContent"]["form_result"]["action"],
+            json!("confirm")
+        );
+        // 给模型看的文字不变。
+        assert_eq!(platform["content"], rendered["content"]);
+        let agent = with_form_result(rendered, &outcome, false);
+        assert!(agent["structuredContent"].get("form_result").is_none());
     }
 
     fn features() -> CompanionFeatures {

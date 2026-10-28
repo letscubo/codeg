@@ -478,6 +478,8 @@ pub struct ConnectionManager {
 struct PendingQuestionEntry {
     parent_connection_id: String,
     questions: Vec<QuestionSpec>,
+    /// fork(letscubo): 工具确认卡的表单定义;带了它,回答里的 `form_result` 才交回调用方。
+    has_form: bool,
     sender: tokio::sync::oneshot::Sender<QuestionOutcome>,
 }
 
@@ -3521,6 +3523,20 @@ impl ConnectionManager {
         conn_id: &str,
         questions: Vec<QuestionSpec>,
     ) -> Option<RegisteredQuestion> {
+        self.register_question_with_form(conn_id, questions, None)
+            .await
+    }
+
+    /// fork(letscubo): 同 [`Self::register_question`],另带一份工具确认卡的表单定义
+    /// (平台以主 token 经 HTTP 伴生发起,见 `web::handlers::myclaw::mcp`)。表单随
+    /// `QuestionRequest` 与快照原样下发;回答时 `form_result` 原样交回。调用方负责先用
+    /// [`crate::acp::question::sanitize_form_payload`] 校验。
+    pub async fn register_question_with_form(
+        &self,
+        conn_id: &str,
+        questions: Vec<QuestionSpec>,
+        form: Option<serde_json::Value>,
+    ) -> Option<RegisteredQuestion> {
         // Defense-in-depth: the companion validates, but the broker socket is
         // only token-gated, so refuse to broadcast malformed/oversized specs
         // (None → the listener declines the ask, as for any other None path).
@@ -3540,6 +3556,7 @@ impl ConnectionManager {
                 PendingQuestionEntry {
                     parent_connection_id: conn_id.to_string(),
                     questions: questions.clone(),
+                    has_form: form.is_some(),
                     sender: tx,
                 },
             );
@@ -3552,6 +3569,7 @@ impl ConnectionManager {
             AcpEvent::QuestionRequest {
                 question_id: question_id.clone(),
                 questions,
+                form,
             },
         )
         .await;
@@ -3624,7 +3642,14 @@ impl ConnectionManager {
             // Already answered / canceled / gone elsewhere — idempotent success.
             return Ok(());
         };
-        let outcome = build_outcome(&entry.questions, &answer);
+        let mut outcome = build_outcome(&entry.questions, &answer);
+        // fork(letscubo): 表单回答只交给带了表单的提问;普通 ask 上客户端多塞的一律丢掉。
+        if entry.has_form && !outcome.declined {
+            outcome.form_result =
+                crate::acp::question::sanitize_form_payload(answer.form_result.as_ref())
+                    .ok()
+                    .flatten();
+        }
         // Ignore a dropped receiver: the listener may have abandoned the wait
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
@@ -3882,6 +3907,31 @@ impl ConnectionManager {
     }
 
     /// Resolve a conversation_id to its currently-active connection id, if any.
+    /// fork(letscubo): 这段对话此刻**正在跑一轮**(`Prompting`)的连接。平台以主 token
+    /// 发起工具确认卡时按对话 id 指定落点(同一个 agent 并行跑几段对话时,按 agent
+    /// 找不出唯一的那个)。给了 `agent_key` 就还要求连接属于这个 agent,防止把卡挂到别的
+    /// agent 的对话上;连接上没记 agent 的(非平台会话)一律不认。
+    pub async fn prompting_connection_for_conversation(
+        &self,
+        conversation_id: i32,
+        agent_key: &str,
+    ) -> Option<String> {
+        let candidates: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>)> = {
+            let map = self.connections.lock().await;
+            map.values().map(|c| (c.id.clone(), c.state.clone())).collect()
+        };
+        for (id, state) in candidates {
+            let s = state.read().await;
+            if s.status == ConnectionStatus::Prompting
+                && s.conversation_id == Some(conversation_id)
+                && s.myclaw_agent_key.as_deref() == Some(agent_key)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Used by the by-conversation snapshot endpoint and the LifecycleSubscriber.
     /// Per-session state is acquired via `read().await` to avoid the
     /// `try_read`-skip false negative that would intermittently return None
@@ -9243,6 +9293,7 @@ mod tests {
             .is_some());
 
         let answer = crate::acp::question::QuestionAnswer {
+            form_result: None,
             answers: vec![crate::acp::question::QuestionAnswerItem {
                 question_id: "qa".into(),
                 labels: vec!["A".into()],
@@ -9453,6 +9504,7 @@ mod tests {
             &state,
             &emitter,
             AcpEvent::QuestionRequest {
+                form: None,
                 question_id: "q1".into(),
                 questions: q_spec(),
             },
@@ -9479,6 +9531,91 @@ mod tests {
             "present entry is not compensated"
         );
         assert!(state.read().await.pending_question.is_some());
+    }
+
+    #[tokio::test]
+    async fn form_question_carries_form_and_returns_form_result() {
+        // fork(letscubo): 工具确认卡 —— 表单进快照,回答里的 form_result 原样交回。
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("cf", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let form = serde_json::json!({ "kind": "tool_confirm", "tool": "create_automation" });
+        let reg = mgr
+            .register_question_with_form("cf", q_spec(), Some(form.clone()))
+            .await
+            .expect("registered");
+        let snapshot_form = mgr
+            .get_state("cf")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .as_ref()
+            .and_then(|q| q.form.clone());
+        assert_eq!(snapshot_form, Some(form));
+
+        let result = serde_json::json!({ "action": "confirm", "values": { "cron": "0 8 * * *" } });
+        let answer = crate::acp::question::QuestionAnswer {
+            form_result: Some(result.clone()),
+            answers: Vec::new(),
+            declined: false,
+        };
+        mgr.answer_question("cf", &reg.question_id, answer)
+            .await
+            .unwrap();
+        let outcome = reg.answer_rx.await.expect("answer delivered");
+        assert_eq!(outcome.form_result, Some(result));
+    }
+
+    #[tokio::test]
+    async fn plain_question_drops_client_form_result() {
+        // 普通 ask 没带表单:客户端多塞的 form_result 不交给 agent。
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("cp", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let reg = mgr.register_question("cp", q_spec()).await.unwrap();
+        assert!(mgr
+            .get_state("cp")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .as_ref()
+            .is_some_and(|q| q.form.is_none()));
+        let answer = crate::acp::question::QuestionAnswer {
+            form_result: Some(serde_json::json!({ "action": "confirm" })),
+            answers: Vec::new(),
+            declined: false,
+        };
+        mgr.answer_question("cp", &reg.question_id, answer)
+            .await
+            .unwrap();
+        assert_eq!(reg.answer_rx.await.unwrap().form_result, None);
+    }
+
+    #[tokio::test]
+    async fn prompting_connection_for_conversation_matches_agent_and_turn() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("cv", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let state = mgr.get_state("cv").await.unwrap();
+        {
+            let mut s = state.write().await;
+            s.conversation_id = Some(25);
+            s.myclaw_agent_key = Some("agent-a".into());
+        }
+        // 没在跑一轮:不认。
+        assert_eq!(mgr.prompting_connection_for_conversation(25, "agent-a").await, None);
+        state.write().await.status = ConnectionStatus::Prompting;
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(25, "agent-a").await.as_deref(),
+            Some("cv")
+        );
+        // 别的 agent / 别的对话:不认。
+        assert_eq!(mgr.prompting_connection_for_conversation(25, "agent-b").await, None);
+        assert_eq!(mgr.prompting_connection_for_conversation(26, "agent-a").await, None);
     }
 
     #[tokio::test]
@@ -9520,6 +9657,7 @@ mod tests {
             "cc2",
             &first.question_id,
             crate::acp::question::QuestionAnswer {
+                form_result: None,
                 answers: vec![crate::acp::question::QuestionAnswerItem {
                     question_id: "qa".into(),
                     labels: vec!["A".into()],

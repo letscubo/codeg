@@ -52,8 +52,9 @@ pub const CALL_PATH: &str = "/api/codeg/tools/call";
 const CATALOG_TTL_OK: Duration = Duration::from_secs(300);
 const CATALOG_TTL_ERR: Duration = Duration::from_secs(30);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
-/// 调用超时:平台端 maxDuration 60s,再留余量。
-const CALL_TIMEOUT: Duration = Duration::from_secs(70);
+/// 调用超时:平台端 maxDuration 300s。写操作可能先弹工具确认卡等用户最多 150 秒
+/// (平台 lib/tool-confirm),再执行,所以留到 280s。
+const CALL_TIMEOUT: Duration = Duration::from_secs(280);
 
 /// 从 webhook 配置派生的平台端点。
 #[derive(Debug, Clone, PartialEq, Eq)]

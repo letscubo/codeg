@@ -715,6 +715,10 @@ pub enum AcpEvent {
     QuestionRequest {
         question_id: String,
         questions: Vec<crate::acp::question::QuestionSpec>,
+        /// fork(letscubo): 工具确认卡的表单定义(平台以主 token 发起时才有),前端据此渲染;
+        /// 不认识它的客户端 / IM 渠道照旧按 `questions` 显示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<serde_json::Value>,
     },
     /// A previously-pending question was answered (from any client) or canceled
     /// (the tool call was aborted / the connection drained). Carries only the
