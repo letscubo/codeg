@@ -218,6 +218,88 @@ pub(crate) fn normalize_gateway_usage(value: &mut Value) {
     }
 }
 
+/// 把紧跟在工具结果后面的纯文字 user 消息并进前一条 tool 消息,返回并了几条。
+///
+/// Claude Code 会在工具结果那条 user 消息里再追加提示(`<total_tokens>…</total_tokens>` 之类的
+/// system-reminder)。转换库把同一条消息里 tool_result 之外的内容另起一条 `role: "user"`,放在
+/// tool 消息之后 —— 模型看到的最后一条成了「用户刚说了话」,于是当成新一轮,从用户原话重新答。
+///
+/// 2026-10-28 A3(claude_code + DeepSeek V4.1 Flash):Linear 未连接时一轮里把 app_status 调了 15 次,
+/// 每段思考都从「The user says 再试一次」开头;网关回「别再调、回复用户」也不管用。
+///
+/// 按结构判断、不认提示的写法:Anthropic 要求角色交替,所以 Chat 里紧跟 tool 消息的 user 消息
+/// 只可能出自同一条带工具结果的消息。带图片等非文字内容的不动(tool 消息只收文字)。
+pub(crate) fn fold_text_after_tool_results(chat: &mut Value) -> usize {
+    let Some(messages) = chat.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut folded = 0;
+    let mut i = 1;
+    while i < messages.len() {
+        let after_tool = messages[i - 1].get("role").and_then(Value::as_str) == Some("tool");
+        let text = (messages[i].get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| plain_text_of(&messages[i]["content"]))
+            .flatten();
+        match (after_tool, text) {
+            (true, Some(text)) => {
+                let tool = &mut messages[i - 1];
+                let joined = match tool.get("content").and_then(Value::as_str) {
+                    Some(prev) if !prev.is_empty() => format!("{prev}\n\n{text}"),
+                    _ => text,
+                };
+                tool["content"] = Value::String(joined);
+                messages.remove(i);
+                folded += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    folded
+}
+
+/// 历史里 assistant 的推理改用 `reasoning_content` 字段发给网关,返回改了几条。
+///
+/// 转换库把 Anthropic thinking 块编成 `reasoning`,网关只认 `reasoning_content`(它回给我们的推理
+/// 也在这个字段),`reasoning` 被静默丢掉。DeepSeek / Kimi 这类思考模型在工具调用之间要靠回传的
+/// 推理接上思路;丢了就每一步都从用户原话重新想。
+///
+/// 2026-10-28 A3 实测(网关 `/v1/chat/completions`,DeepSeek V4.1 Flash):把一句暗号放进上一步的
+/// `reasoning`,模型答不出;放进 `reasoning_content` 能原样答出。同一天 A3-CC 一轮里把 app_status
+/// 连调 15 次,每段思考都以「The user says 再试一次」开头,就是这个原因。
+pub(crate) fn send_reasoning_as_reasoning_content(chat: &mut Value) -> usize {
+    let Some(messages) = chat.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut moved = 0;
+    for message in messages.iter_mut() {
+        let Some(m) = message.as_object_mut() else { continue };
+        if m.contains_key("reasoning_content") {
+            continue;
+        }
+        if let Some(reasoning) = m.remove("reasoning") {
+            m.insert("reasoning_content".into(), reasoning);
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// 只有文字时拼成一段;带任何非文字片段返回 None。
+fn plain_text_of(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|p| match p.get("type").and_then(Value::as_str) {
+                Some("text") => p.get("text").and_then(Value::as_str).map(str::to_string),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|texts| texts.join("\n\n")),
+        _ => None,
+    }
+}
+
 fn anthropic_error(status: StatusCode, message: impl Into<String>) -> Response {
     let kind = match status.as_u16() {
         400 | 422 => "invalid_request_error",
@@ -341,6 +423,11 @@ async fn translate(bridge: &Bridge, client: Client, auth: &str, model: &str, req
         }
         Err(e) => return client.error(StatusCode::BAD_REQUEST, format!("cannot translate request: {e}")),
     };
+    let folded = fold_text_after_tool_results(&mut chat);
+    let reasoning = send_reasoning_as_reasoning_content(&mut chat);
+    if folded + reasoning > 0 {
+        tracing::debug!("[llm-bridge] {model} 工具结果后的文字并进 tool 消息 {folded} 段,推理回传 {reasoning} 条");
+    }
     if stream {
         // 要用量(上下文统计、自动压缩都靠它);网关流式默认不一定带
         chat["stream_options"] = json!({"include_usage": true});
@@ -887,6 +974,46 @@ mod tests {
         assert_eq!(seen[0].1, "Bearer tok-123");
         assert_eq!(seen[0].2["model"], "kimi-k3");
         assert_eq!(seen[0].2["messages"][0]["role"], "system", "Anthropic system 转成 OpenAI system 消息");
+    }
+
+    #[tokio::test]
+    async fn reminders_after_tool_results_do_not_become_a_user_turn() {
+        let (upstream, seen) = mock_gateway().await;
+        // Claude Code 的形状:工具结果那条 user 消息里还追加了提示
+        let body = json!({"model": "deepseek-v4.1-flash", "max_tokens": 64, "messages": [
+            {"role": "user", "content": "再试一次"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "check the status first", "signature": ""},
+                {"type": "tool_use", "id": "call_1", "name": "app_status", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "is_error": true, "content": "{\"code\":\"APP_NOT_CONNECTED\"}"},
+                {"type": "text", "text": "<system-reminder>\n<total_tokens>14999786 tokens left</total_tokens>\n</system-reminder>"}
+            ]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_2", "name": "Read", "input": {"file_path": "a.png"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_2", "content": "ok"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]}
+        ]});
+        let req = axum::http::Request::post("/v1/messages")
+            .header("authorization", "Bearer tok-123")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _) = json_of(router(upstream).oneshot(from_peer(req, [127, 0, 0, 1])).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        let roles: Vec<&str> = seen[0].2["messages"].as_array().unwrap().iter()
+            .map(|m| m["role"].as_str().unwrap_or("")).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool", "user"],
+            "提示并进 tool 消息;图片 tool 消息装不下,照旧单独一条");
+        let tool = seen[0].2["messages"][2]["content"].as_str().unwrap();
+        assert!(tool.starts_with("{\"code\":\"APP_NOT_CONNECTED\"}\n\n<system-reminder>"), "{tool}");
+        assert!(tool.contains("<total_tokens>"));
+        let thought = &seen[0].2["messages"][1];
+        assert_eq!(thought["reasoning_content"], "check the status first", "推理用网关认的字段回传");
+        assert!(thought.get("reasoning").is_none());
     }
 
     #[tokio::test]
