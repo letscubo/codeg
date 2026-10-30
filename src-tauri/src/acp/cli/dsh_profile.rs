@@ -31,6 +31,8 @@ const PLUGIN_SOURCE: &str = include_str!("../../../resources/dsh/codeg-tool-sear
 const PLUGIN_FILE_NAME: &str = "codeg-tool-search.mjs";
 const RUNNER_SOURCE: &str = include_str!("../../../resources/dsh/codeg-headless-runner.mjs");
 const RUNNER_FILE_NAME: &str = "codeg-headless-runner.mjs";
+const APPROVAL_SOURCE: &str = include_str!("../../../resources/dsh/codeg-permissions.mjs");
+const AUTO_SOURCE: &str = include_str!("../../../resources/dsh/codeg-auto-review.mjs");
 /// `stock` keeps dsh's own headless runner (no background-subagent wait) — an
 /// escape hatch should a dsh bump break the replacement's internals.
 pub const RUNNER_ENV: &str = "CODEG_DSH_RUNNER";
@@ -47,6 +49,7 @@ pub(crate) struct DshLaunchProfile {
     pub companion: Option<CompanionLaunchSpec>,
     /// `off` / `on` / `auto`, from `DSH_TOOL_SEARCH` in the launch env.
     pub tool_search_mode: String,
+    pub permission_plugins: Vec<PathBuf>,
     /// codeg's runner, or `None` when `CODEG_DSH_RUNNER=stock`.
     pub runner_path: Option<PathBuf>,
     pub background_wait_secs: u64,
@@ -65,6 +68,7 @@ pub(crate) async fn prepare_launch_profile(
     connection_id: &str,
     working_dir: &Path,
     runtime_env: &BTreeMap<String, String>,
+    session_id: Option<&str>,
     delegation: Option<&DelegationInjection>,
     tasks_enabled: bool,
 ) -> Result<DshLaunchProfile, String> {
@@ -75,6 +79,29 @@ pub(crate) async fn prepare_launch_profile(
     } else {
         Some(materialize(&dsh_home, RUNNER_FILE_NAME, RUNNER_SOURCE)?)
     };
+    let mut permission_plugins = Vec::new();
+    let restoring_auto = session_id
+        .and_then(|id| crate::parsers::deepseek::read_session_permission_facts(&dsh_home, id).ok())
+        .is_some_and(|facts| facts["preset"] == "auto");
+    if super::permissions::native_mode(runtime_env, true)?.is_some() || restoring_auto {
+        if runner_path.is_none() {
+            return Err("Session permissions require the codeg headless runner".into());
+        }
+        permission_plugins.push(materialize(
+            &dsh_home,
+            "codeg-auto-review.mjs",
+            AUTO_SOURCE,
+        )?);
+    }
+    // Approval transport also serves existing native Ask sessions. Loading the
+    // answerer does not select a preset or alter the session's sandbox policy.
+    if runner_path.is_some() {
+        permission_plugins.push(materialize(
+            &dsh_home,
+            "codeg-permissions.mjs",
+            APPROVAL_SOURCE,
+        )?);
+    }
     let companion = match delegation {
         Some(injection) => {
             companion_launch_spec(
@@ -94,6 +121,7 @@ pub(crate) async fn prepare_launch_profile(
         plugin_path,
         companion,
         tool_search_mode: tool_search_mode(runtime_env),
+        permission_plugins,
         runner_path,
         background_wait_secs: background_wait_secs(runtime_env),
     })
@@ -165,7 +193,16 @@ pub(crate) fn render_patch(
             "config": { "provider": provider, "model": model },
         }));
     }
-    let mut inserts: Vec<Value> = Vec::new();
+    let mut inserts: Vec<Value> = profile
+        .permission_plugins
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            json!({
+                "id":format!("codeg-session-permissions-{i}"),"name":path.display().to_string()
+            })
+        })
+        .collect();
     if let Some(companion) = &profile.companion {
         inserts.push(json!({
             "id": crate::acp::delegation::companion::COMPANION_SERVER_NAME,
@@ -243,6 +280,41 @@ fn materialize(dsh_home: &Path, file_name: &str, source: &str) -> Result<PathBuf
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn permission_transport_restores_native_auto_without_requiring_a_platform_mode_override()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "session-11111111-1111-4111-8111-111111111111";
+        let session = dir.path().join("sessions/bucket").join(id);
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("session.jsonl"),
+            "{\"type\":\"permission/preset\",\"data\":{\"preset\":\"auto\"}}\n",
+        )
+        .unwrap();
+        let env = BTreeMap::from([("DSH_HOME".into(), dir.path().to_string_lossy().into_owned())]);
+        let restored = prepare_launch_profile("restore", dir.path(), &env, Some(id), None, false)
+            .await
+            .unwrap();
+        assert!(restored
+            .permission_plugins
+            .iter()
+            .any(|path| path.ends_with("codeg-auto-review.mjs")));
+        assert!(restored
+            .permission_plugins
+            .iter()
+            .any(|path| path.ends_with("codeg-permissions.mjs")));
+        let ordinary = prepare_launch_profile("ask", dir.path(), &env, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary.permission_plugins.len(),
+            1,
+            "ordinary inherited Ask only adds an answerer and keeps its native preset"
+        );
+        assert!(ordinary.permission_plugins[0].ends_with("codeg-permissions.mjs"));
+    }
+
     fn profile(companion: bool, mode: &str) -> DshLaunchProfile {
         DshLaunchProfile {
             dsh_home: PathBuf::from("/h"),
@@ -255,6 +327,7 @@ mod tests {
                 delegation_enabled: false,
             }),
             tool_search_mode: mode.to_string(),
+            permission_plugins: Vec::new(),
             runner_path: None,
             background_wait_secs: 1200,
         }
@@ -276,7 +349,10 @@ mod tests {
         assert_eq!(inserts[1]["name"], "/h/plugins/codeg-tool-search.mjs");
         assert_eq!(inserts[1]["config"]["mode"], "auto");
         // 豁免名单必须与 serverName 同名,否则委派工具会被 tool-search 当普通 MCP 工具藏起来
-        assert_eq!(inserts[1]["config"]["exemptServers"][0], inserts[0]["config"]["serverName"]);
+        assert_eq!(
+            inserts[1]["config"]["exemptServers"][0],
+            inserts[0]["config"]["serverName"]
+        );
     }
 
     #[test]

@@ -144,6 +144,18 @@ pub struct AcpDisconnectParams {
     pub connection_id: String,
 }
 
+pub async fn acp_disconnect_if_idle(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpDisconnectParams>,
+) -> Result<Json<()>, AppCommandError> {
+    state
+        .connection_manager
+        .disconnect_if_idle(&params.connection_id)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
+}
+
 pub async fn acp_disconnect(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpDisconnectParams>,
@@ -595,12 +607,26 @@ pub async fn acp_respond_permission(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpRespondPermissionParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    crate::web::handlers::cli::reject_cli_connection(
-        &state.connection_manager,
-        &params.connection_id,
-        "unsupported_for_cli",
-    )
-    .await?;
+    let native_cli = if let Some(session) = state
+        .connection_manager
+        .get_state(&params.connection_id)
+        .await
+    {
+        matches!(
+            session.read().await.agent_type,
+            AgentType::ClaudeCode | AgentType::DeepSeek
+        )
+    } else {
+        false
+    };
+    if !native_cli {
+        crate::web::handlers::cli::reject_cli_connection(
+            &state.connection_manager,
+            &params.connection_id,
+            "unsupported_for_cli",
+        )
+        .await?;
+    }
     let manager = &state.connection_manager;
     manager
         .respond_permission(&params.connection_id, &params.request_id, &params.option_id)

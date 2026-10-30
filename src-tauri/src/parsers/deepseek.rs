@@ -18,6 +18,44 @@ use crate::parsers::{
     AgentParser, ParseError,
 };
 
+/// Read native permission facts from the exact session's canonical generation.
+/// No transcript contents, credentials, or inferred grants leave this function.
+pub(crate) fn read_session_permission_facts(
+    home: &Path,
+    session_id: &str,
+) -> Result<Value, String> {
+    if uuid::Uuid::parse_str(session_id.strip_prefix("session-").unwrap_or(session_id)).is_err() {
+        return Err("Invalid native session id".into());
+    }
+    let mut found = Vec::new();
+    for bucket in read_subdirs(&home.join("sessions")) {
+        let candidate = bucket.join(session_id);
+        if candidate.is_dir() {
+            found.push(candidate);
+        }
+    }
+    if found.len() != 1 {
+        return Err("Native session not found or ambiguous".into());
+    }
+    let text =
+        read_session_log_text(&found[0]).ok_or("Unable to read native session permissions")?;
+    let mut facts = serde_json::Map::new();
+    for line in text.lines() {
+        let value: Value = serde_json::from_str(line).map_err(|_| "Invalid native session log")?;
+        let data = &value["data"];
+        let pair = match value["type"].as_str() {
+            Some("permission/preset") => Some(("preset", data["preset"].clone())),
+            Some("sandbox/mode") => Some(("sandbox", data["mode"].clone())),
+            Some("approval/policy") => Some(("approval", data["policy"].clone())),
+            _ => None,
+        };
+        if let Some((key, value)) = pair {
+            facts.insert(key.into(), value);
+        }
+    }
+    Ok(Value::Object(facts))
+}
+
 /// Resolve the DeepSeek Harness home the way `@deepseek-ai/dsh-home-paths`'
 /// `resolveDshHome` does: `DSH_HOME` wins, else `~/.dsh`.
 ///
@@ -1370,6 +1408,40 @@ fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn permission_snapshot_uses_exact_session_and_latest_canonical_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "session-11111111-1111-4111-8111-111111111111";
+        let session = temp.path().join("sessions/bucket-a").join(id);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("session.jsonl"),
+            "{\"type\":\"permission/preset\",\"data\":{\"preset\":\"danger-full-access\"}}\n",
+        )
+        .unwrap();
+        let events = "{\"type\":\"permission/preset\",\"data\":{\"preset\":\"workspace-write\"}}\n{\"type\":\"sandbox/mode\",\"data\":{\"mode\":\"read-only\"}}\n{\"type\":\"approval/policy\",\"data\":{\"policy\":\"ask\"}}\n{\"type\":\"user/message\",\"data\":{\"secret\":\"must-not-leave\"}}\n";
+        let mut frames =
+            zstd::stream::encode_all("{\"type\":\"session\",\"version\":3}\n".as_bytes(), 1)
+                .unwrap();
+        frames.extend(zstd::stream::encode_all(events.as_bytes(), 1).unwrap());
+        fs::write(session.join("session.v3.jsonl.zstd"), frames).unwrap();
+        let facts = read_session_permission_facts(temp.path(), id).unwrap();
+        assert_eq!(
+            facts,
+            json!({"preset":"workspace-write","sandbox":"read-only","approval":"ask"})
+        );
+        assert!(read_session_permission_facts(temp.path(), "../bucket-a").is_err());
+        assert!(
+            read_session_permission_facts(temp.path(), "22222222-2222-4222-8222-222222222222")
+                .is_err()
+        );
+        fs::create_dir_all(temp.path().join("sessions/bucket-b").join(id)).unwrap();
+        assert!(
+            read_session_permission_facts(temp.path(), id).is_err(),
+            "ambiguous sessions must not use the most recent match"
+        );
+    }
 
     #[test]
     fn launch_dsh_home_beats_inherited_and_blank_means_removed() {

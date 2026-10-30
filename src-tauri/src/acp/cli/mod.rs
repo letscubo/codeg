@@ -21,6 +21,7 @@ pub mod dsh_profile;
 pub mod dsh_prompt;
 pub mod dsh_stream;
 pub mod dsh_tool_info;
+pub mod permissions;
 pub mod pi_binary;
 pub mod pi_driver;
 pub mod pi_stream;
@@ -174,6 +175,12 @@ impl ConnectionManager {
                     continue;
                 }
                 if state.transport == ConnectionTransport::Cli
+                    && state.cli_permission_mode.as_ref()
+                        != request.runtime_env.get(permissions::MODE_ENV)
+                {
+                    return Err(CliConnectError::ProfileWriteFailed("Session permissions changed; disconnect the idle connection before reconnecting".into()));
+                }
+                if state.transport == ConnectionTransport::Cli
                     && conn.agent_type == request.agent_type
                     && state.working_dir.as_deref() == Some(request.working_dir.as_path())
                 {
@@ -236,6 +243,7 @@ impl ConnectionManager {
                 &connection_id,
                 &request.working_dir,
                 &request.runtime_env,
+                session_id.as_deref(),
                 delegation.as_ref(),
                 tasks_enabled,
             )
@@ -249,31 +257,29 @@ impl ConnectionManager {
         };
         // claude: the same `codeg-mcp` companion, handed over per turn with
         // `--mcp-config` (the ACP path injects it into `mcpServers`).
-        let (claude_companion, claude_delegation) = if matches!(
-            request.agent_type,
-            AgentType::ClaudeCode | AgentType::Codex
-        ) {
-            let delegation = self.delegation_snapshot();
-            let companion = match delegation.as_ref() {
-                Some(injection) => {
-                    crate::acp::connection::companion_launch_spec(
-                        injection,
-                        &connection_id,
-                        &request.working_dir,
-                        tasks_enabled,
-                        crate::acp::host_tools_policy::HostToolsPolicy::from_env(
-                            &request.runtime_env,
-                        ),
-                        crate::acp::connection::locate_codeg_mcp_binary,
-                    )
-                    .await
-                }
-                None => None,
+        let (claude_companion, claude_delegation) =
+            if matches!(request.agent_type, AgentType::ClaudeCode | AgentType::Codex) {
+                let delegation = self.delegation_snapshot();
+                let companion = match delegation.as_ref() {
+                    Some(injection) => {
+                        crate::acp::connection::companion_launch_spec(
+                            injection,
+                            &connection_id,
+                            &request.working_dir,
+                            tasks_enabled,
+                            crate::acp::host_tools_policy::HostToolsPolicy::from_env(
+                                &request.runtime_env,
+                            ),
+                            crate::acp::connection::locate_codeg_mcp_binary,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                (companion, delegation)
+            } else {
+                (None, None)
             };
-            (companion, delegation)
-        } else {
-            (None, None)
-        };
 
         let mut session = SessionState::new(
             connection_id.clone(),
@@ -284,6 +290,7 @@ impl ConnectionManager {
         );
         session.transport = ConnectionTransport::Cli;
         session.cli_model = model.filter(|m| !m.trim().is_empty());
+        session.cli_permission_mode = request.runtime_env.get(permissions::MODE_ENV).cloned();
         let state = Arc::new(RwLock::new(session));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let child_pid = Arc::new(AtomicU32::new(0));
@@ -453,7 +460,9 @@ impl ConnectionManager {
             (AgentType::ClaudeCode | AgentType::Codex, Some(id))
                 if uuid::Uuid::parse_str(&id).is_err() =>
             {
-                tracing::warn!("[CLI] {id} is not a {agent_type} session id; starting a fresh session");
+                tracing::warn!(
+                    "[CLI] {id} is not a {agent_type} session id; starting a fresh session"
+                );
                 None
             }
             (_, session_id) => session_id,

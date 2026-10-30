@@ -2003,6 +2003,22 @@ impl ConnectionManager {
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            {
+                let session = conn.state.read().await;
+                if session.transport == crate::acp::session_state::ConnectionTransport::Cli {
+                    let pending = session
+                        .pending_permission
+                        .as_ref()
+                        .ok_or_else(|| AcpError::Protocol("Permission request expired".into()))?;
+                    if pending.request_id != request_id
+                        || !pending.options.iter().any(|o| o.option_id == option_id)
+                    {
+                        return Err(AcpError::Protocol(
+                            "Permission answer does not belong to the pending request".into(),
+                        ));
+                    }
+                }
+            }
             conn.cmd_tx.clone()
         };
         cmd_tx
@@ -2459,6 +2475,24 @@ impl ConnectionManager {
             })
             .await
             .map_err(|e| AcpError::protocol(e.to_string()))
+    }
+
+    /// Serialize an idle-only disconnect with prompt admission; never interrupt a live turn.
+    pub async fn disconnect_if_idle(&self, conn_id: &str) -> Result<(), AcpError> {
+        let lock = match self.clone_prompt_lock(conn_id).await {
+            Ok(lock) => lock,
+            Err(AcpError::ConnectionNotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let _guard = lock
+            .try_lock_owned()
+            .map_err(|_| AcpError::TurnInProgress)?;
+        if let Some(state) = self.get_state(conn_id).await {
+            if state.read().await.turn_in_flight {
+                return Err(AcpError::TurnInProgress);
+            }
+        }
+        self.disconnect(conn_id).await
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
@@ -3485,9 +3519,14 @@ impl ConnectionManager {
     /// (见 `web::handlers::myclaw::mcp` 的 `agent_session`)。只认 `Prompting`:提问只会
     /// 发生在一轮之中,空闲的连接不可能是调用方。
     pub async fn prompting_connections_for_agent(&self, agent_key: &str) -> Vec<String> {
-        let candidates: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>)> = {
+        let candidates: Vec<(
+            String,
+            Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        )> = {
             let map = self.connections.lock().await;
-            map.values().map(|c| (c.id.clone(), c.state.clone())).collect()
+            map.values()
+                .map(|c| (c.id.clone(), c.state.clone()))
+                .collect()
         };
         let mut out = Vec::new();
         for (id, state) in candidates {
@@ -3916,9 +3955,14 @@ impl ConnectionManager {
         conversation_id: i32,
         agent_key: &str,
     ) -> Option<String> {
-        let candidates: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>)> = {
+        let candidates: Vec<(
+            String,
+            Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        )> = {
             let map = self.connections.lock().await;
-            map.values().map(|c| (c.id.clone(), c.state.clone())).collect()
+            map.values()
+                .map(|c| (c.id.clone(), c.state.clone()))
+                .collect()
         };
         for (id, state) in candidates {
             let s = state.read().await;
@@ -4425,6 +4469,36 @@ impl SessionPlanApprovalAccess for ConnectionManagerPlanApprovalLookup {
 mod tests {
     use super::*;
     use crate::acp::connection::AgentConnection;
+
+    #[tokio::test]
+    async fn permission_change_disconnect_never_cancels_a_running_or_admitting_turn() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection(
+            "permission-test",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        let state = mgr.get_state("permission-test").await.unwrap();
+        state.write().await.turn_in_flight = true;
+        assert!(matches!(
+            mgr.disconnect_if_idle("permission-test").await,
+            Err(AcpError::TurnInProgress)
+        ));
+        assert!(mgr.get_state("permission-test").await.is_some());
+        state.write().await.turn_in_flight = false;
+        let lock = mgr.clone_prompt_lock("permission-test").await.unwrap();
+        let guard = lock.lock_owned().await;
+        assert!(matches!(
+            mgr.disconnect_if_idle("permission-test").await,
+            Err(AcpError::TurnInProgress)
+        ));
+        drop(guard);
+        mgr.disconnect_if_idle("permission-test").await.unwrap();
+        assert!(mgr.get_state("permission-test").await.is_none());
+        mgr.disconnect_if_idle("permission-test").await.unwrap();
+    }
 
     /// An agent that has left the connection map but not yet exited can still
     /// be appending to the transcript a restore is about to unlink, so the
@@ -9607,15 +9681,29 @@ mod tests {
             s.myclaw_agent_key = Some("agent-a".into());
         }
         // 没在跑一轮:不认。
-        assert_eq!(mgr.prompting_connection_for_conversation(25, "agent-a").await, None);
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(25, "agent-a")
+                .await,
+            None
+        );
         state.write().await.status = ConnectionStatus::Prompting;
         assert_eq!(
-            mgr.prompting_connection_for_conversation(25, "agent-a").await.as_deref(),
+            mgr.prompting_connection_for_conversation(25, "agent-a")
+                .await
+                .as_deref(),
             Some("cv")
         );
         // 别的 agent / 别的对话:不认。
-        assert_eq!(mgr.prompting_connection_for_conversation(25, "agent-b").await, None);
-        assert_eq!(mgr.prompting_connection_for_conversation(26, "agent-a").await, None);
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(25, "agent-b")
+                .await,
+            None
+        );
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(26, "agent-a")
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

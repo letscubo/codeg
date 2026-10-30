@@ -70,6 +70,48 @@ pub struct CliCancelParams {
     pub connection_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliPermissionSnapshotParams {
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub runtime_env: BTreeMap<String, String>,
+}
+
+pub async fn cli_permission_snapshot(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<CliPermissionSnapshotParams>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    let mut runtime_env = acp_commands::build_session_runtime_env(
+        &state.db,
+        AgentType::DeepSeek,
+        params.session_id.as_deref(),
+        &state.data_dir,
+    )
+    .await
+    .map_err(|_| {
+        AppCommandError::task_execution_failed("Unable to read native runtime environment")
+    })?;
+    runtime_env.extend(params.runtime_env);
+    let home = crate::parsers::deepseek::resolve_dsh_home_dir_for_launch(&runtime_env);
+    if let Some(id) = params.session_id {
+        return crate::parsers::deepseek::read_session_permission_facts(&home, &id)
+            .map(Json)
+            .map_err(|_| {
+                AppCommandError::task_execution_failed("Unable to read native session permissions")
+            });
+    }
+    let config = std::fs::read_to_string(home.join("settings.yaml")).unwrap_or_default();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&config).map_err(|_| {
+        AppCommandError::task_execution_failed("Unable to parse native permission settings")
+    })?;
+    let preset = yaml["permission"]["defaultPreset"]
+        .as_str()
+        .or_else(|| runtime_env.get("DSH_PERMISSION_MODE").map(String::as_str))
+        .unwrap_or("workspace-write");
+    Ok(Json(serde_json::json!({"preset":preset})))
+}
+
 pub async fn cli_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(mut params): Json<CliPromptParams>,
@@ -385,11 +427,9 @@ mod tests {
     #[test]
     fn a_pi_session_id_is_a_uuid() {
         // pi 铸的是 uuidv7(`01a1271a-…`),走默认那条 uuid 校验。
-        assert!(validate_cli_session_id(
-            AgentType::Pi,
-            "01a1271a-81fb-7fbd-9bb4-5299598a4dbc"
-        )
-        .is_ok());
+        assert!(
+            validate_cli_session_id(AgentType::Pi, "01a1271a-81fb-7fbd-9bb4-5299598a4dbc").is_ok()
+        );
         assert!(validate_cli_session_id(AgentType::Pi, "session-x").is_err());
     }
 }

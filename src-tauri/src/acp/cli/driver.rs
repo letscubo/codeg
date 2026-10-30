@@ -4,7 +4,8 @@
 //! It consumes the connection's `cmd_tx` where an ACP adapter loop would, so the
 //! manager's admission path and `manager.cancel` work unchanged. Each `Prompt`
 //! spawns one `claude -p` process that reads a single stream-json user message
-//! from stdin, then EOF, and exits after its `result` line.
+//! from stdin. Interactive approval modes keep stdin open for control replies;
+//! all modes close it after the final `result` line.
 //!
 //! Invariant: every turn ends with exactly one `TurnComplete`. It is the only
 //! event that clears `turn_in_flight`; a missed one would wedge the connection
@@ -176,6 +177,16 @@ impl CliDriver {
         // to resume, so decide from the file rather than from turn history.
         let resume = transcript_exists(&self.claude_config_dir(), &session_id);
         let mut args = build_args(&session_id, resume, model.as_deref());
+        if let Ok(Some(mode)) = super::permissions::native_mode(&self.runtime_env, false) {
+            let at = args
+                .iter()
+                .position(|arg| arg == "--permission-mode")
+                .expect("base permission flag");
+            args[at + 1] = mode.to_string();
+            if mode != "bypassPermissions" {
+                args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
+            }
+        }
         if let Some(config) = self.companion.as_ref().map(mcp_config_json) {
             args.push("--mcp-config".to_string());
             args.push(config);
@@ -212,6 +223,8 @@ impl CliDriver {
     }
 
     async fn spawn(&self, args: &[String], model: Option<&str>) -> std::io::Result<Child> {
+        super::permissions::native_mode(&self.runtime_env, false)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut command = crate::process::tokio_command(&self.executable);
         command
             .args(args)
@@ -246,13 +259,22 @@ impl CliDriver {
         self.child_pid.store(pid, Ordering::SeqCst);
         tracing::info!(connection_id = %self.connection_id, pid, "[CLI] turn started");
 
+        let interactive = matches!(
+            super::permissions::native_mode(&self.runtime_env, false),
+            Ok(Some("default" | "auto"))
+        );
+        let mut control_stdin = None;
         if let Some(mut stdin) = child.stdin.take() {
-            tokio::spawn(async move {
+            if interactive {
                 if let Err(e) = stdin.write_all(stdin_line.as_bytes()).await {
-                    tracing::warn!("[CLI] failed to write the prompt to stdin: {e}");
+                    tracing::warn!("[CLI] failed to write prompt: {e}");
                 }
-                // Dropping stdin sends EOF: the CLI exits after this turn.
-            });
+                control_stdin = Some(stdin);
+            } else {
+                tokio::spawn(async move {
+                    let _ = stdin.write_all(stdin_line.as_bytes()).await;
+                });
+            }
         }
 
         let stderr_tail = Arc::new(std::sync::Mutex::new(OutputTail::default()));
@@ -269,10 +291,14 @@ impl CliDriver {
         });
 
         let end = match child.stdout.take() {
-            Some(stdout) => self.pump(stdout, session_id, commands).await,
+            Some(stdout) => {
+                self.pump(stdout, session_id, commands, control_stdin.as_mut())
+                    .await
+            }
             None => TurnEnd::Eof,
         };
 
+        drop(control_stdin);
         match end {
             TurnEnd::Finished(finish) => {
                 let status = wait_or_terminate(&mut child, pid).await;
@@ -327,11 +353,15 @@ impl CliDriver {
         stdout: tokio::process::ChildStdout,
         session_id: &str,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
+        mut control_stdin: Option<&mut tokio::process::ChildStdin>,
     ) -> TurnEnd {
         let mut lines = BufReader::new(stdout).lines();
         let mut mapper =
             StreamMapper::new(Some(session_id.to_string()), Some(self.working_dir.clone()));
         let mut unparsable = 0usize;
+        let mut approvals = super::permissions::ApprovalQueue::default();
+        let mut approval_since: Option<tokio::time::Instant> = None;
+        let mut approval_tick = tokio::time::interval(Duration::from_secs(1));
         // A `result` printed while a backgrounded task still runs is NOT the
         // end: claude keeps the process alive, feeds the task's notification
         // back and runs a follow-up turn (see `stream_json` module docs). Keep
@@ -342,6 +372,11 @@ impl CliDriver {
         loop {
             let deadline = background_deadline;
             tokio::select! {
+                _ = approval_tick.tick() => {
+                    if approval_since.is_some_and(|since| since.elapsed() > Duration::from_secs(180)) {
+                        return TurnEnd::Protocol("Permission request expired".into());
+                    }
+                }
                 _ = async move {
                     match deadline {
                         Some(at) => tokio::time::sleep_until(at).await,
@@ -370,6 +405,13 @@ impl CliDriver {
                 }
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
+                        if control_stdin.is_some() {
+                            if let Some(events) = approvals.ingest(&line) {
+                                if !approvals.is_empty() && approval_since.is_none() { approval_since=Some(tokio::time::Instant::now()); }
+                                self.emit_events(events, session_id).await;
+                                continue;
+                            }
+                        }
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -433,6 +475,19 @@ impl CliDriver {
                         connection_id = %self.connection_id,
                         "[CLI] in-turn Prompt DROPPED — the turn_in_flight gate should have rejected this"
                     ),
+                    Some(ConnectionCommand::RespondPermission { request_id, option_id }) => {
+                        if let Some((line, events)) = approvals.answer(&request_id, &option_id) {
+                            if let Some(stdin) = control_stdin.as_mut() {
+                                if stdin.write_all(line.as_bytes()).await.is_err() {
+                                    return TurnEnd::Protocol("Permission response transport failed".into());
+                                }
+                                self.emit_events(events, session_id).await;
+                                approval_since=if approvals.is_empty() {None} else {Some(tokio::time::Instant::now())};
+                            } else {
+                                return TurnEnd::Protocol("Permission response transport failed".into());
+                            }
+                        }
+                    }
                     Some(other) => reject_unsupported(other),
                 },
             }
@@ -499,6 +554,12 @@ impl CliDriver {
     /// A sub-agent's own prose (`parent_tool_use_id` set) is live-only: the
     /// transcript has no nesting for it, so recording it would re-read as the
     /// main agent talking — and MyClaw's live view drops it for that reason.
+    async fn emit_events(&self, events: Vec<AcpEvent>, session_id: &str) {
+        for event in events {
+            self.emit_recorded(event, session_id).await;
+        }
+    }
+
     async fn emit_recorded(&self, event: AcpEvent, session_id: &str) {
         // 工具结果的图片先落盘:自录线路(transcript_update_for)只记路径,历史靠这份文件取图。
         // 和 ACP 通道收到工具结果时的 persist_tool_images 是同一套(按 base64 摘要命名、已存在就跳过)。
@@ -520,7 +581,9 @@ impl CliDriver {
             }
         );
         if !sidechain_prose {
-            if let Some(update) = super::dsh_driver::transcript_update_for(&event, Some(&self.working_dir)) {
+            if let Some(update) =
+                super::dsh_driver::transcript_update_for(&event, Some(&self.working_dir))
+            {
                 record_transcript_update(self.agent_type, session_id, &update);
             }
         }
@@ -759,5 +822,100 @@ impl OutputTail {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_transport_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cli_permission_pipe_round_trip_allows_or_denies_only_the_pending_native_call() {
+        for allowed in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("executed");
+            let state = Arc::new(RwLock::new(SessionState::new(
+                "approval-pipe".into(),
+                AgentType::ClaudeCode,
+                None,
+                "test".into(),
+                None,
+            )));
+            let driver = CliDriver {
+                connection_id: "approval-pipe".into(),
+                agent_type: AgentType::ClaudeCode,
+                executable: "/usr/bin/python3".into(),
+                working_dir: directory.path().into(),
+                runtime_env: BTreeMap::from([(
+                    super::super::permissions::MODE_ENV.into(),
+                    "default".into(),
+                )]),
+                state: state.clone(),
+                emitter: EventEmitter::Noop,
+                child_pid: Arc::new(AtomicU32::new(0)),
+                connections: Arc::new(Mutex::new(HashMap::new())),
+                companion: None,
+                delegation: None,
+            };
+            let script = r#"
+import json,sys,pathlib
+json.loads(sys.stdin.readline())
+print(json.dumps({'type':'control_request','request_id':'native-pending','request':{'subtype':'can_use_tool','tool_name':'Bash','input':{'command':'test'},'tool_use_id':'call'}}),flush=True)
+reply=json.loads(sys.stdin.readline())['response']
+assert reply['request_id']=='native-pending'
+if reply['response']['behavior']=='allow': pathlib.Path(sys.argv[1]).write_text('executed')
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'','duration_ms':1,'num_turns':1}),flush=True)
+"#;
+            let child = tokio::process::Command::new("/usr/bin/python3")
+                .arg("-c")
+                .arg(script)
+                .arg(&marker)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let task = tokio::spawn(async move {
+                driver
+                    .drive(
+                        child,
+                        "{\"type\":\"user\"}\n".into(),
+                        "native-session",
+                        &mut rx,
+                    )
+                    .await
+            });
+            let pending = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(pending) = state.read().await.pending_permission.clone() {
+                        break pending;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("approval must reach the normal session state");
+            tx.send(ConnectionCommand::RespondPermission {
+                request_id: "other-session".into(),
+                option_id: "allow".into(),
+            })
+            .await
+            .unwrap();
+            tx.send(ConnectionCommand::RespondPermission {
+                request_id: pending.request_id,
+                option_id: if allowed { "allow" } else { "reject" }.into(),
+            })
+            .await
+            .unwrap();
+            let (finish, disconnected) = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(finish.error.is_none(), "{:?}", finish.error);
+            assert!(!disconnected);
+            assert_eq!(marker.exists(), allowed);
+            assert!(state.read().await.pending_permission.is_none());
+        }
     }
 }

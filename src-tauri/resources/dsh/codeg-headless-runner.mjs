@@ -502,6 +502,13 @@ async function run(ctx, config, internals) {
       : await resumeHandle(ctx, agents, wantSession, agentOptions, setup, cwd);
   const agent = handle.agent;
   await agent.whenIdle();
+  const nativePermission = process.env.CODEG_CLI_PERMISSION_MODE;
+  if (nativePermission !== undefined) {
+    if (!["workspace-write", "auto", "danger-full-access"].includes(nativePermission)) throw new Error("Invalid session permission mode");
+    const permissions = ctx.get("permissionPresets");
+    if (!permissions) throw new Error("Session permission service unavailable");
+    permissions.set(agent.session, nativePermission);
+  }
   if (wantSession !== undefined) assertAdoptable(agent.session.header, wantSession, cwd);
   const firstSeq = agent.session.seq;
   // Same projection as stock, through a sink that saves tool-result images under
@@ -518,7 +525,7 @@ async function run(ctx, config, internals) {
       : undefined;
   try {
     agent.followup(
-      internals.createUserMessage({ content: [{ type: "text", text: task }], source: { kind: "user" } }),
+      internals.createUserMessage({ content: [{ type: "text", text: task }], source: { kind: "user", rpcId: `codeg-${randomUUID()}` } }),
     );
     const budgetSecs = Number(config.backgroundWaitSecs) > 0 ? Number(config.backgroundWaitSecs) : DEFAULT_BACKGROUND_WAIT_SECS;
     const settled = await settle(agents, agent, budgetSecs * 1000);

@@ -283,6 +283,7 @@ pub struct SessionState {
     /// fork(letscubo)专属: `--model` for the next CLI turn (`None` = CLI
     /// default). Unused by ACP connections.
     pub cli_model: Option<String>,
+    pub cli_permission_mode: Option<String>,
 
     // 状态
     pub status: ConnectionStatus,
@@ -710,6 +711,7 @@ impl SessionState {
             folder_id,
             transport: ConnectionTransport::Acp,
             cli_model: None,
+            cli_permission_mode: None,
             status: ConnectionStatus::Connecting,
             live_message: None,
             active_tool_calls: BTreeMap::new(),

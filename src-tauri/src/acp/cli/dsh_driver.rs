@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -198,12 +198,14 @@ impl DshDriver {
     }
 
     async fn spawn(&self, args: &[String]) -> std::io::Result<Child> {
+        super::permissions::native_mode(&self.runtime_env, true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut command = crate::process::tokio_command(&self.executable);
         command
             .args(args)
             .current_dir(&self.working_dir)
             .envs(&self.runtime_env)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -241,11 +243,22 @@ impl DshDriver {
             Some(self.working_dir.clone()),
             model,
         );
+        let mut control_stdin = child.stdin.take();
         let end = match child.stdout.take() {
-            Some(stdout) => self.pump(stdout, &mut mapper, record, commands).await,
+            Some(stdout) => {
+                self.pump(
+                    stdout,
+                    &mut mapper,
+                    record,
+                    commands,
+                    control_stdin.as_mut(),
+                )
+                .await
+            }
             None => TurnEnd::Eof,
         };
 
+        drop(control_stdin);
         match end {
             TurnEnd::Finished(finish) => {
                 let status = wait_or_terminate(&mut child, pid).await;
@@ -311,13 +324,29 @@ impl DshDriver {
         mapper: &mut DshStreamMapper,
         record: &mut TurnRecord,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
+        mut control_stdin: Option<&mut tokio::process::ChildStdin>,
     ) -> TurnEnd {
         let mut lines = BufReader::new(stdout).lines();
         let mut unparsable = 0usize;
+        let mut approvals = super::permissions::ApprovalQueue::default();
+        let mut approval_since: Option<tokio::time::Instant> = None;
+        let mut approval_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
+                _ = approval_tick.tick() => {
+                    if approval_since.is_some_and(|since| since.elapsed() > std::time::Duration::from_secs(180)) {
+                        return TurnEnd::Protocol("Permission request expired".into());
+                    }
+                }
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
+                        if control_stdin.is_some() {
+                            if let Some(events)=approvals.ingest(&line) {
+                                if !approvals.is_empty() && approval_since.is_none() {approval_since=Some(tokio::time::Instant::now());}
+                                for event in events {self.emit_recorded(event,record).await;}
+                                continue;
+                            }
+                        }
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -360,6 +389,15 @@ impl DshDriver {
                         connection_id = %self.connection_id,
                         "[CLI][dsh] in-turn Prompt DROPPED — the turn_in_flight gate should have rejected this"
                     ),
+                    Some(ConnectionCommand::RespondPermission {request_id,option_id}) => {
+                        if let Some((line,events))=approvals.answer(&request_id,&option_id) {
+                            if let Some(stdin)=control_stdin.as_mut() {
+                                if stdin.write_all(line.as_bytes()).await.is_err() {return TurnEnd::Protocol("Permission response transport failed".into());}
+                                for event in events {self.emit_recorded(event,record).await;}
+                                approval_since=if approvals.is_empty() {None} else {Some(tokio::time::Instant::now())};
+                            } else {return TurnEnd::Protocol("Permission response transport unavailable".into());}
+                        }
+                    }
                     Some(other) => reject_unsupported(other),
                 },
             }
@@ -387,9 +425,10 @@ impl DshDriver {
                     .await;
                 record.prompt_recorded = true;
             }
-        } else if let (Some(sid), Some(update)) =
-            (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
-        {
+        } else if let (Some(sid), Some(update)) = (
+            &record.session_id,
+            transcript_update_for(&event, Some(&self.working_dir)),
+        ) {
             record_transcript_update(self.agent_type, sid, &update);
         }
         self.emit(event).await;

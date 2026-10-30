@@ -42,6 +42,10 @@ pub fn build_router(
 
     let api = Router::new()
         .route("/health", post(health_check))
+        .route(
+            "/cli_permission_snapshot",
+            post(handlers::cli::cli_permission_snapshot),
+        )
         // Debug endpoint: operator-facing snapshot of `EventBusMetrics`
         // (emit volume, lag/eviction counts, attach decision counts).
         // Sits behind the same auth middleware as every other route.
@@ -808,6 +812,10 @@ pub fn build_router(
         )
         .route("/acp_connect", post(handlers::acp::acp_connect))
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
+        .route(
+            "/acp_disconnect_if_idle",
+            post(handlers::acp::acp_disconnect_if_idle),
+        )
         .route(
             "/acp_touch_connection",
             post(handlers::acp::acp_touch_connection),
@@ -1757,7 +1765,10 @@ pub fn build_router(
         .route("/myclaw/metrics", post(handlers::myclaw::metrics::metrics))
         // 「现在有没有人在用这台实例」——平台判忙/闲用(定时全量扫)。只读一个原子量,
         // 不采 CPU、不读磁盘,与 metrics 分开正是为了别为一个计数做那些系统调用。
-        .route("/myclaw/activity", get(handlers::myclaw::activity::activity))
+        .route(
+            "/myclaw/activity",
+            get(handlers::myclaw::activity::activity),
+        )
         .route("/myclaw/task", post(handlers::myclaw::task::submit))
         // 整个家目录备份到平台给的预签名地址(异步:POST 开始、GET 查状态、cancel 取消;
         // 见 handlers/myclaw/backup.rs)。备份期间 activity 报 maintenance=backup。
@@ -1765,7 +1776,10 @@ pub fn build_router(
             "/myclaw/backup",
             post(handlers::myclaw::backup::start).get(handlers::myclaw::backup::get),
         )
-        .route("/myclaw/backup/cancel", post(handlers::myclaw::backup::cancel))
+        .route(
+            "/myclaw/backup/cancel",
+            post(handlers::myclaw::backup::cancel),
+        )
         // 统一记忆:平台改了记忆 → 缓存作废,下一轮重新注入(见 acp/myclaw_memory.rs)
         .route(
             "/myclaw/memory/invalidate",
@@ -1850,7 +1864,10 @@ pub fn build_router(
         // 调用方是容器里的 CLI,只带网关凭证(原样转给网关);handler 自己只放行本机 ——
         // 对端回环且不带任何转发头,公网经反向代理进来的一律 403。
         .route("/myclaw/llm/v1/messages", post(super::llm_bridge::messages))
-        .route("/myclaw/llm/v1/responses", post(super::llm_bridge::responses))
+        .route(
+            "/myclaw/llm/v1/responses",
+            post(super::llm_bridge::responses),
+        )
         .route("/myclaw/llm/health", get(super::llm_bridge::health))
         .route(
             "/workspace_download/{ticket}",
@@ -1978,6 +1995,7 @@ async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "cliPermissionProtocol": 1,
     }))
 }
 
