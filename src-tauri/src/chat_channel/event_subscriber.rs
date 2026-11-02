@@ -435,11 +435,16 @@ async fn process_envelope(
         );
         // fork(letscubo)专属: 本轮由 turn_relay 直推渠道 → 告诉平台别再自己发回复。
         // turn_complete 是一轮的终点,取走认领;error 可能不是终点,只读。
-        if let Some(turn_id) = super::turn_relay::relay_turn_id_for(
+        if let Some((channel, turn_id)) = super::turn_relay::relay_claim_for(
             &envelope.connection_id,
             event_type == "turn_complete",
         ) {
-            payload["relay_turn_id"] = serde_json::json!(turn_id);
+            let key = if channel == "whatsapp" {
+                "whatsapp_relay_turn_id"
+            } else {
+                "relay_turn_id"
+            };
+            payload[key] = serde_json::json!(turn_id);
         }
         if let Some(reason) = stop_reason {
             payload["stop_reason"] = serde_json::json!(reason);

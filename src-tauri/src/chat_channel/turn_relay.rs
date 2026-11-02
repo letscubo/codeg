@@ -38,7 +38,8 @@
 //! 只在本进程内存里,这一轮结束即丢;不落盘、不进日志(`Debug` 已脱敏)、**不进 agent 进程
 //! 的环境变量**(agent 能执行命令)。
 //!
-//! 目前只接 Telegram;Slack 的流式接口(chat.startStream / appendStream)另行接入。
+//! Telegram 直接发送；WhatsApp 复用事件源与正文缓冲，通过受限平台代理发送/编辑并维护 typing。
+//! WhatsApp 网关凭证始终留在平台，Codeg 不获得平台共用密钥。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -51,10 +52,16 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::acp::internal_bus::InternalEventBus;
-use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
+#[cfg(test)]
+use crate::acp::types::AcpEvent;
+use crate::acp::types::EventEnvelope;
 use crate::db::service::app_metadata_service;
 
 use super::tg_html;
+
+mod events;
+mod whatsapp;
+use events::{classify, PublicEvent};
 
 /// 两次更新(草稿或编辑正文)的最小间隔。实测草稿 1/s 稳定、1.5/s 触发 429;
 /// editMessageText 与它共享限额,同样按 1/s 节流(业界常见取 200–800ms,这里保守些)。
@@ -89,16 +96,29 @@ pub enum OutboundSpec {
         #[serde(default)]
         texts: RelayTexts,
     },
+    /// Scoped platform proxy; Codeg owns pacing and typing, platform retains WAHA credentials.
+    #[serde(rename_all = "camelCase")]
+    Whatsapp {
+        turn_id: String,
+        delivery_grant: String,
+    },
 }
 
 impl std::fmt::Debug for OutboundSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutboundSpec::Telegram { turn_id, chat_id, .. } => f
+            OutboundSpec::Telegram {
+                turn_id, chat_id, ..
+            } => f
                 .debug_struct("Telegram")
                 .field("turn_id", turn_id)
                 .field("chat_id", chat_id)
                 .field("bot_token", &"<redacted>")
+                .finish(),
+            OutboundSpec::Whatsapp { turn_id, .. } => f
+                .debug_struct("Whatsapp")
+                .field("turn_id", turn_id)
+                .field("delivery_grant", &"<redacted>")
                 .finish(),
         }
     }
@@ -107,7 +127,9 @@ impl std::fmt::Debug for OutboundSpec {
 impl OutboundSpec {
     pub fn turn_id(&self) -> &str {
         match self {
-            OutboundSpec::Telegram { turn_id, .. } => turn_id,
+            OutboundSpec::Telegram { turn_id, .. } | OutboundSpec::Whatsapp { turn_id, .. } => {
+                turn_id
+            }
         }
     }
 }
@@ -152,6 +174,28 @@ impl Composer {
 
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// WhatsApp has a UTF-16 limit; share the same buffer/index and newline-aware split.
+    pub(crate) fn push_whatsapp(&mut self, delta: &str) -> Vec<String> {
+        self.text.push_str(delta);
+        let mut chunks = Vec::new();
+        while self.text.encode_utf16().count() > 3800 {
+            let mut units = 0;
+            let chars = self
+                .text
+                .chars()
+                .take_while(|c| {
+                    units += c.len_utf16();
+                    units <= 3800
+                })
+                .count();
+            let (head, tail) = split_head(&self.text, chars);
+            chunks.push(head);
+            self.text = tail;
+            self.index += 1;
+        }
+        chunks
     }
 
     /// 追加正文。超长时把要**定稿**的头部切出来返回(调用方把当前消息改成它,再开新消息),
@@ -329,8 +373,13 @@ impl TelegramTurn {
         let mut status_tool: Option<String> = None;
 
         // 立刻给出状态(还没有正文,走草稿:不占消息历史)
-        self.draft(&status, &mut draft_shown, &mut last_update, &mut blocked_until)
-            .await;
+        self.draft(
+            &status,
+            &mut draft_shown,
+            &mut last_update,
+            &mut blocked_until,
+        )
+        .await;
 
         let outcome = loop {
             let want = self.display(&body, &status, status_tool.is_some());
@@ -355,8 +404,8 @@ impl TelegramTurn {
                 input = rx.recv() => match input {
                     None => break Outcome::Aborted,
                     Some(RelayInput::Lagged) => break Outcome::Lagged,
-                    Some(RelayInput::Event(env)) => match &env.payload {
-                        AcpEvent::ContentDelta { text, parent_tool_use_id: None } => {
+                    Some(RelayInput::Event(env)) => match classify(&env.payload) {
+                        PublicEvent::Text(text) => {
                             // 超长:当前这条消息定稿成 head,之后的正文另起一条
                             for head in body.push(text) {
                                 delivery_failed |= !self
@@ -365,39 +414,35 @@ impl TelegramTurn {
                                 live = None;
                             }
                         }
-                        AcpEvent::ToolCall { tool_call_id, title, description, .. } => {
-                            if let Some(line) = tool_status(description.as_deref(), title) {
+                        PublicEvent::ToolStarted { id: tool_call_id, title, description, .. } => {
+                            if let Some(line) = tool_status(description, title) {
                                 status = line;
-                                status_tool = Some(tool_call_id.clone());
+                                status_tool = Some(tool_call_id.to_string());
                             }
                         }
-                        AcpEvent::ToolCallUpdate { tool_call_id, title, description, status: tool_state, .. }
-                            if status_tool.as_deref() == Some(tool_call_id.as_str()) =>
+                        PublicEvent::ToolUpdated { id: tool_call_id, title, description, state: tool_state, .. }
+                            if status_tool.as_deref() == Some(tool_call_id) =>
                         {
-                            if matches!(tool_state.as_deref(), Some("completed" | "failed")) {
+                            if matches!(tool_state, Some("completed" | "failed")) {
                                 status = self.texts.thinking.clone();
                                 status_tool = None;
                             } else if let Some(line) = description
-                                .as_deref()
                                 .map(|d| tool_status(Some(d), ""))
-                                .or_else(|| title.as_deref().map(|t| tool_status(None, t)))
+                                .or_else(|| title.map(|t| tool_status(None, t)))
                                 .flatten()
                             {
                                 // 首帧没带说明、更新时才补上的
                                 status = line;
                             }
                         }
-                        AcpEvent::TurnComplete { stop_reason, .. } => {
-                            break match stop_reason.as_str() {
+                        PublicEvent::Finished(stop_reason) => {
+                            break match stop_reason {
                                 "end_turn" => Outcome::Completed,
                                 "cancelled" => Outcome::Cancelled,
                                 _ => Outcome::Failed,
                             };
                         }
-                        AcpEvent::Error { terminal: true, .. } => break Outcome::Failed,
-                        AcpEvent::StatusChanged {
-                            status: ConnectionStatus::Disconnected | ConnectionStatus::Error,
-                        } => break Outcome::Failed,
+                        PublicEvent::Failed => break Outcome::Failed,
                         _ => {}
                     },
                 },
@@ -427,11 +472,20 @@ impl TelegramTurn {
         let final_text = body.text().trim().to_string();
         if !final_text.is_empty() {
             delivery_failed |= !self
-                .write(&final_text, &mut live, &mut fence, &mut message_ids, &mut last_update, &mut blocked_until)
+                .write(
+                    &final_text,
+                    &mut live,
+                    &mut fence,
+                    &mut message_ids,
+                    &mut last_update,
+                    &mut blocked_until,
+                )
                 .await;
         }
         let note = match outcome {
-            Outcome::Completed if final_text.is_empty() && message_ids.is_empty() => Some(&self.texts.empty),
+            Outcome::Completed if final_text.is_empty() && message_ids.is_empty() => {
+                Some(&self.texts.empty)
+            }
             Outcome::Cancelled => Some(&self.texts.cancelled),
             Outcome::Failed => Some(&self.texts.failed),
             _ => None,
@@ -496,11 +550,17 @@ impl TelegramTurn {
             None => {
                 let body = serde_json::json!({ "chat_id": self.chat_id, "text": html, "parse_mode": "HTML" });
                 let plain = serde_json::json!({ "chat_id": self.chat_id, "text": text });
-                match self.send_with_plain_fallback("sendMessage", body, plain).await {
+                match self
+                    .send_with_plain_fallback("sendMessage", body, plain)
+                    .await
+                {
                     Ok(id) => {
                         if let Some(id) = id {
                             message_ids.push(id);
-                            *live = Some(Live { message_id: id, shown: text.to_string() });
+                            *live = Some(Live {
+                                message_id: id,
+                                shown: text.to_string(),
+                            });
                         }
                         true
                     }
@@ -514,8 +574,12 @@ impl TelegramTurn {
                 let body = serde_json::json!({
                     "chat_id": self.chat_id, "message_id": id, "text": html, "parse_mode": "HTML"
                 });
-                let plain = serde_json::json!({ "chat_id": self.chat_id, "message_id": id, "text": text });
-                match self.send_with_plain_fallback("editMessageText", body, plain).await {
+                let plain =
+                    serde_json::json!({ "chat_id": self.chat_id, "message_id": id, "text": text });
+                match self
+                    .send_with_plain_fallback("editMessageText", body, plain)
+                    .await
+                {
                     Ok(_) => {
                         if let Some(l) = live.as_mut() {
                             l.shown = text.to_string();
@@ -527,7 +591,15 @@ impl TelegramTurn {
                         // 用户把消息删了:另起一条接着写
                         tracing::warn!("[TurnRelay] telegram message {id} no longer editable ({e}); sending a new one");
                         *live = None;
-                        Box::pin(self.write(text, live, fence, message_ids, last_update, blocked_until)).await
+                        Box::pin(self.write(
+                            text,
+                            live,
+                            fence,
+                            message_ids,
+                            last_update,
+                            blocked_until,
+                        ))
+                        .await
                     }
                     Err(e) => {
                         tracing::warn!("[TurnRelay] telegram editMessageText failed: {e}");
@@ -578,7 +650,13 @@ impl TelegramTurn {
     ) -> Result<Option<i64>, String> {
         match self.call_with_retry(method, html).await {
             Ok(id) => Ok(id),
-            Err(e) if e.contains("not modified") || e.contains("not found") || e.contains("can't be edited") => Err(e),
+            Err(e)
+                if e.contains("not modified")
+                    || e.contains("not found")
+                    || e.contains("can't be edited") =>
+            {
+                Err(e)
+            }
             Err(e) => {
                 tracing::warn!("[TurnRelay] telegram HTML rejected ({e}); retrying as plain text");
                 self.call_with_retry(method, plain).await
@@ -619,6 +697,7 @@ struct Worker {
 
 struct Claim {
     turn_id: String,
+    channel: &'static str,
     at: std::time::Instant,
 }
 
@@ -646,10 +725,7 @@ fn relay(bus: &Arc<InternalEventBus>, db: &DatabaseConnection) -> Arc<Relay> {
     }))
 }
 
-async fn dispatch(
-    relay: Arc<Relay>,
-    mut rx: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>,
-) {
+async fn dispatch(relay: Arc<Relay>, mut rx: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
         match rx.recv().await {
@@ -707,6 +783,10 @@ fn register(
 ) -> String {
     let relay = relay(bus, db);
     let turn_id = spec.turn_id().to_string();
+    let channel = match &spec {
+        OutboundSpec::Telegram { .. } => "telegram",
+        OutboundSpec::Whatsapp { .. } => "whatsapp",
+    };
     let (tx, rx) = mpsc::unbounded_channel();
     {
         let mut workers = relay.workers.lock().unwrap();
@@ -724,31 +804,68 @@ fn register(
             connection_id.to_string(),
             Claim {
                 turn_id: turn_id.clone(),
+                channel,
                 at: std::time::Instant::now(),
             },
         );
     }
 
-    let OutboundSpec::Telegram {
-        bot_token,
-        chat_id,
-        draft_id,
-        texts,
-        ..
-    } = spec;
-    let turn = TelegramTurn {
-        api: Arc::new(HttpTg {
-            client: relay.client.clone(),
-            token: bot_token,
-        }),
-        chat_id,
-        draft_base: draft_id.filter(|d| *d > 0).unwrap_or_else(|| derive_draft_base(&turn_id)),
-        texts,
-    };
     let connection_id = connection_id.to_string();
     let tid = turn_id.clone();
     tokio::spawn(async move {
-        let report = turn.run(rx).await;
+        let report = match spec {
+            OutboundSpec::Telegram {
+                bot_token,
+                chat_id,
+                draft_id,
+                texts,
+                ..
+            } => {
+                TelegramTurn {
+                    api: Arc::new(HttpTg {
+                        client: relay.client.clone(),
+                        token: bot_token,
+                    }),
+                    chat_id,
+                    draft_base: draft_id
+                        .filter(|d| *d > 0)
+                        .unwrap_or_else(|| derive_draft_base(&tid)),
+                    texts,
+                }
+                .run(rx)
+                .await
+            }
+            OutboundSpec::Whatsapp { delivery_grant, .. } => {
+                let urls = app_metadata_service::get_value(
+                    &relay.db,
+                    super::event_subscriber::EVENT_WEBHOOKS_KEY,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|json| super::webhook::enabled_webhook_urls(&json))
+                .unwrap_or_default();
+                match whatsapp::endpoint(&urls, &tid)
+                    .and_then(|url| whatsapp::HttpBroker::new(url, delivery_grant))
+                {
+                    Ok(broker) => {
+                        whatsapp::WhatsappTurn {
+                            broker: Arc::new(broker),
+                        }
+                        .run(rx)
+                        .await
+                    }
+                    Err(reason) => {
+                        tracing::warn!("[TurnRelay] whatsapp inbox unavailable: {reason}");
+                        TurnReport {
+                            outcome: Outcome::Failed,
+                            delivery_failed: true,
+                            message_ids: vec![],
+                        }
+                    }
+                }
+            }
+        };
         tracing::info!(
             "[TurnRelay] turn {tid} on {connection_id}: {:?} (delivery_failed={})",
             report.outcome,
@@ -760,8 +877,17 @@ fn register(
                 workers.remove(&connection_id);
             }
         }
-        if report.delivery_failed {
-            report_failure(&relay, &connection_id, conversation_id, &tid, &report.message_ids).await;
+        // WhatsApp failures stay owned by its scoped proxy receipts. Never invoke
+        // Telegram's legacy fallback or expose a WhatsApp claim as Telegram.
+        if report.delivery_failed && channel == "telegram" {
+            report_failure(
+                &relay,
+                &connection_id,
+                conversation_id,
+                &tid,
+                &report.message_ids,
+            )
+            .await;
         }
     });
     turn_id
@@ -780,8 +906,14 @@ pub fn abort(connection_id: &str, turn_id: &str) {
     }
 }
 
-/// webhook 用:这条连接的当前轮是否由本模块直推。`take` = 取走(turn_complete 时)。
+/// Legacy Telegram claim accessor. WhatsApp claims use `relay_claim_for` and a
+/// distinct webhook field, so an old platform never treats them as Telegram.
 pub fn relay_turn_id_for(connection_id: &str, take: bool) -> Option<String> {
+    relay_claim_for(connection_id, take)
+        .and_then(|(channel, id)| (channel == "telegram").then_some(id))
+}
+
+pub fn relay_claim_for(connection_id: &str, take: bool) -> Option<(&'static str, String)> {
     let relay = RELAY.get()?;
     let mut claims = relay.claims.lock().unwrap();
     let fresh = claims
@@ -792,9 +924,11 @@ pub fn relay_turn_id_for(connection_id: &str, take: bool) -> Option<String> {
         return None;
     }
     if take {
-        claims.remove(connection_id).map(|c| c.turn_id)
+        claims.remove(connection_id).map(|c| (c.channel, c.turn_id))
     } else {
-        claims.get(connection_id).map(|c| c.turn_id.clone())
+        claims
+            .get(connection_id)
+            .map(|c| (c.channel, c.turn_id.clone()))
     }
 }
 
@@ -806,12 +940,13 @@ async fn report_failure(
     turn_id: &str,
     message_ids: &[i64],
 ) {
-    let urls = app_metadata_service::get_value(&relay.db, super::event_subscriber::EVENT_WEBHOOKS_KEY)
-        .await
-        .ok()
-        .flatten()
-        .map(|json| super::webhook::enabled_webhook_urls(&json))
-        .unwrap_or_default();
+    let urls =
+        app_metadata_service::get_value(&relay.db, super::event_subscriber::EVENT_WEBHOOKS_KEY)
+            .await
+            .ok()
+            .flatten()
+            .map(|json| super::webhook::enabled_webhook_urls(&json))
+            .unwrap_or_default();
     if urls.is_empty() {
         return;
     }
@@ -902,14 +1037,20 @@ mod tests {
 
     #[async_trait]
     impl TgApi for FakeTg {
-        async fn call(&self, method: &str, body: serde_json::Value) -> Result<Option<i64>, TgError> {
+        async fn call(
+            &self,
+            method: &str,
+            body: serde_json::Value,
+        ) -> Result<Option<i64>, TgError> {
             let text = body["text"].as_str().unwrap_or_default().to_string();
             self.calls.lock().unwrap().push((method.to_string(), text));
             if self.fail_messages && method == "sendMessage" {
                 return Err(TgError::Other("Forbidden".into()));
             }
             if self.edit_gone && method == "editMessageText" {
-                return Err(TgError::Other("Bad Request: message to edit not found".into()));
+                return Err(TgError::Other(
+                    "Bad Request: message to edit not found".into(),
+                ));
             }
             if self.reject_html && body.get("parse_mode").is_some() {
                 return Err(TgError::Other("Bad Request: can't parse entities".into()));
@@ -923,7 +1064,7 @@ mod tests {
         }
     }
 
-    fn env(payload: AcpEvent) -> RelayInput {
+    pub(super) fn env(payload: AcpEvent) -> RelayInput {
         RelayInput::Event(Arc::new(EventEnvelope {
             seq: 0,
             connection_id: "c1".into(),
@@ -931,14 +1072,14 @@ mod tests {
         }))
     }
 
-    fn delta(t: &str) -> RelayInput {
+    pub(super) fn delta(t: &str) -> RelayInput {
         env(AcpEvent::ContentDelta {
             text: t.into(),
             parent_tool_use_id: None,
         })
     }
 
-    fn complete(reason: &str) -> RelayInput {
+    pub(super) fn complete(reason: &str) -> RelayInput {
         env(AcpEvent::TurnComplete {
             session_id: "s".into(),
             stop_reason: reason.into(),
@@ -947,7 +1088,7 @@ mod tests {
         })
     }
 
-    fn tool_call(id: &str, title: &str, description: Option<&str>) -> RelayInput {
+    pub(super) fn tool_call(id: &str, title: &str, description: Option<&str>) -> RelayInput {
         env(AcpEvent::ToolCall {
             tool_call_id: id.into(),
             title: title.into(),
@@ -964,7 +1105,7 @@ mod tests {
         })
     }
 
-    fn tool_done(id: &str) -> RelayInput {
+    pub(super) fn tool_done(id: &str) -> RelayInput {
         env(AcpEvent::ToolCallUpdate {
             tool_call_id: id.into(),
             title: None,
@@ -1027,7 +1168,13 @@ mod tests {
         let api = Arc::new(FakeTg::default());
         let r = run_with(
             Arc::clone(&api),
-            vec![delta("我先看看"), tool_call("t", "Bash", None), delta("结论是 "), delta("42"), complete("end_turn")],
+            vec![
+                delta("我先看看"),
+                tool_call("t", "Bash", None),
+                delta("结论是 "),
+                delta("42"),
+                complete("end_turn"),
+            ],
         )
         .await;
         assert_eq!(r.outcome, Outcome::Completed);
@@ -1036,7 +1183,10 @@ mod tests {
         assert_eq!(messages(&api), vec!["我先看看结论是 42"]);
         assert_eq!(r.message_ids, vec![1]);
         // 第一次调用就是「思考中」状态,不是空草稿
-        assert_eq!(drafts(&api).first().unwrap(), &RelayTexts::default().thinking);
+        assert_eq!(
+            drafts(&api).first().unwrap(),
+            &RelayTexts::default().thinking
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1069,7 +1219,8 @@ mod tests {
 
         tx.send(delta("正文")).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况"))).unwrap();
+        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况")))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(edits(&api).last().unwrap(), "正文\n\n🔧 查看磁盘使用情况");
 
@@ -1087,14 +1238,18 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(turn_with(Arc::clone(&api)).run(rx));
 
-        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况"))).unwrap();
+        tx.send(tool_call("t1", "df -h", Some("查看磁盘使用情况")))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(drafts(&api).last().unwrap(), "🔧 查看磁盘使用情况");
         assert!(messages(&api).is_empty(), "还没有正文就不占消息历史");
 
         tx.send(tool_done("t1")).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(drafts(&api).last().unwrap(), &RelayTexts::default().thinking);
+        assert_eq!(
+            drafts(&api).last().unwrap(),
+            &RelayTexts::default().thinking
+        );
 
         tx.send(complete("end_turn")).unwrap();
         handle.await.unwrap();
@@ -1107,8 +1262,15 @@ mod tests {
         assert_eq!(messages(&api), vec![RelayTexts::default().empty]);
 
         let api = Arc::new(FakeTg::default());
-        run_with(Arc::clone(&api), vec![delta("写了一半"), complete("cancelled")]).await;
-        assert_eq!(messages(&api), vec!["写了一半".to_string(), RelayTexts::default().cancelled]);
+        run_with(
+            Arc::clone(&api),
+            vec![delta("写了一半"), complete("cancelled")],
+        )
+        .await;
+        assert_eq!(
+            messages(&api),
+            vec!["写了一半".to_string(), RelayTexts::default().cancelled]
+        );
 
         let api = Arc::new(FakeTg::default());
         let r = run_with(Arc::clone(&api), vec![complete("max_tokens")]).await;
@@ -1132,14 +1294,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn markdown_is_sent_as_html_and_falls_back_to_plain() {
         let api = Arc::new(FakeTg::default());
-        run_with(Arc::clone(&api), vec![delta("**总结**:磁盘 `/` 充裕"), complete("end_turn")]).await;
+        run_with(
+            Arc::clone(&api),
+            vec![delta("**总结**:磁盘 `/` 充裕"), complete("end_turn")],
+        )
+        .await;
         assert_eq!(messages(&api), vec!["<b>总结</b>:磁盘 <code>/</code> 充裕"]);
 
         let api = Arc::new(FakeTg {
             reject_html: true,
             ..Default::default()
         });
-        let r = run_with(Arc::clone(&api), vec![delta("**总结**"), complete("end_turn")]).await;
+        let r = run_with(
+            Arc::clone(&api),
+            vec![delta("**总结**"), complete("end_turn")],
+        )
+        .await;
         assert!(!r.delivery_failed);
         // 先试 HTML 被拒,再以原文纯文本发出
         assert_eq!(messages(&api), vec!["<b>总结</b>", "**总结**"]);
@@ -1185,21 +1355,32 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(6)).await;
         assert_eq!(drafts(&api).len(), 2);
 
-        // 连续来字:距上次更新已超过 1 秒,第一个字立刻发出;余下攒到下一次一起写
-        for t in ["a", "b", "c", "d"] {
+        // Establish the first send before queueing the burst. Queueing all four
+        // deltas together can legitimately send "abcd" once with no edit at all.
+        tx.send(delta("a")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(messages(&api), vec!["a"]);
+        for t in ["b", "c", "d"] {
             tx.send(delta(t)).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        // 距上次更新已超过 1 秒,先到的字立刻发出(select 先取事件还是先触发计时器不确定,
-        // 所以只断言「发了一条、内容是 abcd 的前缀」),余下攒到下一次一起写
+        // The remaining burst updates the existing message after the throttle.
         assert_eq!(messages(&api).len(), 1);
-        assert!("abcd".starts_with(messages(&api)[0].as_str()), "{:?}", messages(&api));
+        assert!(
+            "abcd".starts_with(messages(&api)[0].as_str()),
+            "{:?}",
+            messages(&api)
+        );
         assert_eq!(edits(&api).last().unwrap(), "abcd");
 
         // 正文消息不会过期 → 没有新字就不再调用
         let before = api.calls.lock().unwrap().len();
         tokio::time::sleep(Duration::from_secs(20)).await;
-        assert_eq!(api.calls.lock().unwrap().len(), before, "静默时不打扰 Telegram");
+        assert_eq!(
+            api.calls.lock().unwrap().len(),
+            before,
+            "静默时不打扰 Telegram"
+        );
 
         tx.send(complete("end_turn")).unwrap();
         let r = handle.await.unwrap();

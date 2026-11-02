@@ -1978,6 +1978,8 @@ async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        // Inbox protocol only. This does not claim that WhatsApp delivery is enabled.
+        "capabilities": ["whatsapp_relay_proxy_v2"],
     }))
 }
 
