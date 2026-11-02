@@ -6,6 +6,12 @@ This file provides guidance to Code Agent when working with code in this reposit
 
 Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、OpenClaw、Cline 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
 
+## 分支工作流（2026-11-03，用户明确要求）
+
+- Codeg 后续开发与迭代直接在 `main` 分支进行，不再默认创建功能分支。
+- 开始修改和提交前先同步 `origin/main`，保护并恢复已有工作区改动。只有用户以后明确改变要求时，才改用其他分支。
+- commit、push、版本 tag 和 Release 仍分别遵守用户授权范围；“在 main 开发”不代表可以自行推送或发版。
+
 ## 技术栈
 
 - **服务器运行时**: 独立 Rust 二进制（Axum HTTP + WebSocket）—— 本 fork 的唯一交付物
@@ -133,7 +139,7 @@ cargo insta review
 }
 ```
 
-本地验证：服务器模式测试代码仅编译（不运行数据库用例）；11 项已审查无数据库 Prompt 测试及 6 项执行器守卫测试通过。codeg-server、codeg-mcp、桌面 codeg 的 cargo check 通过。严格 Clippy 被 7 处既有问题阻断（event_bridge 文档空行、pi_stream/turn_relay 未使用方法、connection 的 future/参数数量、registry match、session_commands if）；未扩展本次任务清理它们。完整仓库 fmt 亦有既有差异，仅对本次重写的 Prompt 实现和测试做了格式检查。
+本地验证：服务器模式测试代码仅编译（不运行数据库用例）；13 项已审查无数据库 Prompt 测试及 6 项执行器守卫测试通过。codeg-server、codeg-mcp、桌面 codeg 的 cargo check 通过。严格 Clippy 被 7 处既有问题阻断（event_bridge 文档空行、pi_stream/turn_relay 未使用方法、connection 的 future/参数数量、registry match、session_commands if）；未扩展本次任务清理它们。完整仓库 fmt 亦有既有差异，仅对本次重写的 Prompt 实现和测试做了格式检查。
 
 ## WhatsApp 独立 relay 地址
 
