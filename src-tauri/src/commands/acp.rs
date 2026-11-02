@@ -10881,11 +10881,12 @@ pub async fn acp_prompt(
     folder_id: Option<i32>,
     conversation_id: Option<i32>,
     client_message_id: Option<String>,
+    internal_prompt: Option<String>,
     db: State<'_, crate::db::AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
     manager
-        .send_prompt_linked_with_message_id(
+        .send_prompt_linked_with_internal_prompt(
             &db,
             &connection_id,
             blocks,
@@ -10893,6 +10894,7 @@ pub async fn acp_prompt(
             conversation_id,
             None,
             client_message_id,
+            internal_prompt,
         )
         .await
         .map(|_| ())

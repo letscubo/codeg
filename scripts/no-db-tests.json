@@ -1,19 +1,18 @@
 {
   "schemaVersion": 1,
-  "review": "PromptSource is mocked; tests use SessionState and in-memory channels. No SQL database, migrations, real agents or network. Other suites are compile-only.",
-  "sourceSha256": "d9f9066675fa3f9e63c7d1438f399d9ff3dd5925c4795407e4871b296e868ca3",
+  "review": "Reviewed request deserialization and pure block construction; manager tests use SessionState, Noop emitter and in-memory channels. No AppDatabase, SQL, migrations, agent processes or network. Other suites are compile-only.",
+  "sourceSha256": "ef42cbcdf7d2de0f86da452da0ff2df58781701e39e9ebf8fe1d8b175e7acd85",
   "tests": [
-    "acp::manager::internal_prompt_tests::myclaw_prompt_busy_and_empty_are_rejected_before_config_reads",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_advance_phase",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_empty_first_config_still_advances_phase",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_failed_config_does_not_enqueue_or_consume_first_phase",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_first_then_every_followup_preserves_user_echo_and_reads_updated_config",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_native_history_evidence_distinguishes_fresh_resume_and_accepted",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_native_session_change_clears_fresh_evidence",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_resumed_connection_uses_persisted_history_even_without_local_turns",
-    "acp::manager::internal_prompt_tests::myclaw_prompt_scope_change_rechecks_phase_and_attachments_are_preserved",
-    "acp::myclaw_prompt::tests::myclaw_prompt_first_gets_both_and_followups_get_every_message_prompt",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_absent_null_empty_and_whitespace_do_not_inject",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_busy_and_empty_are_still_rejected",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_context",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_context_does_not_cross_connections_or_depend_on_history",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_each_request_uses_only_its_own_context",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_inline_context_preserves_user_echo_and_attachments",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_invalid_context_never_enqueues_or_wedges_gate",
+    "acp::myclaw_prompt::tests::myclaw_prompt_cli_and_acp_deserialize_the_same_parameter",
+    "acp::myclaw_prompt::tests::myclaw_prompt_omitted_null_and_empty_http_parameters_are_optional",
     "acp::myclaw_prompt::tests::myclaw_prompt_preserves_unicode_and_escapes_reserved_delimiters",
-    "acp::myclaw_prompt::tests::myclaw_prompt_requires_explicit_fields_and_bounds_both_values"
+    "acp::myclaw_prompt::tests::myclaw_prompt_size_limit_is_utf8_bytes_and_error_is_redacted"
   ]
 }

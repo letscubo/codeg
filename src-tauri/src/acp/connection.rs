@@ -2371,7 +2371,6 @@ pub async fn spawn_agent_connection(
     // first event (StatusChanged{Connecting} below) doesn't race with the
     // installer. The receiver is returned to `spawn_agent`, which holds the
     // per-session dedup lock until this rx fires (or times out / aborts).
-    initial_state.internal_prompt_fresh_session = session_id.is_none();
     let session_started_rx = initial_state.install_session_started_signal();
     // Record what this launch's environment freezes before the state is shared:
     // the emit path and the preference replay both read it, and both run after

@@ -32,10 +32,10 @@ codeg 自带的工作台。因此：
 
 - 测试不得创建或初始化数据库，包括内存 SQLite、临时 SQLite 文件、测试数据库及任何迁移、种子写入。
 - 现有依赖真实数据库的用例仅保留编译检查（`cargo test --no-run`），不得直接执行全量 `cargo test`。这不代表数据库集成测试已通过。
-- 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前为 12 项 Prompt 测试。它们使用内存对象、模拟 PromptSource 和通道，不创建 SQLite。
+- 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前为 11 项 Prompt 测试。它们只使用请求反序列化、内存 SessionState、Noop emitter 和通道，不创建 SQLite。
 - 新增或修改测试应使用 mock/fake 等无数据库方式。Rust 源码或依赖变化后，必须重新核对允许执行用例的调用链并更新清单指纹；不能只为通过 CI 自动刷新指纹或扩大匹配条件。
 - 按用户要求不修改 `.github/workflows/test.yml`。该工作流仍含建库测试，不得触发；本次发布提交使用 `[skip ci]` 跳过 push/pull_request 自动测试，通过 `gh workflow run release.yml --ref <版本标签>` 手动触发 Release。
-- Release 在打包发布前执行保护脚本测试和已审查的 12 项无数据库 Prompt 测试（`node scripts/test-no-db.mjs server --release`）；不会执行全量数据库测试。不得把这一结果描述为全量测试通过。
+- Release 在打包发布前执行保护脚本测试和已审查的 11 项无数据库 Prompt 测试（`node scripts/test-no-db.mjs server --release`）；不会执行全量数据库测试。不得把这一结果描述为全量测试通过。
 
 ### Rust（在 `src-tauri/` 目录下执行）
 
@@ -111,3 +111,26 @@ cargo insta review
 
 - Rust：2021 edition，使用 `thiserror` 定义错误类型
 - 仓库里剩余的少量 `.mjs`（sidecar 脚本、dsh 插件）沿用 Prettier 默认：无分号、尾逗号（es5）、2 空格缩进
+
+
+## 内部提示词参数（v0.30.10-78）
+
+- `/api/cli_prompt`、`/api/acp_prompt` 接受可选字符串 `internalPrompt`；Tauri `acp_prompt` 同义。由调用方提供本轮最终提示词，Codeg 不再调用 `/api/codeg/prompt/snapshot`、读取 agent_config 或判断首轮/续聊。
+- 省略、null、空字符串、纯空白都不注入；每轮独立，不缓存、不沿用上一轮，不在 SessionState 保存内容。
+- 非空内容只插入执行用 blocks，用户消息回显、clientMessageId、附件、标题与预览仍取原始消息。沿用 v1 `myclaw_internal_prompt` 包装；`phase="existing_session"` 仅兼容已有历史过滤器，不代表 Codeg 对会话年龄作出判断。原生运行时记录仍可能包含包装内容，平台需继续按该标记过滤。
+- 限制 UTF-8 文本为 64 KiB，错误不回显提示词；HTTP 入口在连接/会话/relay 副作用前校验。旧内部发送调用默认不提供该参数。
+- health 能力标识 `internal_prompt_inline_v1` 用于未来 MyClaw 接入协商。本次 Codeg 发版不部署 MyClaw 调用方、不执行 SQL、不升级实例；未传参数的调用方按约定不注入内部提示词。
+
+请求示例（其余 CLI 启动字段／ACP 连接字段沿用原协议）：
+
+```json
+{
+  "connectionId": "existing-connection",
+  "folderId": 1,
+  "conversationId": 137,
+  "blocks": [{ "type": "text", "text": "hi" }],
+  "internalPrompt": "本轮执行规则"
+}
+```
+
+本地验证：服务器模式测试代码仅编译（不运行数据库用例）；11 项已审查无数据库 Prompt 测试及 6 项执行器守卫测试通过。codeg-server、codeg-mcp、桌面 codeg 的 cargo check 通过。严格 Clippy 被 7 处既有问题阻断（event_bridge 文档空行、pi_stream/turn_relay 未使用方法、connection 的 future/参数数量、registry match、session_commands if）；未扩展本次任务清理它们。完整仓库 fmt 亦有既有差异，仅对本次重写的 Prompt 实现和测试做了格式检查。

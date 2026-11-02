@@ -44,6 +44,9 @@ pub struct CliPromptParams {
     pub blocks: Vec<PromptInputBlock>,
     #[serde(default)]
     pub client_message_id: Option<String>,
+    /// Final internal instructions for this request only; never part of the user echo.
+    #[serde(default)]
+    pub internal_prompt: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     /// Provider route for `model` (deepseek: the `agent-default-model` patch).
@@ -74,6 +77,8 @@ pub async fn cli_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(mut params): Json<CliPromptParams>,
 ) -> Result<Json<CliPromptResult>, AppCommandError> {
+    crate::acp::myclaw_prompt::validate_internal_prompt(params.internal_prompt.as_deref())
+        .map_err(AppCommandError::invalid_input)?;
     if params.blocks.is_empty() {
         return Err(coded_invalid(
             "invalid_params",
@@ -123,7 +128,7 @@ pub async fn cli_prompt(
         None => None,
     };
     let sent = manager
-        .send_prompt_linked_with_message_id(
+        .send_prompt_linked_with_internal_prompt(
             &state.db,
             &connection_id,
             params.blocks,
@@ -131,6 +136,7 @@ pub async fn cli_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            params.internal_prompt,
         )
         .await;
     let conversation_id = match sent {

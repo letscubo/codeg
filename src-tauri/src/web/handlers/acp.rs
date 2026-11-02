@@ -179,6 +179,9 @@ pub struct AcpPromptParams {
     pub conversation_id: Option<i32>,
     #[serde(default)]
     pub client_message_id: Option<String>,
+    /// Final internal instructions for this request only; never part of the user echo.
+    #[serde(default)]
+    pub internal_prompt: Option<String>,
     /// fork(letscubo)专属: 本轮边生成边推到渠道(见 chat_channel::turn_relay)。
     #[serde(default)]
     pub outbound: Option<crate::chat_channel::turn_relay::OutboundSpec>,
@@ -188,6 +191,8 @@ pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(mut params): Json<AcpPromptParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::acp::myclaw_prompt::validate_internal_prompt(params.internal_prompt.as_deref())
+        .map_err(AppCommandError::invalid_input)?;
     crate::web::handlers::cli::reject_cli_connection(
         &state.connection_manager,
         &params.connection_id,
@@ -210,7 +215,7 @@ pub async fn acp_prompt(
     let connection_id = params.connection_id.clone();
     state
         .connection_manager
-        .send_prompt_linked_with_message_id(
+        .send_prompt_linked_with_internal_prompt(
             &state.db,
             &params.connection_id,
             params.blocks,
@@ -218,6 +223,7 @@ pub async fn acp_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            params.internal_prompt,
         )
         .await
         .map_err(|e| {

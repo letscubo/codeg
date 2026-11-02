@@ -280,13 +280,6 @@ async fn async_main() -> ExitCode {
     // Build AppState
     let pet_state_handle = codeg_lib::pet_state_mapper::new_pet_state_handle();
     let connection_manager = codeg_lib::app_state::default_connection_manager();
-    connection_manager.install_internal_prompt_source(Arc::new(
-        codeg_lib::acp::myclaw_prompt::PlatformPromptSource {
-            db: codeg_lib::db::AppDatabase {
-                conn: db.conn.clone(),
-            },
-        },
-    ));
     let (
         delegation_broker,
         delegation_tokens,
