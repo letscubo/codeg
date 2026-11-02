@@ -3,7 +3,7 @@ use super::{
     classify, tool_status, Composer, Outcome, PublicEvent, RelayInput, TurnReport, MAX_TURN,
 };
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
@@ -13,6 +13,14 @@ const UPDATE: Duration = Duration::from_secs(2);
 const TYPING: Duration = Duration::from_secs(4);
 const EDIT_WINDOW: Duration = Duration::from_secs(14 * 60);
 const MAX_BYTES: usize = 256 * 1024;
+const STATUS_DELAY: Duration = Duration::from_secs(15);
+
+/// Opt-in negotiated by the platform; old proxies continue using the v2 presentation.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Presentation {
+    pub working: String,
+    pub waiting: String,
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -29,6 +37,9 @@ pub(super) enum Operation {
     },
     Typing {
         active: bool,
+    },
+    Reaction {
+        state: String,
     },
     Finish {
         outcome: String,
@@ -158,6 +169,77 @@ async fn typing_pump(broker: Arc<dyn Broker>, mut active: watch::Receiver<bool>)
         }
     }
 }
+// One in-flight status request; coalesce rapid tool updates. Cosmetic failures never
+// interrupt answer delivery, and no tool arguments/reasoning enter this channel.
+async fn reaction_pump(broker: Arc<dyn Broker>, mut state: watch::Receiver<Option<&'static str>>) {
+    if state.borrow().is_some() {
+        let _ = broker
+            .execute(&Operation::Reaction {
+                state: "received".into(),
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    let mut last = None;
+    loop {
+        let current = *state.borrow_and_update();
+        if current != last || current.is_none() {
+            let _ = broker
+                .execute(&Operation::Reaction {
+                    state: current.unwrap_or("clear").into(),
+                })
+                .await;
+            last = current;
+        }
+        if current.is_none() {
+            break;
+        }
+        if state.changed().await.is_err() {
+            let _ = broker
+                .execute(&Operation::Reaction {
+                    state: "clear".into(),
+                })
+                .await;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+}
+
+/// Carry fenced-code context across long-message boundaries. Only final chunks
+/// advance the context; preview edits may render the same source repeatedly.
+fn fenced_chunk(text: &str, opened: &mut Option<String>) -> String {
+    let mut result = opened
+        .as_ref()
+        .map(|marker| format!("{marker}\n"))
+        .unwrap_or_default();
+    result.push_str(text);
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(ch) = line.chars().next().filter(|c| *c == '`' || *c == '~') else {
+            continue;
+        };
+        let width = line.chars().take_while(|c| *c == ch).count();
+        if !(3..=16).contains(&width) {
+            continue;
+        }
+        match opened.as_ref() {
+            Some(marker)
+                if marker.starts_with(ch)
+                    && width >= marker.len()
+                    && line[width..].trim().is_empty() =>
+            {
+                *opened = None
+            }
+            None => *opened = Some(ch.to_string().repeat(width)),
+            _ => {}
+        }
+    }
+    if let Some(marker) = opened.as_ref() {
+        result.push_str(&format!("\n{marker}"));
+    }
+    result
+}
 struct Output {
     broker: Arc<dyn Broker>,
     live: Option<String>,
@@ -166,9 +248,17 @@ struct Output {
     index: usize,
     edit: usize,
     finals: Vec<String>,
+    presentation: bool,
+    code_fence: Option<String>,
 }
 impl Output {
     async fn show(&mut self, text: String, final_part: bool) -> bool {
+        let mut next_fence = self.code_fence.clone();
+        let text = if self.presentation {
+            fenced_chunk(&text, &mut next_fence)
+        } else {
+            text
+        };
         if !final_part
             && (self.shown == text || self.live.is_some() && self.created.elapsed() >= EDIT_WINDOW)
         {
@@ -201,6 +291,7 @@ impl Output {
                 self.live = Some(id);
                 self.shown = text;
                 if final_part {
+                    self.code_fence = next_fence;
                     self.finals.push(key);
                     self.live = None;
                     self.shown.clear();
@@ -214,11 +305,19 @@ impl Output {
 }
 pub(super) struct WhatsappTurn {
     pub broker: Arc<dyn Broker>,
+    pub presentation: Option<Presentation>,
 }
 impl WhatsappTurn {
     pub(super) async fn run(self, mut rx: mpsc::UnboundedReceiver<RelayInput>) -> TurnReport {
         let (typing, receiver) = watch::channel(true);
         let pulse = tokio::spawn(typing_pump(self.broker.clone(), receiver));
+        let rich = self.presentation.is_some();
+        let reaction = if rich {
+            let (tx, rx) = watch::channel(Some("thinking"));
+            Some((tx, tokio::spawn(reaction_pump(self.broker.clone(), rx))))
+        } else {
+            None
+        };
         let mut out = Output {
             broker: self.broker.clone(),
             live: None,
@@ -227,6 +326,8 @@ impl WhatsappTurn {
             index: 0,
             edit: 0,
             finals: vec![],
+            presentation: rich,
+            code_fence: None,
         };
         let mut composer = Composer::default();
         let mut bytes = 0usize;
@@ -235,8 +336,11 @@ impl WhatsappTurn {
         let mut status = "💭".to_owned();
         let mut dirty = false;
         let mut last = Instant::now();
+        let fallback_at = last + STATUS_DELAY;
+        let mut fallback_shown = false;
+        let mut after_tool = false;
         let deadline = Instant::now() + MAX_TURN;
-        let mut delivery_failed = !out.show(status.clone(), false).await;
+        let mut delivery_failed = !rich && !out.show(status.clone(), false).await;
         let outcome = if delivery_failed {
             Outcome::Failed
         } else {
@@ -250,10 +354,17 @@ impl WhatsappTurn {
                             match classify(&env.payload){
                                 PublicEvent::Text(text)=>{
                                     bytes+=text.len();if bytes>MAX_BYTES{break Outcome::Lagged;}
+                                    if rich && after_tool && !text.is_empty() {
+                                        if !composer.text().is_empty() && !composer.text().ends_with("\n\n") {
+                                            for head in composer.push_whatsapp("\n\n") { if !out.show(head,true).await { delivery_failed=true;break; } }
+                                        }
+                                        after_tool=false;
+                                    }
+                                    if delivery_failed { break Outcome::Failed; }
                                     for head in composer.push_whatsapp(text){if !out.show(head,true).await{delivery_failed=true;break;}}
                                     if delivery_failed{break Outcome::Failed;}
                                 }
-                                PublicEvent::ToolStarted{id,name,..}=>{tools.insert(id.to_owned());status=tool_status(None,name.unwrap_or("Tool")).unwrap_or_default().chars().take(80).collect();}
+                                PublicEvent::ToolStarted{id,name,..}=>{tools.insert(id.to_owned());after_tool=true;status=tool_status(None,name.unwrap_or("Tool")).unwrap_or_default().chars().take(80).collect();}
                                 PublicEvent::ToolUpdated{id,name,state,..}=>{
                                     if matches!(state,Some("completed"|"failed"|"cancelled")){tools.remove(id);}else if tools.contains(id)&&name.is_some(){status=tool_status(None,name.unwrap()).unwrap_or_default().chars().take(80).collect();}
                                 }
@@ -264,12 +375,31 @@ impl WhatsappTurn {
                                 PublicEvent::Ignore=>continue,
                             }
                             let _=typing.send(waiting.is_empty());dirty=true;
+                            if let Some((tx,_))=&reaction {
+                                let next=Some(if !waiting.is_empty(){"waiting"}else if !tools.is_empty(){"tool"}else if composer.text().is_empty(){"thinking"}else{"writing"});
+                                tx.send_if_modified(|current| { if *current==next {false} else {*current=next;true} });
+                            }
                         }
                     },
                     _=tokio::time::sleep_until(next), if dirty=>{
-                        let note=if !waiting.is_empty(){"⏸"}else if !tools.is_empty(){&status}else if composer.text().is_empty(){"💭"}else{"✍️"};
-                        let text=if composer.text().is_empty(){note.to_owned()}else{format!("{}\n\n{note}",composer.text())};
-                        if !out.show(text,false).await{delivery_failed=true;break Outcome::Failed;}dirty=false;last=Instant::now();
+                        let text = if let Some(p)=&self.presentation {
+                            if !waiting.is_empty() { Some(format!("{}\n\n{}",composer.text(),p.waiting.chars().take(120).collect::<String>()).trim().to_owned()) }
+                            else if !composer.text().trim().is_empty() && (out.live.is_some() || composer.text().chars().count() >= 20) { Some(composer.text().to_owned()) }
+                            else if out.live.is_some() { Some(p.working.chars().take(120).collect()) }
+                            else { None }
+                        } else {
+                            let note=if !waiting.is_empty(){"⏸"}else if !tools.is_empty(){&status}else if composer.text().is_empty(){"💭"}else{"✍️"};
+                            Some(if composer.text().is_empty(){note.to_owned()}else{format!("{}\n\n{note}",composer.text())})
+                        };
+                        if let Some(text)=text { if !out.show(text,false).await{delivery_failed=true;break Outcome::Failed;} }
+                        dirty=false;last=Instant::now();
+                    }
+                    _=tokio::time::sleep_until(fallback_at), if rich && !fallback_shown=>{
+                        fallback_shown=true;
+                        if out.live.is_none() && composer.text().trim().is_empty() {
+                            let text=self.presentation.as_ref().unwrap().working.chars().take(120).collect();
+                            if !out.show(text,false).await {delivery_failed=true;break Outcome::Failed;}
+                        }
                     }
                     _=tokio::time::sleep_until(deadline)=>break Outcome::Failed,
                 }
@@ -312,6 +442,11 @@ impl WhatsappTurn {
         )
         .await
         .is_err();
+        if let Some((tx, worker)) = reaction {
+            let _ = tx.send(None);
+            drop(tx);
+            let _ = worker.await;
+        }
         TurnReport {
             outcome,
             delivery_failed,
@@ -333,6 +468,7 @@ mod tests {
         calls: Mutex<Vec<Operation>>,
         fail_once: AtomicBool,
         fail_all: AtomicBool,
+        fail_reactions: AtomicBool,
         block_once: AtomicBool,
         started: Notify,
         release: Notify,
@@ -341,6 +477,11 @@ mod tests {
     impl Broker for FakeBroker {
         async fn execute(&self, op: &Operation) -> Result<Option<String>, BrokerError> {
             self.calls.lock().unwrap().push(op.clone());
+            if matches!(op, Operation::Reaction { .. })
+                && self.fail_reactions.load(Ordering::SeqCst)
+            {
+                return Err(BrokerError::Rejected);
+            }
             if matches!(op, Operation::Send { .. } | Operation::Edit { .. }) {
                 if self.block_once.swap(false, Ordering::SeqCst) {
                     self.started.notify_one();
@@ -423,6 +564,7 @@ mod tests {
         tx.send(complete("end_turn")).unwrap();
         let report = WhatsappTurn {
             broker: broker.clone(),
+            presentation: None,
         }
         .run(rx)
         .await;
@@ -447,6 +589,7 @@ mod tests {
         tx.send(complete("end_turn")).unwrap();
         WhatsappTurn {
             broker: broker.clone(),
+            presentation: None,
         }
         .run(rx)
         .await;
@@ -473,6 +616,7 @@ mod tests {
         tx.send(super::super::tests::complete("end_turn")).unwrap();
         let result = WhatsappTurn {
             broker: broker.clone(),
+            presentation: None,
         }
         .run(rx)
         .await;
@@ -494,6 +638,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         WhatsappTurn {
             broker: broker.clone(),
+            presentation: None,
         }
         .run(rx)
         .await;
@@ -510,6 +655,7 @@ mod tests {
         let task = tokio::spawn(
             WhatsappTurn {
                 broker: broker.clone(),
+                presentation: None,
             }
             .run(rx),
         );
@@ -539,5 +685,206 @@ mod tests {
             .unwrap()
             .iter()
             .any(|op| matches!(op, Operation::Typing { active: false })));
+    }
+    fn quiet_turn(broker: Arc<FakeBroker>) -> WhatsappTurn {
+        WhatsappTurn {
+            broker,
+            presentation: Some(Presentation {
+                working: "正在处理你的请求…".into(),
+                waiting: "请在 MyClaw 中确认。".into(),
+            }),
+        }
+    }
+    async fn settle_tasks() {
+        for _ in 0..12 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quick_replies_have_no_placeholder_or_cursor_bubble() {
+        use super::super::tests::{complete, delta};
+        let b = Arc::new(FakeBroker::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(delta("收到")).unwrap();
+        tx.send(complete("end_turn")).unwrap();
+        let report = quiet_turn(b.clone()).run(rx).await;
+        assert!(!report.delivery_failed);
+        let calls = b.calls.lock().unwrap();
+        let bodies: Vec<_> = calls
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Send { text, .. } | Operation::Edit { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies, vec!["收到"]);
+        assert!(matches!(calls.last(),Some(Operation::Reaction{state}) if state=="clear"));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn slow_turn_uses_one_delayed_text_then_replaces_it_with_the_answer() {
+        use super::super::tests::{complete, delta};
+        let b = Arc::new(FakeBroker::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(quiet_turn(b.clone()).run(rx));
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(14)).await;
+        settle_tasks().await;
+        assert!(!b
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, Operation::Send { .. })));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle_tasks().await;
+        assert!(b
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op,Operation::Send{text,..} if text=="正在处理你的请求…")));
+        tx.send(delta("实际结果")).unwrap();
+        tx.send(complete("end_turn")).unwrap();
+        assert!(!task.await.unwrap().delivery_failed);
+        let calls = b.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|op| matches!(op, Operation::Send { .. }))
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(
+            |op| matches!(op,Operation::Edit{key,text,..} if key=="final:0" && text=="实际结果")
+        ));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn tool_lifecycle_changes_small_reactions_without_leaking_tool_details() {
+        use super::super::tests::{complete, delta, tool_call, tool_done};
+        let b = Arc::new(FakeBroker::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(quiet_turn(b.clone()).run(rx));
+        settle_tasks().await;
+        tx.send(tool_call("one", "private command", Some("SECRET_PATH")))
+            .unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_tasks().await;
+        assert!(b
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op,Operation::Reaction{state} if state=="tool")));
+        tx.send(tool_done("one")).unwrap();
+        tx.send(delta("A sufficiently long public reply for streaming"))
+            .unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle_tasks().await;
+        tx.send(complete("end_turn")).unwrap();
+        assert!(!task.await.unwrap().delivery_failed);
+        let calls = b.calls.lock().unwrap();
+        let text = serde_json::to_string(&*calls).unwrap();
+        assert!(!text.contains("SECRET_PATH"));
+        assert!(!text.contains("private command"));
+        assert!(!text.contains("💭"));
+        assert!(calls
+            .iter()
+            .any(|op| matches!(op,Operation::Reaction{state} if state=="writing")));
+        let finish = calls
+            .iter()
+            .position(|op| matches!(op,Operation::Finish{outcome,..} if outcome=="completed"))
+            .unwrap();
+        let clear = calls
+            .iter()
+            .rposition(|op| matches!(op,Operation::Reaction{state} if state=="clear"))
+            .unwrap();
+        assert!(clear > finish);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_reactions_do_not_fail_or_duplicate_the_reply() {
+        use super::super::tests::{complete, delta, tool_call};
+        let b = Arc::new(FakeBroker::default());
+        b.fail_reactions.store(true, Ordering::SeqCst);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(delta("先检查")).unwrap();
+        tx.send(tool_call("t", "Bash", None)).unwrap();
+        tx.send(delta("检查结束")).unwrap();
+        tx.send(complete("end_turn")).unwrap();
+        assert!(!quiet_turn(b.clone()).run(rx).await.delivery_failed);
+        let calls = b.calls.lock().unwrap();
+        assert!(calls.iter().any(|op|matches!(op,Operation::Send{text,key} if key=="final:0" && text=="先检查\n\n检查结束")));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|op| matches!(op, Operation::Send { .. }))
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn fenced_code_is_closed_for_each_preview_and_carried_to_the_next_chunk() {
+        let mut fence = None;
+        assert_eq!(
+            fenced_chunk("```python\nprint('**literal**')", &mut fence),
+            "```python\nprint('**literal**')\n```"
+        );
+        let saved = fence.clone();
+        let mut preview = fence.clone();
+        assert_eq!(fenced_chunk("next()", &mut preview), "```\nnext()\n```");
+        assert_eq!(fence, saved);
+        assert_eq!(
+            fenced_chunk("last()\n```\n\n**done**", &mut fence),
+            "```\nlast()\n```\n\n**done**"
+        );
+        assert!(fence.is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn approval_pauses_typing_and_resume_replaces_the_waiting_notice() {
+        use super::super::tests::{complete, delta, env};
+        use crate::acp::types::AcpEvent;
+        let b = Arc::new(FakeBroker::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(quiet_turn(b.clone()).run(rx));
+        settle_tasks().await;
+        tx.send(env(AcpEvent::QuestionRequest {
+            question_id: "question".into(),
+            questions: vec![],
+            form: None,
+        }))
+        .unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle_tasks().await;
+        assert!(b
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op,Operation::Send{text,..} if text=="请在 MyClaw 中确认。")));
+        assert!(b
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, Operation::Typing { active: false })));
+        tx.send(env(AcpEvent::QuestionResolved {
+            question_id: "question".into(),
+        }))
+        .unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle_tasks().await;
+        assert!(b
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op,Operation::Edit{text,..} if text=="正在处理你的请求…")));
+        tx.send(delta("完成")).unwrap();
+        tx.send(complete("end_turn")).unwrap();
+        assert!(!task.await.unwrap().delivery_failed);
     }
 }

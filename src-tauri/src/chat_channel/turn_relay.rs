@@ -101,6 +101,8 @@ pub enum OutboundSpec {
     Whatsapp {
         turn_id: String,
         delivery_grant: String,
+        #[serde(default)]
+        presentation: Option<whatsapp::Presentation>,
     },
 }
 
@@ -835,7 +837,7 @@ fn register(
                 .run(rx)
                 .await
             }
-            OutboundSpec::Whatsapp { delivery_grant, .. } => {
+            OutboundSpec::Whatsapp { delivery_grant, presentation, .. } => {
                 let urls = app_metadata_service::get_value(
                     &relay.db,
                     super::event_subscriber::EVENT_WEBHOOKS_KEY,
@@ -851,6 +853,7 @@ fn register(
                     Ok(broker) => {
                         whatsapp::WhatsappTurn {
                             broker: Arc::new(broker),
+                            presentation,
                         }
                         .run(rx)
                         .await
