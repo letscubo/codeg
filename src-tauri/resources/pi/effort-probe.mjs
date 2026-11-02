@@ -3,7 +3,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { verifiedWireLevels } from "../codeg-effort-wire.mjs";
+import { samplingPreservesSelection, verifiedWireLevels } from "../codeg-effort-wire.mjs";
 
 export function packageRoot(executable, name) {
   let dir = dirname(realpathSync(executable));
@@ -43,6 +43,13 @@ export function readonlySettingsStorage(cwd, agentDir, configDirName) {
   };
 }
 
+export function nativeDefaultThinkingLevel(settings, provider, model, fallback) {
+  const perModel = typeof settings.getModelThinkingLevel === "function"
+    ? settings.getModelThinkingLevel(provider, model)
+    : undefined;
+  return perModel || (settings.getDefaultThinkingLevel() ?? fallback);
+}
+
 export async function probeModels(executable, queries, cwd = process.cwd()) {
   const root = packageRoot(executable, "@earendil-works/pi-coding-agent");
   const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -66,18 +73,25 @@ export async function probeModels(executable, queries, cwd = process.cwd()) {
     : undefined;
   const settings = sdk.SettingsManager.fromStorage(readonlySettingsStorage(cwd, agentDir, sdk.CONFIG_DIR_NAME), { projectTrusted: false });
   if (settings.drainErrors().length > 0) clearError = "Pi settings could not be read to verify the default thinking level";
-  const defaultLevel = settings.getDefaultThinkingLevel() ?? defaults.DEFAULT_THINKING_LEVEL;
   const models = queries.map(({ model, provider }) => {
     const descriptor = provider ? runtime.getModel(provider, model) : undefined;
     if (!descriptor || runtime.getError()) return { model, provider: provider ?? null, known: false, levels: [] };
     const native = verifiedWireLevels({
       runtime: "pi", provider, api: descriptor.api, map: descriptor.thinkingLevelMap,
       compat: descriptor.compat, nativeLevels: compat.getSupportedThinkingLevels(descriptor),
+      modelId: descriptor.id, samplingParams: descriptor.samplingParams,
+      samplingParamsByThinkingLevel: descriptor.samplingParamsByThinkingLevel,
     });
     const levels = descriptor.reasoning === true ? native.map((level) => level === "off" ? "none" : level) : [];
+    const defaultLevel = nativeDefaultThinkingLevel(settings, descriptor.provider, descriptor.id, defaults.DEFAULT_THINKING_LEVEL);
     const effectiveDefault = typeof defaultLevel === "string" ? compat.clampThinkingLevel(descriptor, defaultLevel) : undefined;
+    const samplingSafe = (provider !== "myclaw" && provider !== "myclaw-anthropic") || descriptor.api !== "openai-completions" || samplingPreservesSelection({
+      modelId: descriptor.id, level: effectiveDefault, wireEffort: descriptor.thinkingLevelMap?.[effectiveDefault],
+      samplingParams: descriptor.samplingParams, samplingParamsByThinkingLevel: descriptor.samplingParamsByThinkingLevel,
+    });
     return { model, provider: provider ?? null, known: true, levels, defaultLevel: effectiveDefault,
-      clearError: descriptor.reasoning === true ? clearError ?? (native.includes(effectiveDefault) ? undefined : "Pi default effort has no verified canonical wire mapping") : undefined };
+      clearError: !samplingSafe ? "Pi sampling parameters override the selected model or default effort"
+        : descriptor.reasoning === true ? clearError ?? (native.includes(effectiveDefault) ? undefined : "Pi default effort has no verified canonical wire mapping") : undefined };
   });
   return { type: "codeg_effort_capabilities", version: manifest.version, models };
 }

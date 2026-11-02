@@ -4,8 +4,8 @@ import test from "node:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { verifiedWireLevels } from "./codeg-effort-wire.mjs";
-import { readonlySettingsStorage } from "./pi/effort-probe.mjs";
+import { samplingPreservesSelection, verifiedWireLevels } from "./codeg-effort-wire.mjs";
+import { nativeDefaultThinkingLevel, readonlySettingsStorage } from "./pi/effort-probe.mjs";
 import { effortCapabilities, turnModelSelection } from "./dsh/codeg-headless-runner.mjs";
 
 const native = ["off", "low", "medium", "high", "max"];
@@ -83,4 +83,32 @@ test("Pi settings backend reads defaults without writing files or lock directori
   assert.throws(() => storage.withLock("global", () => '{"defaultThinkingLevel":"low"}'));
   assert.equal(readFileSync(file, "utf8"), '{"defaultThinkingLevel":"high"}');
   assert.equal(existsSync(`${file}.lock`), false);
+});
+
+test("Pi 1.3 per-model defaults precede global settings while 0.84 remains compatible", () => {
+  const settings = {
+    getModelThinkingLevel(provider, model) {
+      assert.equal(provider, "myclaw");
+      return { first: "high", second: "off" }[model];
+    },
+    getDefaultThinkingLevel: () => "low",
+  };
+  assert.equal(nativeDefaultThinkingLevel(settings, "myclaw", "first", "medium"), "high");
+  assert.equal(nativeDefaultThinkingLevel(settings, "myclaw", "second", "medium"), "off");
+  assert.equal(nativeDefaultThinkingLevel(settings, "myclaw", "other", "medium"), "low");
+  assert.equal(nativeDefaultThinkingLevel({ getDefaultThinkingLevel: () => "high" }, "myclaw", "first", "medium"), "high");
+  assert.equal(nativeDefaultThinkingLevel({ getDefaultThinkingLevel: () => undefined }, "myclaw", "first", "medium"), "medium");
+});
+
+test("Pi effective sampling preserves exact model and effort without blocking unrelated options", () => {
+  const input = { runtime: "pi", provider: "myclaw", api: "openai-completions", map,
+    compat: { supportsReasoningEffort: true }, nativeLevels: native, modelId: "exact" };
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParams: { temperature: 0.7, top_p: 0.9, model: "exact" } }), ["off", "low", "high", "max"]);
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParams: { reasoning_effort: "high" } }), ["high"]);
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParams: { reasoning_effort: "high" }, samplingParamsByThinkingLevel: { low: { reasoning_effort: "low" } } }), ["low", "high"]);
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParamsByThinkingLevel: { low: { reasoning_effort: "high" }, off: { reasoning_effort: null } } }), ["high", "max"]);
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParams: { model: "wrong-model" } }), []);
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParams: { model: "wrong-model" }, samplingParamsByThinkingLevel: { high: { model: "exact" } } }), ["high"]);
+  assert.deepEqual(verifiedWireLevels({ ...input, samplingParamsByThinkingLevel: { high: { reasoning_effort: undefined } } }), ["off", "low", "max"]);
+  assert.equal(samplingPreservesSelection({ modelId: "plain", level: "off", samplingParams: { model: "wrong-model" } }), false);
 });
