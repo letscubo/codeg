@@ -47,12 +47,13 @@ export function assertAllowedTests(listing, expected) {
   }
 }
 
-export function runNoDbTests({mode, repo = root, invoke = spawnSync, fingerprint = sourceFingerprint, manifest}) {
+export function runNoDbTests({mode, release = false, repo = root, invoke = spawnSync, fingerprint = sourceFingerprint, manifest}) {
   if (!['desktop', 'server'].includes(mode)) throw new Error('Usage: node scripts/test-no-db.mjs desktop|server');
+  if (typeof release !== 'boolean') throw new Error('Invalid release profile selection');
   if (manifest.schemaVersion !== 1 || fingerprint(repo) !== manifest.sourceSha256) {
     throw new Error('Rust source/dependencies changed; review database-free test safety and update the manifest first');
   }
-  const args = ['test', '--locked', '--lib', ...(mode === 'server' ? ['--no-default-features'] : ['--features', 'test-utils']), filter];
+  const args = ['test', '--locked', ...(release ? ['--release'] : []), '--lib', ...(mode === 'server' ? ['--no-default-features'] : ['--features', 'test-utils']), filter];
   const options = {cwd: join(repo, 'src-tauri'), encoding: 'utf8', maxBuffer: 32 * 1024 * 1024};
   // --list only compiles/enumerates tests. It does not call the test functions.
   const listed = invoke('cargo', [...args, '--', '--list'], options);
@@ -65,8 +66,10 @@ export function runNoDbTests({mode, repo = root, invoke = spawnSync, fingerprint
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    if (process.argv.length !== 3) throw new Error('Usage: node scripts/test-no-db.mjs desktop|server');
-    runNoDbTests({mode: process.argv[2], manifest: JSON.parse(readFileSync(join(root, 'scripts/no-db-tests.json'), 'utf8'))});
+    if (process.argv.length < 3 || process.argv.length > 4 || (process.argv[3] && process.argv[3] !== '--release')) {
+      throw new Error('Usage: node scripts/test-no-db.mjs desktop|server [--release]');
+    }
+    runNoDbTests({mode: process.argv[2], release: process.argv[3] === '--release', manifest: JSON.parse(readFileSync(join(root, 'scripts/no-db-tests.json'), 'utf8'))});
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

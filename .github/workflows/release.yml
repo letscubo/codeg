@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -27,6 +28,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Require a version tag for release
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) echo "::error::Dispatch this workflow against a version tag, not a branch."; exit 1 ;;
+          esac
 
       - id: meta
         name: Resolve release channel
@@ -216,8 +225,15 @@ jobs:
         # the cross-compile env (Linux arm64) without dragging in tauri
         # runtime deps.
         run: |
-          cargo build --release --bin codeg-server --no-default-features --target ${{ matrix.target }}
-          cargo build --release --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
+          cargo build --locked --release --bin codeg-server --no-default-features --target ${{ matrix.target }}
+          cargo build --locked --release --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
+
+      - name: Validate reviewed database-free tests
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          node --test scripts/test-no-db.test.mjs
+          node scripts/test-no-db.mjs server --release
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
