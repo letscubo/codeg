@@ -827,6 +827,8 @@ pub fn build_router(
         .route("/acp_cancel", post(handlers::acp::acp_cancel))
         // ─── fork(letscubo)专属: Claude Code CLI transport ───
         .route("/cli_prompt", post(handlers::cli::cli_prompt))
+        .route("/cli_prompt_with_reasoning", post(handlers::cli::cli_prompt_with_reasoning))
+        .route("/cli_prompt_capabilities", post(handlers::cli::cli_prompt_capabilities))
         .route("/cli_cancel", post(handlers::cli::cli_cancel))
         .route("/acp_fork", post(handlers::acp::acp_fork))
         .route(

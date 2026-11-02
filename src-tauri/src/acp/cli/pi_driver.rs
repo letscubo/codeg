@@ -175,6 +175,7 @@ impl PiDriver {
                 ConnectionCommand::Prompt {
                     blocks,
                     user_message,
+                    ..
                 } => {
                     let stop = self.run_turn(blocks, user_message, &mut commands).await;
                     self.reclaim_questions().await;

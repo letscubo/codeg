@@ -16,6 +16,7 @@ use std::sync::Arc;
 use axum::{extract::Extension, Json};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::cli::effort::{self, CliTurnOptions, EffortCapability};
 use crate::acp::cli::{
     binary, codex_binary, dsh_binary, pi_binary, CliConnectError, CliConnectRequest, CliConnection,
 };
@@ -46,6 +47,8 @@ pub struct CliPromptParams {
     pub client_message_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default, deserialize_with = "effort::deserialize_effort")]
+    pub reasoning_effort: Option<Option<String>>,
     /// Provider route for `model` (deepseek: the `agent-default-model` patch).
     #[serde(default)]
     pub provider: Option<String>,
@@ -62,6 +65,8 @@ pub struct CliPromptResult {
     pub connection_id: String,
     pub session_id: Option<String>,
     pub conversation_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -72,8 +77,82 @@ pub struct CliCancelParams {
 
 pub async fn cli_prompt(
     Extension(state): Extension<Arc<AppState>>,
-    Json(mut params): Json<CliPromptParams>,
+    Json(params): Json<CliPromptParams>,
 ) -> Result<Json<CliPromptResult>, AppCommandError> {
+    cli_prompt_impl(state, params).await
+}
+
+/// Strict new route: an old server returns 404 instead of silently ignoring effort.
+pub async fn cli_prompt_with_reasoning(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<CliPromptParams>,
+) -> Result<Json<CliPromptResult>, AppCommandError> {
+    if params.reasoning_effort.is_none() {
+        return Err(coded_invalid(
+            "reasoning_effort_required",
+            "reasoningEffort must be present (a level or null)",
+        ));
+    }
+    cli_prompt_impl(state, params).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliCapabilitiesParams {
+    pub agent_type: AgentType,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliCapabilitiesResult {
+    pub reasoning_effort: EffortCapability,
+}
+
+pub async fn cli_prompt_capabilities(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<CliCapabilitiesParams>,
+) -> Result<Json<CliCapabilitiesResult>, AppCommandError> {
+    let capability = if params.agent_type != AgentType::ClaudeCode {
+        EffortCapability::unavailable(
+            "Per-turn effort is implemented only for Claude Code".into(),
+            None,
+        )
+    } else {
+        let env = acp_commands::build_session_runtime_env(
+            &state.db,
+            params.agent_type,
+            None,
+            &state.data_dir,
+        )
+        .await
+        .map_err(|_| {
+            AppCommandError::configuration_missing("Could not inspect Claude Code runtime")
+        })?;
+        match binary::resolve_claude_executable(&env).await {
+            Ok(executable) => effort::probe(&executable).await,
+            Err(reason) => EffortCapability::unavailable(reason, None),
+        }
+    };
+    Ok(Json(CliCapabilitiesResult {
+        reasoning_effort: capability,
+    }))
+}
+
+async fn cli_prompt_impl(
+    state: Arc<AppState>,
+    mut params: CliPromptParams,
+) -> Result<Json<CliPromptResult>, AppCommandError> {
+    effort::validate_level(&params.reasoning_effort)
+        .map_err(|reason| coded_invalid("unsupported_reasoning_effort", reason))?;
+    if params.reasoning_effort.is_some()
+        && params.connection_id.is_none()
+        && params.agent_type != Some(AgentType::ClaudeCode)
+    {
+        return Err(coded_invalid(
+            "unsupported_reasoning_effort",
+            "Per-turn effort is implemented only for Claude Code",
+        ));
+    }
     if params.blocks.is_empty() {
         return Err(coded_invalid(
             "invalid_params",
@@ -98,16 +177,49 @@ pub async fn cli_prompt(
         }
     };
 
-    if let Some(model) = params
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        if let Some(session) = manager.get_state(&connection_id).await {
-            session.write().await.cli_model = Some(model.to_string());
+    // Capture model + effort as one immutable turn snapshot. A rejected concurrent
+    // request never writes options into the connection's currently running turn.
+    let cli_options = if params.reasoning_effort.is_some() {
+        let session = manager
+            .get_state(&connection_id)
+            .await
+            .ok_or_else(|| coded_invalid("connection_not_found", "Connection not found"))?;
+        let snapshot = session.read().await;
+        let model = params.model.clone().or_else(|| snapshot.cli_model.clone());
+        let context = snapshot.cli_effort_context.clone().ok_or_else(|| {
+            coded_invalid(
+                "unsupported_reasoning_effort",
+                "Connection does not support Claude Code reasoning effort",
+            )
+        })?;
+        drop(snapshot);
+        if let Err(reason) = context
+            .validate(model.as_deref(), &params.reasoning_effort)
+            .await
+        {
+            if created {
+                let _ = manager.disconnect(&connection_id).await;
+            }
+            return Err(coded_invalid("reasoning_effort_unavailable", reason));
         }
-    }
+        Some(CliTurnOptions {
+            model,
+            reasoning_effort: params.reasoning_effort.clone(),
+        })
+    } else {
+        // Legacy calls retain their existing model update behavior.
+        if let Some(model) = params
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            if let Some(session) = manager.get_state(&connection_id).await {
+                session.write().await.cli_model = Some(model.to_string());
+            }
+        }
+        None
+    };
 
     // 须在提交之前登记,这一轮的事件才不会漏
     let relay_turn = match params.outbound.take() {
@@ -123,7 +235,7 @@ pub async fn cli_prompt(
         None => None,
     };
     let sent = manager
-        .send_prompt_linked_with_message_id(
+        .send_prompt_linked_with_cli_options(
             &state.db,
             &connection_id,
             params.blocks,
@@ -131,6 +243,7 @@ pub async fn cli_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            cli_options,
         )
         .await;
     let conversation_id = match sent {
@@ -153,6 +266,7 @@ pub async fn cli_prompt(
         connection_id,
         session_id,
         conversation_id,
+        reasoning_effort: params.reasoning_effort,
     }))
 }
 
@@ -356,6 +470,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn effort_request_and_ack_distinguish_missing_null_and_level() {
+        use serde_json::json;
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<CliPromptParams>(value)
+                .unwrap()
+                .reasoning_effort
+        };
+        assert_eq!(parse(json!({"blocks":[]})), None);
+        assert_eq!(
+            parse(json!({"blocks":[],"reasoningEffort":null})),
+            Some(None)
+        );
+        assert_eq!(
+            parse(json!({"blocks":[],"reasoningEffort":"xhigh"})),
+            Some(Some("xhigh".into()))
+        );
+        assert!(serde_json::from_value::<CliPromptParams>(
+            json!({"blocks":[],"reasoningEffort":3})
+        )
+        .is_err());
+        let ack = |effort| {
+            serde_json::to_value(CliPromptResult {
+                connection_id: "c".into(),
+                session_id: None,
+                conversation_id: None,
+                reasoning_effort: effort,
+            })
+            .unwrap()
+        };
+        assert!(ack(None).get("reasoningEffort").is_none());
+        assert!(ack(Some(None))["reasoningEffort"].is_null());
+        assert_eq!(ack(Some(Some("high".into())))["reasoningEffort"], "high");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_effort_route_admits_and_acknowledges_the_requested_argv() {
+        let _ = crate::acp::cli::test_transcript_root();
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &dir.path().display().to_string()).await;
+        let state = Arc::new(AppState::new_for_test(db, dir.path().to_path_buf()));
+        let executable = dir.path().join("fake-claude");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+case "$1" in
+ --version) echo '2.1.276 (Claude Code)'; exit 0;;
+ --help) echo 'claude --effort <level>'; exit 0;;
+esac
+printf '%s\n' "$@" > "$FAKE_DIR/args.txt"
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let params = |effort: serde_json::Value| {
+            serde_json::from_value::<CliPromptParams>(json!({
+            "agentType":"claude_code", "workingDir":dir.path(), "folderId":folder_id,
+            "model":"claude-opus-5", "blocks":[{"type":"text","text":"test"}],
+            "runtimeEnv":{"CLAUDE_CODE_EXECUTABLE":executable,"CLAUDE_CONFIG_DIR":dir.path().join("claude"),"FAKE_DIR":dir.path()},
+            "reasoningEffort":effort
+        })).unwrap()
+        };
+        let Json(ack) =
+            cli_prompt_with_reasoning(Extension(state.clone()), Json(params(json!("xhigh"))))
+                .await
+                .unwrap();
+        assert_eq!(ack.reasoning_effort, Some(Some("xhigh".into())));
+        let args_path = dir.path().join("args.txt");
+        for _ in 0..500 {
+            if args_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let args = std::fs::read_to_string(args_path).unwrap();
+        assert!(args.contains("--effort\nxhigh\n"));
+        assert!(args.contains("--model\nclaude-opus-5\n"));
+        state
+            .connection_manager
+            .disconnect(&ack.connection_id)
+            .await
+            .unwrap();
+        let mut other_runtime = params(json!("high"));
+        other_runtime.agent_type = Some(AgentType::Pi);
+        assert!(
+            cli_prompt_with_reasoning(Extension(state.clone()), Json(other_runtime))
+                .await
+                .is_err()
+        );
+        let mut missing = params(json!("high"));
+        missing.reasoning_effort = None;
+        assert!(
+            cli_prompt_with_reasoning(Extension(state.clone()), Json(missing))
+                .await
+                .is_err()
+        );
+
+        // A settings env override is rejected before prompt admission and startup.
+        std::fs::create_dir_all(dir.path().join("claude")).unwrap();
+        std::fs::write(
+            dir.path().join("claude/settings.json"),
+            r#"{"env":{"CLAUDE_CODE_EFFORT_LEVEL":"low"}}"#,
+        )
+        .unwrap();
+        assert!(
+            cli_prompt_with_reasoning(Extension(state), Json(params(json!("max"))))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
     fn session_id_shape_depends_on_the_agent() {
         let uuid = "55960ec1-365e-4af9-8681-e6576043af2d";
         assert!(validate_cli_session_id(AgentType::ClaudeCode, uuid).is_ok());
@@ -385,11 +617,9 @@ mod tests {
     #[test]
     fn a_pi_session_id_is_a_uuid() {
         // pi 铸的是 uuidv7(`01a1271a-…`),走默认那条 uuid 校验。
-        assert!(validate_cli_session_id(
-            AgentType::Pi,
-            "01a1271a-81fb-7fbd-9bb4-5299598a4dbc"
-        )
-        .is_ok());
+        assert!(
+            validate_cli_session_id(AgentType::Pi, "01a1271a-81fb-7fbd-9bb4-5299598a4dbc").is_ok()
+        );
         assert!(validate_cli_session_id(AgentType::Pi, "session-x").is_err());
     }
 }

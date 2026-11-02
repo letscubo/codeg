@@ -97,8 +97,11 @@ impl CliDriver {
                 ConnectionCommand::Prompt {
                     blocks,
                     user_message,
+                    cli_options,
                 } => {
-                    let disconnect = self.run_turn(blocks, user_message, &mut commands).await;
+                    let disconnect = self
+                        .run_turn(blocks, user_message, cli_options, &mut commands)
+                        .await;
                     if disconnect {
                         break;
                     }
@@ -125,6 +128,7 @@ impl CliDriver {
         &self,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<UserMessageBlock>)>,
+        cli_options: Option<super::effort::CliTurnOptions>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> bool {
         // Same order as the ACP loop: status first, then the user echo, so the
@@ -141,7 +145,13 @@ impl CliDriver {
         let started = std::time::Instant::now();
         let (session_id, model) = {
             let s = self.state.read().await;
-            (s.external_id.clone(), s.cli_model.clone())
+            (
+                s.external_id.clone(),
+                cli_options
+                    .as_ref()
+                    .and_then(|o| o.model.clone())
+                    .or_else(|| s.cli_model.clone()),
+            )
         };
         let (session_id, minted) = match session_id {
             Some(id) => (id, false),
@@ -175,7 +185,41 @@ impl CliDriver {
         // A turn that crashed before claude wrote its transcript leaves nothing
         // to resume, so decide from the file rather than from turn history.
         let resume = transcript_exists(&self.claude_config_dir(), &session_id);
+        let reasoning_effort = cli_options
+            .as_ref()
+            .and_then(|o| o.reasoning_effort.clone());
+        let context = super::effort::CliEffortContext {
+            executable: self.executable.clone(),
+            working_dir: self.working_dir.clone(),
+            runtime_env: self.runtime_env.clone(),
+        };
+        // Recheck mutable settings immediately before spawning too.
+        if let Err(message) = context.validate_configuration(&reasoning_effort) {
+            self.finish_turn(
+                TurnFinish {
+                    stop_reason: STOP_UNKNOWN.into(),
+                    error: Some(CliTurnError {
+                        code: "reasoning_effort_configuration_conflict",
+                        message,
+                        details: None,
+                    }),
+                },
+                &session_id,
+                0,
+                model,
+            )
+            .await;
+            self.emit(AcpEvent::StatusChanged {
+                status: ConnectionStatus::Connected,
+            })
+            .await;
+            return false;
+        }
         let mut args = build_args(&session_id, resume, model.as_deref());
+        if let Some(Some(level)) = &reasoning_effort {
+            args.push("--effort".into());
+            args.push(level.clone());
+        }
         if let Some(config) = self.companion.as_ref().map(mcp_config_json) {
             args.push("--mcp-config".to_string());
             args.push(config);
@@ -520,7 +564,9 @@ impl CliDriver {
             }
         );
         if !sidechain_prose {
-            if let Some(update) = super::dsh_driver::transcript_update_for(&event, Some(&self.working_dir)) {
+            if let Some(update) =
+                super::dsh_driver::transcript_update_for(&event, Some(&self.working_dir))
+            {
                 record_transcript_update(self.agent_type, session_id, &update);
             }
         }

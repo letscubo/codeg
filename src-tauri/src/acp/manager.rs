@@ -1042,6 +1042,7 @@ impl ConnectionManager {
         conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+        cli_options: Option<crate::acp::cli::effort::CliTurnOptions>,
     ) -> Result<(), AcpError> {
         // fork(letscubo): 统一记忆 —— 所有入口(网页 / 渠道 / 定时任务 / 派活)都走这里。
         // 只往发给运行时的 blocks 最前面插,回显给界面的 user_message 不动;送出去了才记版本,
@@ -1054,7 +1055,7 @@ impl ConnectionManager {
             self.plan_myclaw_memory(conn_id, &mut blocks).await
         };
         let result = self
-            .send_prompt_inner_raw(conn_id, blocks, user_message)
+            .send_prompt_inner_raw(conn_id, blocks, user_message, cli_options)
             .await;
         if result.is_ok() {
             if let Some((state, version)) = injected {
@@ -1106,6 +1107,7 @@ impl ConnectionManager {
         conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+        cli_options: Option<crate::acp::cli::effort::CliTurnOptions>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -1161,11 +1163,15 @@ impl ConnectionManager {
                 );
                 return Err(AcpError::TurnInProgress);
             }
+            if let Some(model) = cli_options.as_ref().and_then(|options| options.model.as_ref()) {
+                s.cli_model = Some(model.clone());
+            }
             s.turn_in_flight = true;
         }
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
+            cli_options,
         });
         Ok(())
     }
@@ -1191,7 +1197,7 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None).await
+        self.send_prompt_inner(conn_id, blocks, None, None).await
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -1246,11 +1252,37 @@ impl ConnectionManager {
         &self,
         db: &AppDatabase,
         conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+        delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+        client_message_id: Option<String>,
+    ) -> Result<Option<i32>, AcpError> {
+        self.send_prompt_linked_with_cli_options(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            delegation,
+            client_message_id,
+            None,
+        )
+        .await
+    }
+
+    /// CLI options are enqueued with the accepted prompt, never written into shared turn state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_prompt_linked_with_cli_options(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+        cli_options: Option<crate::acp::cli::effort::CliTurnOptions>,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1697,7 +1729,10 @@ impl ConnectionManager {
         // for a prompt that never reached the agent, so without this the
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
-        match self.send_prompt_inner(conn_id, blocks, user_message).await {
+        match self
+            .send_prompt_inner(conn_id, blocks, user_message, cli_options)
+            .await
+        {
             Ok(()) => {
                 // The prompt reached the agent: surface it to the chat-channel
                 // "user message" event feed. Notification-only — never gates the
@@ -5330,6 +5365,7 @@ mod tests {
         let ConnectionCommand::Prompt {
             blocks,
             user_message,
+            ..
         } = command
         else {
             panic!("expected prompt command");
@@ -5687,6 +5723,51 @@ mod tests {
             "only the pre-existing holder may remain, got {listed:?}"
         );
         assert_eq!(listed[0].id, holder.id);
+    }
+
+    #[tokio::test]
+    async fn rejected_concurrent_cli_prompt_cannot_replace_admitted_effort() {
+        use crate::acp::cli::effort::CliTurnOptions;
+        let mgr = ConnectionManager::new();
+        let conn_id = "effort-admission";
+        let mut rx = insert_live_connection(&mgr, conn_id, AgentType::ClaudeCode, None).await;
+        let options = |level: &str| {
+            Some(CliTurnOptions {
+                model: Some("claude-opus-5".into()),
+                reasoning_effort: Some(Some(level.into())),
+            })
+        };
+        mgr.send_prompt_inner_raw(
+            conn_id,
+            vec![PromptInputBlock::Text {
+                text: "first".into(),
+            }],
+            None,
+            options("low"),
+        )
+        .await
+        .unwrap();
+        let error = mgr
+            .send_prompt_inner_raw(
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "second".into(),
+                }],
+                None,
+                options("max"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AcpError::TurnInProgress));
+        let ConnectionCommand::Prompt {
+            cli_options: Some(options),
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected CLI options");
+        };
+        assert_eq!(options.reasoning_effort, Some(Some("low".into())));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6061,6 +6142,7 @@ mod tests {
                     text: "filler".into(),
                 }],
                 user_message: None,
+                cli_options: None,
             })
             .await
             .unwrap();
@@ -6072,6 +6154,7 @@ mod tests {
             vec![PromptInputBlock::Text {
                 text: "blocked".into(),
             }],
+            None,
             None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
@@ -9607,15 +9690,29 @@ mod tests {
             s.myclaw_agent_key = Some("agent-a".into());
         }
         // 没在跑一轮:不认。
-        assert_eq!(mgr.prompting_connection_for_conversation(25, "agent-a").await, None);
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(25, "agent-a")
+                .await,
+            None
+        );
         state.write().await.status = ConnectionStatus::Prompting;
         assert_eq!(
-            mgr.prompting_connection_for_conversation(25, "agent-a").await.as_deref(),
+            mgr.prompting_connection_for_conversation(25, "agent-a")
+                .await
+                .as_deref(),
             Some("cv")
         );
         // 别的 agent / 别的对话:不认。
-        assert_eq!(mgr.prompting_connection_for_conversation(25, "agent-b").await, None);
-        assert_eq!(mgr.prompting_connection_for_conversation(26, "agent-a").await, None);
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(25, "agent-b")
+                .await,
+            None
+        );
+        assert_eq!(
+            mgr.prompting_connection_for_conversation(26, "agent-a")
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

@@ -88,6 +88,7 @@ impl DshDriver {
                 ConnectionCommand::Prompt {
                     blocks,
                     user_message,
+                    ..
                 } => {
                     let disconnect = self.run_turn(blocks, user_message, &mut commands).await;
                     if disconnect {

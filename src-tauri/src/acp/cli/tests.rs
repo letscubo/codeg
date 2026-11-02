@@ -601,3 +601,112 @@ async fn background_work_that_never_settles_is_stopped_after_the_budget() {
     assert_eq!(events.last().unwrap()["stop_reason"], "end_turn");
     assert!(!h.turn_in_flight().await);
 }
+
+/// Each admitted turn owns its effort; a reused connection does not retain it.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_turn_effort_applies_to_new_resumed_and_reused_claude_processes() {
+    use super::effort::CliTurnOptions;
+    use crate::db::test_helpers;
+    let h = Harness::new(&[]).await;
+    let db = test_helpers::fresh_in_memory_db().await;
+    let folder_id = test_helpers::seed_folder(&db, &h.dir.display().to_string()).await;
+    h.stdout(&[json!({"type":"result","subtype":"success","is_error":false})]);
+    let mut rx = h.subscribe().await;
+    let mut conversation_id = None;
+    for (index, level) in [
+        Some("low"),
+        Some("medium"),
+        Some("high"),
+        Some("xhigh"),
+        None,
+        Some("max"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conversation_id = h
+            .manager
+            .send_prompt_linked_with_cli_options(
+                &db,
+                &h.connection_id,
+                vec![PromptInputBlock::Text {
+                    text: "turn".into(),
+                }],
+                Some(folder_id),
+                conversation_id,
+                None,
+                None,
+                Some(CliTurnOptions {
+                    model: Some("claude-opus-5".into()),
+                    reasoning_effort: Some(level.map(str::to_string)),
+                }),
+            )
+            .await
+            .unwrap();
+        collect_until(&mut rx, is_status("connected")).await;
+        let args = h.args();
+        match level {
+            Some(level) => assert!(args.windows(2).any(|w| w == ["--effort", level])),
+            None => assert!(!args.iter().any(|arg| arg == "--effort")),
+        }
+        assert!(args.windows(2).any(|w| w == ["--model", "claude-opus-5"]));
+        let expected_session_flag = if index == 0 {
+            "--session-id"
+        } else {
+            "--resume"
+        };
+        assert!(args
+            .windows(2)
+            .any(|w| w == [expected_session_flag, h.session_id.as_str()]));
+        // Make the next invocation exercise --resume on the exact same connection.
+        let project = h.dir.join("claude/projects/test");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{}.jsonl", h.session_id)), "{}\n").unwrap();
+    }
+    h.manager.disconnect(&h.connection_id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_changed_after_acceptance_fail_explicitly_before_claude_spawns() {
+    use super::effort::CliTurnOptions;
+    use crate::db::test_helpers;
+    let h = Harness::new(&[]).await;
+    std::fs::create_dir_all(h.dir.join("claude")).unwrap();
+    std::fs::write(
+        h.dir.join("claude/settings.json"),
+        r#"{"env":{"CLAUDE_CODE_EFFORT_LEVEL":"low"}}"#,
+    )
+    .unwrap();
+    let db = test_helpers::fresh_in_memory_db().await;
+    let folder_id = test_helpers::seed_folder(&db, &h.dir.display().to_string()).await;
+    let mut rx = h.subscribe().await;
+    h.manager
+        .send_prompt_linked_with_cli_options(
+            &db,
+            &h.connection_id,
+            vec![PromptInputBlock::Text {
+                text: "turn".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+            None,
+            Some(CliTurnOptions {
+                model: Some("claude-opus-5".into()),
+                reasoning_effort: Some(Some("high".into())),
+            }),
+        )
+        .await
+        .unwrap();
+    let events = collect_until(&mut rx, is_status("connected")).await;
+    assert!(events.iter().any(|v| v["type"] == "error"
+        && v["message"]
+            .as_str()
+            .is_some_and(|s| s.contains("CLAUDE_CODE_EFFORT_LEVEL"))));
+    assert!(
+        !h.dir.join("args.txt").exists(),
+        "conflict must not start the CLI"
+    );
+    assert!(!h.turn_in_flight().await);
+    h.manager.disconnect(&h.connection_id).await.unwrap();
+}
