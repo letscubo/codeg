@@ -1,16 +1,18 @@
 {
   "schemaVersion": 1,
-  "review": "Reviewed request deserialization and pure block construction; manager tests use SessionState, Noop emitter and in-memory channels. No AppDatabase, SQL, migrations, agent processes or network. Other suites are compile-only.",
-  "sourceSha256": "ef42cbcdf7d2de0f86da452da0ff2df58781701e39e9ebf8fe1d8b175e7acd85",
+  "review": "Reviewed request deserialization and pure block construction, including simultaneous internalPrompt and reasoningEffort; manager tests use SessionState, Noop emitter and in-memory channels to verify accepted, rejected, cancelled and explicitly cleared turn options. Office preloading has no mentioned scene and memory lookup has no installed database handle, so both return before external access. No AppDatabase, SQL, migrations, agent processes or network. Other suites are compile-only.",
+  "sourceSha256": "5d8e0748d325629d55fbad6dffea501801c8e49c144252db390d1c93756c3e75",
   "tests": [
     "acp::manager::internal_prompt_tests::myclaw_prompt_absent_null_empty_and_whitespace_do_not_inject",
     "acp::manager::internal_prompt_tests::myclaw_prompt_busy_and_empty_are_still_rejected",
     "acp::manager::internal_prompt_tests::myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_context",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_context_and_effort_stay_with_the_accepted_turn",
     "acp::manager::internal_prompt_tests::myclaw_prompt_context_does_not_cross_connections_or_depend_on_history",
     "acp::manager::internal_prompt_tests::myclaw_prompt_each_request_uses_only_its_own_context",
     "acp::manager::internal_prompt_tests::myclaw_prompt_inline_context_preserves_user_echo_and_attachments",
     "acp::manager::internal_prompt_tests::myclaw_prompt_invalid_context_never_enqueues_or_wedges_gate",
     "acp::myclaw_prompt::tests::myclaw_prompt_cli_and_acp_deserialize_the_same_parameter",
+    "acp::myclaw_prompt::tests::myclaw_prompt_cli_deserializes_context_and_effort_together",
     "acp::myclaw_prompt::tests::myclaw_prompt_omitted_null_and_empty_http_parameters_are_optional",
     "acp::myclaw_prompt::tests::myclaw_prompt_preserves_unicode_and_escapes_reserved_delimiters",
     "acp::myclaw_prompt::tests::myclaw_prompt_size_limit_is_utf8_bytes_and_error_is_redacted"

@@ -283,6 +283,8 @@ pub struct SessionState {
     /// fork(letscubo)专属: `--model` for the next CLI turn (`None` = CLI
     /// default). Unused by ACP connections.
     pub cli_model: Option<String>,
+    /// Frozen launch context, used for read-only per-turn effort validation.
+    pub cli_effort_context: Option<crate::acp::cli::effort::CliEffortContext>,
 
     // 状态
     pub status: ConnectionStatus,
@@ -710,6 +712,7 @@ impl SessionState {
             folder_id,
             transport: ConnectionTransport::Acp,
             cli_model: None,
+            cli_effort_context: None,
             status: ConnectionStatus::Connecting,
             live_message: None,
             active_tool_calls: BTreeMap::new(),

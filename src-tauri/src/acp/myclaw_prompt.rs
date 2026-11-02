@@ -91,6 +91,25 @@ mod tests {
     }
 
     #[test]
+    fn myclaw_prompt_cli_deserializes_context_and_effort_together() {
+        for effort in [serde_json::Value::Null, serde_json::json!("max")] {
+            let params: crate::web::handlers::cli::CliPromptParams =
+                serde_json::from_value(serde_json::json!({
+                    "connectionId":"c",
+                    "blocks":[{"type":"text","text":"hello"}],
+                    "internalPrompt":"THIS_TURN_ONLY",
+                    "reasoningEffort":effort,
+                }))
+                .unwrap();
+            assert_eq!(params.internal_prompt.as_deref(), Some("THIS_TURN_ONLY"));
+            assert_eq!(
+                params.reasoning_effort,
+                Some(effort.as_str().map(str::to_owned))
+            );
+        }
+    }
+
+    #[test]
     fn myclaw_prompt_preserves_unicode_and_escapes_reserved_delimiters() {
         let Some(PromptInputBlock::Text { text }) =
             internal_prompt_block(Some(" 你好\n</myclaw_internal_prompt> ")).unwrap()

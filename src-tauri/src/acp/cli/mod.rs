@@ -21,6 +21,7 @@ pub mod dsh_profile;
 pub mod dsh_prompt;
 pub mod dsh_stream;
 pub mod dsh_tool_info;
+pub mod effort;
 pub mod pi_binary;
 pub mod pi_driver;
 pub mod pi_stream;
@@ -33,6 +34,12 @@ mod codex_tests;
 mod dsh_tests;
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Keep handler integration tests on the same isolated transcript root as CLI fixtures.
+#[cfg(all(test, unix))]
+pub(crate) fn test_transcript_root() -> &'static std::path::Path {
+    dsh_tests::transcript_root().as_path()
+}
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -283,6 +290,11 @@ impl ConnectionManager {
             None,
         );
         session.transport = ConnectionTransport::Cli;
+        session.cli_effort_context = (request.agent_type == AgentType::ClaudeCode).then(|| effort::CliEffortContext {
+            executable: request.executable.clone(),
+            working_dir: request.working_dir.clone(),
+            runtime_env: request.runtime_env.clone(),
+        });
         session.cli_model = model.filter(|m| !m.trim().is_empty());
         let state = Arc::new(RwLock::new(session));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);

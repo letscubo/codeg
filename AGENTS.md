@@ -32,10 +32,10 @@ codeg 自带的工作台。因此：
 
 - 测试不得创建或初始化数据库，包括内存 SQLite、临时 SQLite 文件、测试数据库及任何迁移、种子写入。
 - 现有依赖真实数据库的用例仅保留编译检查（`cargo test --no-run`），不得直接执行全量 `cargo test`。这不代表数据库集成测试已通过。
-- 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前为 11 项 Prompt 测试。它们只使用请求反序列化、内存 SessionState、Noop emitter 和通道，不创建 SQLite。
+- 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前为 13 项 Prompt 测试。它们只使用请求反序列化、内存 SessionState、Noop emitter 和通道，不创建 SQLite。
 - 新增或修改测试应使用 mock/fake 等无数据库方式。Rust 源码或依赖变化后，必须重新核对允许执行用例的调用链并更新清单指纹；不能只为通过 CI 自动刷新指纹或扩大匹配条件。
 - 按用户要求不修改 `.github/workflows/test.yml`。该工作流仍含建库测试，不得触发；本次发布提交使用 `[skip ci]` 跳过 push/pull_request 自动测试，通过 `gh workflow run release.yml --ref <版本标签>` 手动触发 Release。
-- Release 在打包发布前执行保护脚本测试和已审查的 11 项无数据库 Prompt 测试（`node scripts/test-no-db.mjs server --release`）；不会执行全量数据库测试。不得把这一结果描述为全量测试通过。
+- Release 在打包发布前执行保护脚本测试和已审查的 13 项无数据库 Prompt 测试（`node scripts/test-no-db.mjs server --release`）；不会执行全量数据库测试。不得把这一结果描述为全量测试通过。
 
 ### Rust（在 `src-tauri/` 目录下执行）
 

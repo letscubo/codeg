@@ -36,6 +36,7 @@ async fn take(
         ConnectionCommand::Prompt {
             blocks,
             user_message,
+            ..
         } => (blocks, user_message),
         _ => panic!("unexpected command"),
     }
@@ -64,7 +65,13 @@ async fn myclaw_prompt_inline_context_preserves_user_echo_and_attachments() {
         crate::acp::user_blocks_from_prompt(&original),
     ));
     manager
-        .send_prompt_inner("c", original.clone(), echo.clone(), Some("FIRST\nNEXT"))
+        .send_prompt_inner(
+            "c",
+            original.clone(),
+            echo.clone(),
+            Some("FIRST\nNEXT"),
+            None,
+        )
         .await
         .unwrap();
     let (blocks, user_message) = take(&mut rx).await;
@@ -82,7 +89,7 @@ async fn myclaw_prompt_absent_null_empty_and_whitespace_do_not_inject() {
     let (manager, mut rx) = fixture().await;
     for value in [None, Some(""), Some(" \n\t")] {
         manager
-            .send_prompt_inner("c", hello(), None, value)
+            .send_prompt_inner("c", hello(), None, value, None)
             .await
             .unwrap();
         assert_eq!(take(&mut rx).await.0, hello());
@@ -99,7 +106,7 @@ async fn myclaw_prompt_each_request_uses_only_its_own_context() {
     for value in [Some("FIRST_ONLY"), None, Some("SECOND_ONLY"), Some("")] {
         manager
             .clone_ref()
-            .send_prompt_inner("c", hello(), None, value)
+            .send_prompt_inner("c", hello(), None, value, None)
             .await
             .unwrap();
         let (blocks, _) = take(&mut rx).await;
@@ -127,7 +134,7 @@ async fn myclaw_prompt_context_does_not_cross_connections_or_depend_on_history()
         s.conversation_id = Some(42);
     }
     manager
-        .send_prompt_inner("c", hello(), None, Some("THIS_TURN_ONLY"))
+        .send_prompt_inner("c", hello(), None, Some("THIS_TURN_ONLY"), None)
         .await
         .unwrap();
     assert!(text_of(&take(&mut rx).await.0).contains("THIS_TURN_ONLY"));
@@ -150,7 +157,7 @@ async fn myclaw_prompt_invalid_context_never_enqueues_or_wedges_gate() {
     let (manager, mut rx) = fixture().await;
     let oversized = "private".repeat(10_000);
     assert!(manager
-        .send_prompt_inner("c", hello(), None, Some(&oversized))
+        .send_prompt_inner("c", hello(), None, Some(&oversized), None)
         .await
         .is_err());
     assert!(rx.try_recv().is_err());
@@ -164,7 +171,7 @@ async fn myclaw_prompt_invalid_context_never_enqueues_or_wedges_gate() {
             .turn_in_flight
     );
     manager
-        .send_prompt_inner("c", hello(), None, Some("VALID"))
+        .send_prompt_inner("c", hello(), None, Some("VALID"), None)
         .await
         .unwrap();
     assert!(text_of(&take(&mut rx).await.0).contains("VALID"));
@@ -174,7 +181,7 @@ async fn myclaw_prompt_invalid_context_never_enqueues_or_wedges_gate() {
 async fn myclaw_prompt_busy_and_empty_are_still_rejected() {
     let (manager, mut rx) = fixture().await;
     assert!(manager
-        .send_prompt_inner("c", vec![], None, Some("RULES"))
+        .send_prompt_inner("c", vec![], None, Some("RULES"), None)
         .await
         .is_err());
     assert!(rx.try_recv().is_err());
@@ -187,7 +194,7 @@ async fn myclaw_prompt_busy_and_empty_are_still_rejected() {
         .turn_in_flight = true;
     assert!(matches!(
         manager
-            .send_prompt_inner("c", hello(), None, Some("RULES"))
+            .send_prompt_inner("c", hello(), None, Some("RULES"), None)
             .await,
         Err(AcpError::TurnInProgress)
     ));
@@ -200,7 +207,7 @@ async fn myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_contex
     drop(rx);
     assert!(matches!(
         manager
-            .send_prompt_inner("c", hello(), None, Some("PRIVATE"))
+            .send_prompt_inner("c", hello(), None, Some("PRIVATE"), None)
             .await,
         Err(AcpError::ProcessExited)
     ));
@@ -214,6 +221,13 @@ async fn myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_contex
             .turn_in_flight
     );
     let (manager, mut rx) = fixture().await;
+    manager
+        .get_state("c")
+        .await
+        .unwrap()
+        .write()
+        .await
+        .cli_model = Some("claude-opus-5".into());
     let tx = manager
         .connections
         .lock()
@@ -226,13 +240,23 @@ async fn myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_contex
         tx.send(ConnectionCommand::Prompt {
             blocks: hello(),
             user_message: None,
+            cli_options: None,
         })
         .await
         .unwrap();
     }
     assert!(tokio::time::timeout(
         Duration::from_millis(20),
-        manager.send_prompt_inner("c", hello(), None, Some("CANCELLED"))
+        manager.send_prompt_inner(
+            "c",
+            hello(),
+            None,
+            Some("CANCELLED"),
+            Some(crate::acp::cli::effort::CliTurnOptions {
+                model: Some("claude-sonnet-5".into()),
+                reasoning_effort: Some(Some("max".into())),
+            }),
+        )
     )
     .await
     .is_err());
@@ -245,9 +269,172 @@ async fn myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_contex
             .await
             .turn_in_flight
     );
+    assert_eq!(
+        manager
+            .get_state("c")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .cli_model
+            .as_deref(),
+        Some("claude-opus-5")
+    );
     for _ in 0..4 {
         take(&mut rx).await;
     }
     manager.send_prompt("c", hello()).await.unwrap();
-    assert_eq!(take(&mut rx).await.0, hello());
+    let ConnectionCommand::Prompt {
+        blocks,
+        cli_options,
+        ..
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("expected legacy prompt after cancelled reserve");
+    };
+    assert_eq!(blocks, hello());
+    assert!(cli_options.is_none());
+}
+
+#[tokio::test]
+async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
+    use crate::acp::cli::effort::CliTurnOptions;
+    let (manager, mut rx) = fixture().await;
+    let original = hello();
+    let echo = Some((
+        "optimistic-first".into(),
+        crate::acp::user_blocks_from_prompt(&original),
+    ));
+    let options = |model: &str, level: &str| {
+        Some(CliTurnOptions {
+            model: Some(model.into()),
+            reasoning_effort: Some(Some(level.into())),
+        })
+    };
+    manager
+        .send_prompt_inner(
+            "c",
+            original.clone(),
+            echo.clone(),
+            Some("ACCEPTED_ONLY"),
+            options("claude-opus-5", "max"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager
+            .send_prompt_inner(
+                "c",
+                hello(),
+                None,
+                Some("REJECTED_ONLY"),
+                options("claude-sonnet-5", "low"),
+            )
+            .await,
+        Err(AcpError::TurnInProgress)
+    ));
+    let ConnectionCommand::Prompt {
+        blocks,
+        user_message,
+        cli_options,
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("expected prompt");
+    };
+    assert_eq!(user_message, echo);
+    assert_eq!(&blocks[1..], original.as_slice());
+    assert!(text_of(&blocks[..1]).contains("ACCEPTED_ONLY"));
+    assert!(!text_of(&blocks).contains("REJECTED_ONLY"));
+    let accepted = cli_options.unwrap();
+    assert_eq!(accepted.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(accepted.reasoning_effort, Some(Some("max".into())));
+    assert_eq!(
+        manager
+            .get_state("c")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .cli_model
+            .as_deref(),
+        Some("claude-opus-5")
+    );
+    assert!(rx.try_recv().is_err());
+    idle(&manager).await;
+    // Legacy callers add neither option, even after a rejected mixed request.
+    manager.send_prompt("c", hello()).await.unwrap();
+    let ConnectionCommand::Prompt {
+        blocks,
+        user_message,
+        cli_options,
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("expected legacy prompt");
+    };
+    assert_eq!(blocks, hello());
+    assert!(user_message.is_none());
+    assert!(cli_options.is_none());
+    idle(&manager).await;
+    manager
+        .send_prompt_inner(
+            "c",
+            hello(),
+            None,
+            Some("NEXT_ONLY"),
+            options("claude-opus-5", "low"),
+        )
+        .await
+        .unwrap();
+    let ConnectionCommand::Prompt {
+        blocks,
+        cli_options,
+        ..
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("expected next prompt");
+    };
+    assert!(text_of(&blocks).contains("NEXT_ONLY"));
+    assert!(!text_of(&blocks).contains("ACCEPTED_ONLY"));
+    assert!(!text_of(&blocks).contains("REJECTED_ONLY"));
+    assert_eq!(
+        cli_options.unwrap().reasoning_effort,
+        Some(Some("low".into()))
+    );
+    idle(&manager).await;
+    let mut clear_blocks = hello();
+    clear_blocks.push(PromptInputBlock::Image {
+        data: "clear-image".into(),
+        mime_type: "image/png".into(),
+        uri: None,
+    });
+    let clear_echo = Some((
+        "optimistic-clear".into(),
+        crate::acp::user_blocks_from_prompt(&clear_blocks),
+    ));
+    manager
+        .send_prompt_inner(
+            "c",
+            clear_blocks.clone(),
+            clear_echo.clone(),
+            Some("CLEAR_ONLY"),
+            Some(CliTurnOptions {
+                model: Some("claude-opus-5".into()),
+                reasoning_effort: Some(None),
+            }),
+        )
+        .await
+        .unwrap();
+    let ConnectionCommand::Prompt {
+        blocks,
+        user_message,
+        cli_options,
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("expected clear prompt");
+    };
+    assert_eq!(user_message, clear_echo);
+    assert_eq!(&blocks[1..], clear_blocks.as_slice());
+    assert!(text_of(&blocks[..1]).contains("CLEAR_ONLY"));
+    assert!(!text_of(&blocks).contains("NEXT_ONLY"));
+    assert_eq!(cli_options.unwrap().reasoning_effort, Some(None));
 }

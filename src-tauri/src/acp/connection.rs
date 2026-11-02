@@ -1161,6 +1161,8 @@ pub enum SteerOutcome {
 /// Commands sent from Tauri command handlers to the ACP connection loop.
 pub enum ConnectionCommand {
     Prompt {
+        /// Immutable options belonging only to this admitted CLI turn.
+        cli_options: Option<crate::acp::cli::effort::CliTurnOptions>,
         blocks: Vec<PromptInputBlock>,
         /// Pre-projected cross-client user-message broadcast (`message_id` +
         /// user blocks), computed by the manager under the prompt lock. The
@@ -9891,6 +9893,7 @@ async fn run_conversation_loop<'a>(
             Some(ConnectionCommand::Prompt {
                 blocks,
                 user_message,
+                ..
             }) => {
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
