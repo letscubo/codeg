@@ -1981,7 +1981,7 @@ async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         // Inbox protocol only. This does not claim that WhatsApp delivery is enabled.
-        "capabilities": ["whatsapp_relay_proxy_v2", "whatsapp_relay_presentation_v1", "internal_prompt_inline_v1"],
+        "capabilities": ["whatsapp_relay_proxy_v2", "whatsapp_relay_endpoint_v1", "whatsapp_relay_presentation_v1", "internal_prompt_inline_v1"],
     }))
 }
 

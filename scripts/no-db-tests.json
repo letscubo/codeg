@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "review": "Reviewed request deserialization and pure block construction, including simultaneous internalPrompt and reasoningEffort; manager tests use SessionState, Noop emitter and in-memory channels to verify accepted, rejected, cancelled and explicitly cleared turn options. Office preloading has no mentioned scene and memory lookup has no installed database handle, so both return before external access. No AppDatabase, SQL, migrations, agent processes or network. Other suites are compile-only.",
-  "sourceSha256": "5d8e0748d325629d55fbad6dffea501801c8e49c144252db390d1c93756c3e75",
+  "review": "Reviewed request deserialization and pure block construction, including simultaneous internalPrompt and reasoningEffort; manager tests use SessionState, Noop emitter and in-memory channels to verify accepted, rejected, cancelled and explicitly cleared turn options. Office preloading has no mentioned scene and memory lookup has no installed database handle, so both return before external access. WhatsApp relay endpoint and health changes are outside the allowlisted call paths and their suites remain compile-only. No AppDatabase, SQL, migrations, agent processes or network.",
+  "sourceSha256": "fe6f2ab0c6827a083b7f3de7d6dfc97ae9fe5ab6fcdcbe194b790ac98da40386",
   "tests": [
     "acp::manager::internal_prompt_tests::myclaw_prompt_absent_null_empty_and_whitespace_do_not_inject",
     "acp::manager::internal_prompt_tests::myclaw_prompt_busy_and_empty_are_still_rejected",
