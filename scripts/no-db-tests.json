@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "review": "PromptSource is mocked; tests use SessionState and in-memory channels. No SQL database, migrations, real agents or network. Other suites are compile-only.",
+  "sourceSha256": "d9f9066675fa3f9e63c7d1438f399d9ff3dd5925c4795407e4871b296e868ca3",
+  "tests": [
+    "acp::manager::internal_prompt_tests::myclaw_prompt_busy_and_empty_are_rejected_before_config_reads",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_advance_phase",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_empty_first_config_still_advances_phase",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_failed_config_does_not_enqueue_or_consume_first_phase",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_first_then_every_followup_preserves_user_echo_and_reads_updated_config",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_native_history_evidence_distinguishes_fresh_resume_and_accepted",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_native_session_change_clears_fresh_evidence",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_resumed_connection_uses_persisted_history_even_without_local_turns",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_scope_change_rechecks_phase_and_attachments_are_preserved",
+    "acp::myclaw_prompt::tests::myclaw_prompt_first_gets_both_and_followups_get_every_message_prompt",
+    "acp::myclaw_prompt::tests::myclaw_prompt_preserves_unicode_and_escapes_reserved_delimiters",
+    "acp::myclaw_prompt::tests::myclaw_prompt_requires_explicit_fields_and_bounds_both_values"
+  ]
+}

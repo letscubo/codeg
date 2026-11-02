@@ -28,17 +28,27 @@ codeg 自带的工作台。因此：
 
 ## 代码检查与测试（任务完成后进行必要的检查）
 
+### 禁止测试创建数据库（2026-11-02，用户要求）
+
+- 测试不得创建或初始化数据库，包括内存 SQLite、临时 SQLite 文件、测试数据库及任何迁移、种子写入。
+- 现有依赖真实数据库的用例仅保留编译检查（`cargo test --no-run`），不得直接执行全量 `cargo test`。这不代表数据库集成测试已通过。
+- 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前为 12 项 Prompt 测试。它们使用内存对象、模拟 PromptSource 和通道，不创建 SQLite。
+- 新增或修改测试应使用 mock/fake 等无数据库方式。Rust 源码或依赖变化后，必须重新核对允许执行用例的调用链并更新清单指纹；不能只为通过 CI 自动刷新指纹或扩大匹配条件。
+- 按用户要求暂不修改 `.github/workflows/test.yml`，无数据库执行入口目前仅供手动运行。现有 CI 仍会执行含建库操作的全量测试；在满足禁止建库的限制前，不得触发该流程，也不得声称 CI 已切换为无数据库测试。
+
 ### Rust（在 `src-tauri/` 目录下执行）
 
 ```bash
 # 桌面模式（默认 feature）
 cargo check
-cargo test --features test-utils
+cargo test --features test-utils --no-run
+node ../scripts/test-no-db.mjs desktop
 cargo clippy --all-targets --features test-utils -- -D warnings
 
 # 服务器模式
 cargo check --no-default-features --bin codeg-server
-cargo test --no-default-features --bin codeg-server --lib
+cargo test --no-default-features --bin codeg-server --lib --no-run
+node ../scripts/test-no-db.mjs server
 cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
 
 # codeg-mcp 协作伴生进程（多智能体委托）
@@ -47,7 +57,7 @@ cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 
 # 解析器快照评审（输出变化时）
 cargo insta review
-INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
+# 执行快照用例前先完成无数据库审查并纳入清单；禁止全量自动执行。
 ```
 
 ## 架构

@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {assertAllowedTests, runNoDbTests} from './test-no-db.mjs';
+
+const name = 'acp::myclaw_prompt::tests::myclaw_prompt_example';
+const manifest = {schemaVersion: 1, sourceSha256: 'reviewed-source', tests: [name]};
+
+test('unknown, missing and duplicate test names cannot enter the executable suite', () => {
+  assertAllowedTests(`${name}: test\r\n1 test, 0 benchmarks\r\n`, [name]);
+  for (const listing of ['', `${name}: test\nacp::myclaw_prompt_database_test: test`, `${name}: test\n${name}: test`]) {
+    assert.throws(() => assertAllowedTests(listing, [name]));
+  }
+  assert.throws(() => assertAllowedTests('', []));
+});
+
+test('source changes and invalid modes stop before any cargo invocation', () => {
+  const invoke = () => { throw new Error('must not invoke cargo'); };
+  assert.throws(() => runNoDbTests({mode: 'server', manifest, fingerprint: () => 'changed', invoke}), /source\/dependencies changed/);
+  assert.throws(() => runNoDbTests({mode: 'all', manifest, fingerprint: () => 'reviewed-source', invoke}), /Usage/);
+});
+
+test('discovery failure or an added test stops before test execution', () => {
+  for (const result of [{status: 1, stderr: 'compile error'}, {status: 0, stdout: `${name}: test\nacp::myclaw_prompt_sqlite: test`}]) {
+    let calls = 0;
+    assert.throws(() => runNoDbTests({mode: 'server', manifest, fingerprint: () => 'reviewed-source', invoke: () => { calls++; return result; }}));
+    assert.equal(calls, 1);
+  }
+});
+
+test('source changes during discovery stop before execution', () => {
+  let checks = 0;
+  let calls = 0;
+  assert.throws(() => runNoDbTests({mode: 'server', manifest,
+    fingerprint: () => ++checks === 1 ? 'reviewed-source' : 'changed',
+    invoke: () => { calls++; return {status: 0, stdout: `${name}: test`}; },
+  }), /Source changed during/);
+  assert.equal(calls, 1);
+});
+
+test('only the reviewed library filter executes in either supported mode', () => {
+  for (const mode of ['desktop', 'server']) {
+    const calls = [];
+    runNoDbTests({mode, manifest, fingerprint: () => 'reviewed-source', invoke: (command, args) => {
+      calls.push({command, args});
+      return {status: 0, stdout: `${name}: test`};
+    }});
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every(call => call.command === 'cargo' && call.args.includes('--lib') && call.args.includes('myclaw_prompt')));
+    assert.deepEqual(calls[0].args.slice(-2), ['--', '--list']);
+    assert.deepEqual(calls[1].args.slice(-2), ['--', '--test-threads=1']);
+    assert.ok(calls[1].args.includes(mode === 'server' ? '--no-default-features' : 'test-utils'));
+  }
+});
+
+test('a failing approved suite is not reported as success', () => {
+  let calls = 0;
+  assert.throws(() => runNoDbTests({mode: 'server', manifest, fingerprint: () => 'reviewed-source',
+    invoke: () => ++calls === 1 ? {status: 0, stdout: `${name}: test`} : {status: 1},
+  }), /tests failed/);
+});
