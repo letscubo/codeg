@@ -265,6 +265,12 @@ pub struct SessionState {
     pub myclaw_agent_key: Option<String>,
     /// fork(letscubo): 已注入过的统一记忆版本;平台版本变了才重新注入。
     pub myclaw_memory_version: Option<String>,
+    /// None: no accepted prompt on this connection. Some(None): unlinked
+    /// conversation. Scope changes (e.g. fork) consult persisted history again.
+    /// Internal only: never included in client snapshots.
+    pub internal_prompt_accepted_scope: Option<Option<i32>>,
+    /// Set only by a genuinely fresh native launch, not every connection.
+    pub internal_prompt_fresh_session: bool,
     pub conversation_id: Option<i32>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
@@ -701,6 +707,8 @@ impl SessionState {
             connection_id,
             myclaw_agent_key: None,
             myclaw_memory_version: None,
+            internal_prompt_accepted_scope: None,
+            internal_prompt_fresh_session: false,
             conversation_id: None,
             external_id: None,
             external_id_changed_at: None,
@@ -811,6 +819,9 @@ impl SessionState {
         let was_prompting = self.status == ConnectionStatus::Prompting;
         match payload {
             AcpEvent::SessionStarted { session_id } => {
+                if self.external_id.is_some() && self.external_id.as_deref() != Some(session_id.as_str()) {
+                    self.internal_prompt_fresh_session = false;
+                }
                 if self.external_id.as_deref() != Some(session_id.as_str()) {
                     self.external_id_changed_at = Some(std::time::SystemTime::now());
                     // The AIR task table is keyed to the session we just left.
@@ -1276,6 +1287,9 @@ impl SessionState {
                 folder_id,
                 ..
             } => {
+                if self.conversation_id.is_some() && self.conversation_id != Some(*conversation_id) {
+                    self.internal_prompt_fresh_session = false;
+                }
                 self.conversation_id = Some(*conversation_id);
                 self.folder_id = Some(*folder_id);
                 // A title published before this bind was dropped (no row yet).

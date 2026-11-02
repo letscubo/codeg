@@ -282,6 +282,7 @@ impl ConnectionManager {
             owner_window_label.clone(),
             None,
         );
+        session.internal_prompt_fresh_session = session_id.is_none() && continues_from.is_none();
         session.transport = ConnectionTransport::Cli;
         session.cli_model = model.filter(|m| !m.trim().is_empty());
         let state = Arc::new(RwLock::new(session));

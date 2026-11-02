@@ -462,6 +462,8 @@ pub struct ConnectionManager {
     /// no cap, no cumulative growth; entries are removed on answer / cancel /
     /// connection teardown.
     pending_questions: Arc<Mutex<HashMap<String, PendingQuestionEntry>>>,
+    internal_prompt_source:
+        Arc<std::sync::OnceLock<Arc<dyn crate::acp::myclaw_prompt::PromptSource>>>,
     /// In-flight Grok `exit_plan_mode` approvals awaiting the user's decision,
     /// keyed by the globally-unique `approval_id`. The connection's ext handler
     /// parks on the receiver; the answer / cancel path resolves (and removes) the
@@ -510,6 +512,7 @@ impl ConnectionManager {
             chat_channel: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            internal_prompt_source: Arc::new(std::sync::OnceLock::new()),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -527,8 +530,17 @@ impl ConnectionManager {
             chat_channel: self.chat_channel.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
+            internal_prompt_source: self.internal_prompt_source.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
         }
+    }
+
+    /// Shared by all manager clones, including automation and channel engines.
+    pub fn install_internal_prompt_source(
+        &self,
+        source: Arc<dyn crate::acp::myclaw_prompt::PromptSource>,
+    ) {
+        let _ = self.internal_prompt_source.set(source);
     }
 
     /// Set the delegation injection context exactly once during bootstrap.
@@ -577,6 +589,7 @@ impl ConnectionManager {
             chat_channel: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            internal_prompt_source: Arc::new(std::sync::OnceLock::new()),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1043,6 +1056,14 @@ impl ConnectionManager {
         mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
     ) -> Result<(), AcpError> {
+        // Reject before configuration IO; an injected block must never turn an
+        // empty draft into a valid prompt. Both public send paths hold prompt_lock.
+        if blocks.is_empty() {
+            return Err(AcpError::protocol(
+                "prompt must contain at least one content block",
+            ));
+        }
+        let internal_prompt = self.plan_internal_prompt(conn_id).await?;
         // fork(letscubo): 统一记忆 —— 所有入口(网页 / 渠道 / 定时任务 / 派活)都走这里。
         // 只往发给运行时的 blocks 最前面插,回显给界面的 user_message 不动;送出去了才记版本,
         // 被拒(比如上一轮还没完)下一次照样注入。空 prompt 不注入 —— 留给下面原样拒掉。
@@ -1053,6 +1074,9 @@ impl ConnectionManager {
             crate::commands::myclaw_office::preload_mentioned_guides(&mut blocks).await;
             self.plan_myclaw_memory(conn_id, &mut blocks).await
         };
+        if let Some(block) = internal_prompt {
+            blocks.insert(0, block);
+        }
         let result = self
             .send_prompt_inner_raw(conn_id, blocks, user_message)
             .await;
@@ -1062,6 +1086,50 @@ impl ConnectionManager {
             }
         }
         result
+    }
+
+    async fn plan_internal_prompt(
+        &self,
+        conn_id: &str,
+    ) -> Result<Option<PromptInputBlock>, AcpError> {
+        let state = self
+            .get_state(conn_id)
+            .await
+            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        let (identity, accepted) = {
+            let s = state.read().await;
+            if s.turn_in_flight {
+                return Err(AcpError::TurnInProgress);
+            }
+            (
+                crate::acp::myclaw_prompt::PromptIdentity {
+                    conversation_id: s.conversation_id,
+                    agent_key: s.myclaw_agent_key.clone(),
+                    native_session_id: s.external_id.clone(),
+                    agent_type: s.agent_type,
+                    history_state: if s.internal_prompt_accepted_scope == Some(s.conversation_id) {
+                        crate::acp::myclaw_prompt::HistoryState::Present
+                    } else if s.internal_prompt_fresh_session {
+                        crate::acp::myclaw_prompt::HistoryState::Empty
+                    } else {
+                        crate::acp::myclaw_prompt::HistoryState::Unknown
+                    },
+                },
+                s.internal_prompt_accepted_scope == Some(s.conversation_id),
+            )
+        };
+        let Some(source) = self.internal_prompt_source.get() else {
+            return Ok(None);
+        };
+        let snapshot = source
+            .snapshot(&identity)
+            .await
+            .map_err(AcpError::protocol)?;
+        snapshot
+            .map(|config| config.block(accepted))
+            .transpose()
+            .map(|block| block.flatten())
+            .map_err(AcpError::protocol)
     }
 
     /// 取这条连接的记忆快照,需要时插到 blocks 最前面;返回送达后该记下的版本。
@@ -1162,6 +1230,10 @@ impl ConnectionManager {
                 return Err(AcpError::TurnInProgress);
             }
             s.turn_in_flight = true;
+            // Commit the phase at the same cancellation-safe admission boundary.
+            // The platform history can lag an accepted prompt; rejected sends
+            // must not consume the first-message phase, even when A is empty.
+            s.internal_prompt_accepted_scope = Some(s.conversation_id);
         }
         permit.send(ConnectionCommand::Prompt {
             blocks,
@@ -9724,3 +9796,7 @@ mod tests {
             .await;
     }
 }
+
+#[cfg(test)]
+#[path = "manager_prompt_tests.rs"]
+mod internal_prompt_tests;

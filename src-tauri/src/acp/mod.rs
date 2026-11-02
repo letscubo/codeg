@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod manager;
 // fork(letscubo)专属: 统一记忆 —— 每轮送达运行时前注入平台给的 <myclaw_memory> 块。
 pub mod myclaw_memory;
+pub mod myclaw_prompt;
 pub mod opencode_catalog;
 pub mod opencode_plugins;
 pub mod plan_approval;
