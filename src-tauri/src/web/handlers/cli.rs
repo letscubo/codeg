@@ -103,6 +103,12 @@ pub async fn cli_prompt_with_reasoning(
 #[serde(rename_all = "camelCase")]
 pub struct CliCapabilitiesParams {
     pub agent_type: AgentType,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub models: Vec<crate::acp::cli::sdk_effort::ModelRequest>,
 }
 
 #[derive(Serialize)]
@@ -115,9 +121,21 @@ pub async fn cli_prompt_capabilities(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<CliCapabilitiesParams>,
 ) -> Result<Json<CliCapabilitiesResult>, AppCommandError> {
-    let capability = if params.agent_type != AgentType::ClaudeCode {
+    let mut models = params.models;
+    if let Some(model) = params.model {
+        models.push(crate::acp::cli::sdk_effort::ModelRequest {
+            model,
+            provider: params.provider,
+        });
+    }
+    crate::acp::cli::sdk_effort::validate_models(&models)
+        .map_err(AppCommandError::invalid_input)?;
+    let capability = if !matches!(
+        params.agent_type,
+        AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek
+    ) {
         EffortCapability::unavailable(
-            "Per-turn effort is implemented only for Claude Code".into(),
+            "Per-turn effort is unavailable for this runtime".into(),
             None,
         )
     } else {
@@ -131,8 +149,28 @@ pub async fn cli_prompt_capabilities(
         .map_err(|_| {
             AppCommandError::configuration_missing("Could not inspect Claude Code runtime")
         })?;
-        match binary::resolve_claude_executable(&env).await {
-            Ok(executable) => effort::probe(&executable).await,
+        let executable = match params.agent_type {
+            AgentType::Pi => pi_binary::resolve_pi_executable(&env).await,
+            AgentType::DeepSeek => dsh_binary::resolve_dsh_executable(&env).await,
+            _ => binary::resolve_claude_executable(&env).await,
+        };
+        match executable {
+            Ok(executable) if params.agent_type == AgentType::ClaudeCode => {
+                effort::probe(&executable).await
+            }
+            Ok(executable) => {
+                crate::acp::cli::sdk_effort::capability(
+                    &effort::CliEffortContext {
+                        agent_type: params.agent_type,
+                        provider: None,
+                        executable,
+                        working_dir: state.data_dir.clone(),
+                        runtime_env: env,
+                    },
+                    &models,
+                )
+                .await
+            }
             Err(reason) => EffortCapability::unavailable(reason, None),
         }
     };
@@ -151,11 +189,14 @@ async fn cli_prompt_impl(
         .map_err(|reason| coded_invalid("unsupported_reasoning_effort", reason))?;
     if params.reasoning_effort.is_some()
         && params.connection_id.is_none()
-        && params.agent_type != Some(AgentType::ClaudeCode)
+        && !matches!(
+            params.agent_type,
+            Some(AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek)
+        )
     {
         return Err(coded_invalid(
             "unsupported_reasoning_effort",
-            "Per-turn effort is implemented only for Claude Code",
+            "Per-turn effort is implemented only for Claude Code, Pi and DeepSeek Harness",
         ));
     }
     if params.blocks.is_empty() {
@@ -194,12 +235,21 @@ async fn cli_prompt_impl(
         let context = snapshot.cli_effort_context.clone().ok_or_else(|| {
             coded_invalid(
                 "unsupported_reasoning_effort",
-                "Connection does not support Claude Code reasoning effort",
+                "Connection does not support per-turn reasoning effort",
             )
         })?;
         drop(snapshot);
+        let options = context.turn_options(
+            model,
+            params.provider.clone(),
+            params.reasoning_effort.clone(),
+        );
         if let Err(reason) = context
-            .validate(model.as_deref(), &params.reasoning_effort)
+            .resolve_turn(
+                options.model.as_deref(),
+                options.provider.as_deref(),
+                &options.reasoning_effort,
+            )
             .await
         {
             if created {
@@ -207,22 +257,40 @@ async fn cli_prompt_impl(
             }
             return Err(coded_invalid("reasoning_effort_unavailable", reason));
         }
+        Some(options)
+    } else if params
+        .model
+        .as_deref()
+        .is_some_and(|m| !m.trim().is_empty())
+        || params
+            .provider
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+    {
+        // Legacy model changes use the same admission gate. None effort keeps
+        // legacy driver behavior without probing or clearing native settings.
+        let session = manager
+            .get_state(&connection_id)
+            .await
+            .ok_or_else(|| connection_not_found(&connection_id))?;
+        let snapshot = session.read().await;
         Some(CliTurnOptions {
-            model,
-            reasoning_effort: params.reasoning_effort.clone(),
+            model: params
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .or_else(|| snapshot.cli_model.clone()),
+            provider: params.provider.clone().or_else(|| {
+                snapshot
+                    .cli_effort_context
+                    .as_ref()
+                    .and_then(|c| c.provider.clone())
+            }),
+            reasoning_effort: None,
         })
     } else {
-        // Legacy calls retain their existing model update behavior.
-        if let Some(model) = params
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            if let Some(session) = manager.get_state(&connection_id).await {
-                session.write().await.cli_model = Some(model.to_string());
-            }
-        }
         None
     };
 

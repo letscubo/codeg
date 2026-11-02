@@ -31,9 +31,10 @@ use super::driver::{
     reject_unsupported, terminate, truncate, wait_or_terminate, OutputTail,
     MAX_CONSECUTIVE_UNPARSABLE, PROTOCOL_SAMPLE_BYTES, STDERR_DRAIN_WAIT,
 };
-use super::dsh_profile::{remove_turn_patch, write_turn_patch, DshLaunchProfile};
+use super::dsh_profile::{remove_turn_patch, write_turn_patch_with_options, DshLaunchProfile};
 use super::dsh_prompt::{build_args, flatten_prompt};
 use super::dsh_stream::DshStreamMapper;
+use super::effort::{CliEffortContext, CliTurnOptions};
 use super::stream_json::{CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_UNKNOWN};
 use crate::acp::connection::{
     map_prompt_blocks, record_prompt, record_transcript_header_continuing,
@@ -88,9 +89,11 @@ impl DshDriver {
                 ConnectionCommand::Prompt {
                     blocks,
                     user_message,
-                    ..
+                    cli_options,
                 } => {
-                    let disconnect = self.run_turn(blocks, user_message, &mut commands).await;
+                    let disconnect = self
+                        .run_turn(blocks, user_message, cli_options, &mut commands)
+                        .await;
                     if disconnect {
                         break;
                     }
@@ -117,6 +120,7 @@ impl DshDriver {
         &self,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<UserMessageBlock>)>,
+        cli_options: Option<CliTurnOptions>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> bool {
         self.emit(AcpEvent::StatusChanged {
@@ -128,9 +132,14 @@ impl DshDriver {
                 .await;
         }
 
-        let (session_id, model) = {
+        let (session_id, model, provider) = {
             let s = self.state.read().await;
-            (s.external_id.clone(), s.cli_model.clone())
+            let (model, provider) = super::effort::model_route_for_turn(
+                cli_options.as_ref(),
+                &s,
+                self.provider.as_deref(),
+            );
+            (s.external_id.clone(), model, provider)
         };
         let mut record = TurnRecord {
             session_id: session_id.clone(),
@@ -145,20 +154,51 @@ impl DshDriver {
         }
         let started = Instant::now();
 
-        let prepared = flatten_prompt(&blocks, &self.working_dir).and_then(|prompt| {
-            write_turn_patch(
-                &self.profile,
-                &self.connection_id,
-                self.provider.as_deref(),
-                model.as_deref(),
-            )
-            .map(|patch| build_args(&patch, session_id.as_deref(), &prompt))
+        let context = CliEffortContext {
+            agent_type: AgentType::DeepSeek,
+            provider: provider.clone(),
+            executable: self.executable.clone(),
+            working_dir: self.working_dir.clone(),
+            runtime_env: self.runtime_env.clone(),
+        };
+        let options = match cli_options.as_ref() {
+            Some(options) if options.reasoning_effort.is_some() => context
+                .resolve_turn(
+                    model.as_deref(),
+                    provider.as_deref(),
+                    &options.reasoning_effort,
+                )
+                .await
+                .map(|native| {
+                    let mut options = options.clone();
+                    options.reasoning_effort = Some(native);
+                    Some(options)
+                }),
+            _ => Ok(None),
+        };
+        let prepared = options
             .map_err(|message| CliTurnError {
-                code: "dsh_profile_failed",
+                code: "reasoning_effort_unavailable",
                 message,
                 details: None,
             })
-        });
+            .and_then(|options| {
+                flatten_prompt(&blocks, &self.working_dir).and_then(|prompt| {
+                    write_turn_patch_with_options(
+                        &self.profile,
+                        &self.connection_id,
+                        provider.as_deref(),
+                        model.as_deref(),
+                        options.as_ref(),
+                    )
+                    .map(|patch| build_args(&patch, session_id.as_deref(), &prompt))
+                    .map_err(|message| CliTurnError {
+                        code: "dsh_profile_failed",
+                        message,
+                        details: None,
+                    })
+                })
+            });
 
         let (finish, disconnect) = match prepared {
             Err(error) => (
@@ -388,9 +428,10 @@ impl DshDriver {
                     .await;
                 record.prompt_recorded = true;
             }
-        } else if let (Some(sid), Some(update)) =
-            (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
-        {
+        } else if let (Some(sid), Some(update)) = (
+            &record.session_id,
+            transcript_update_for(&event, Some(&self.working_dir)),
+        ) {
             record_transcript_update(self.agent_type, sid, &update);
         }
         self.emit(event).await;

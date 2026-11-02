@@ -1186,6 +1186,11 @@ impl ConnectionManager {
             if let Some(model) = cli_options.as_ref().and_then(|options| options.model.as_ref()) {
                 s.cli_model = Some(model.clone());
             }
+            if let Some(provider) = cli_options.as_ref().and_then(|options| options.provider.as_ref()) {
+                if let Some(context) = s.cli_effort_context.as_mut() {
+                    context.provider = Some(provider.clone());
+                }
+            }
             s.turn_in_flight = true;
         }
         permit.send(ConnectionCommand::Prompt {
@@ -5821,6 +5826,7 @@ mod tests {
         let options = |level: &str| {
             Some(CliTurnOptions {
                 model: Some("claude-opus-5".into()),
+                provider: None,
                 reasoning_effort: Some(Some(level.into())),
             })
         };

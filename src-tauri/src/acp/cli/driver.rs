@@ -189,6 +189,8 @@ impl CliDriver {
             .as_ref()
             .and_then(|o| o.reasoning_effort.clone());
         let context = super::effort::CliEffortContext {
+            agent_type: AgentType::ClaudeCode,
+            provider: None,
             executable: self.executable.clone(),
             working_dir: self.working_dir.clone(),
             runtime_env: self.runtime_env.clone(),

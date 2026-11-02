@@ -22,6 +22,7 @@ pub mod dsh_prompt;
 pub mod dsh_stream;
 pub mod dsh_tool_info;
 pub mod effort;
+pub mod sdk_effort;
 pub mod pi_binary;
 pub mod pi_driver;
 pub mod pi_stream;
@@ -290,7 +291,9 @@ impl ConnectionManager {
             None,
         );
         session.transport = ConnectionTransport::Cli;
-        session.cli_effort_context = (request.agent_type == AgentType::ClaudeCode).then(|| effort::CliEffortContext {
+        session.cli_effort_context = matches!(request.agent_type, AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek).then(|| effort::CliEffortContext {
+            agent_type: request.agent_type,
+            provider: provider.clone(),
             executable: request.executable.clone(),
             working_dir: request.working_dir.clone(),
             runtime_env: request.runtime_env.clone(),

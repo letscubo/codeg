@@ -1,8 +1,14 @@
 {
   "schemaVersion": 1,
-  "review": "Reviewed request deserialization and pure block construction, including simultaneous internalPrompt and reasoningEffort; manager tests use SessionState, Noop emitter and in-memory channels to verify accepted, rejected, cancelled and explicitly cleared turn options. Office preloading has no mentioned scene and memory lookup has no installed database handle, so both return before external access. WhatsApp relay endpoint and health changes are outside the allowlisted call paths and their suites remain compile-only. The v0.30.10-79 change is version metadata only. No AppDatabase, SQL, migrations, agent processes or network.",
-  "sourceSha256": "d4d4178515971b4af4ac554a6a5f6a679f04e403e8447697b3c0bd06ec94785f",
+  "review": "Independently reviewed all 19 exact test call paths. Request deserialization and block construction are pure. Manager tests use SessionState, Noop emitter and in-memory channels for accepted, rejected, cancelled, cleared and switched provider/model snapshots, including strict-to-legacy turns; Office has no mentioned scene and memory has no installed database handle, so both return before external access. Five SDK-effort tests exercise only pure level resolution, exact request validation, argv and YAML patch construction, plus a content-hash cache using private temporary JSON and a non-executed placeholder file. These tests never call native inspect/run_probe, load an installed SDK, initialize an Agent/Session, install anything or launch a CLI process. WhatsApp relay/health suites and all database-dependent tests remain compile-only. No AppDatabase, SQLite, SQL, migrations, agent processes or network are executed. The separately reviewed six Node tests use pure wire checks, mock metadata/selection and a read-only temporary settings backend; the runner apply and SDK probe entry points are not called.",
+  "sourceSha256": "6de1fdd4f37b904aa263394d990b1d57fcb9a2d7df9b98621463daa989b1ce4f",
   "tests": [
+    "acp::cli::sdk_effort::tests::myclaw_prompt_native_levels_reject_missing_efforts_and_preserve_clear",
+    "acp::cli::sdk_effort::tests::myclaw_prompt_native_capability_requests_preserve_exact_route_identity",
+    "acp::cli::sdk_effort::tests::myclaw_prompt_pi_args_pin_effort_and_route_on_each_resumed_turn",
+    "acp::cli::sdk_effort::tests::myclaw_prompt_dsh_patch_uses_runner_selection_without_mutating_default_schema",
+    "acp::cli::sdk_effort::tests::myclaw_prompt_native_probe_cache_invalidates_on_configuration_or_env_change",
+    "acp::manager::internal_prompt_tests::myclaw_prompt_accepted_provider_switch_is_used_by_the_next_fast_turn",
     "acp::manager::internal_prompt_tests::myclaw_prompt_absent_null_empty_and_whitespace_do_not_inject",
     "acp::manager::internal_prompt_tests::myclaw_prompt_busy_and_empty_are_still_rejected",
     "acp::manager::internal_prompt_tests::myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_context",

@@ -23,6 +23,7 @@ export function sourceFingerprint(repo) {
   }
   for (const dir of ['src-tauri/src', 'src-tauri/tests', 'src-tauri/vendor']) walk(join(repo, dir));
   for (const name of ['Cargo.lock', 'Cargo.toml', 'build.rs']) files.push(join(repo, 'src-tauri', name));
+  for (const name of ['codeg-effort-wire.mjs', 'pi/effort-probe.mjs', 'dsh/codeg-headless-runner.mjs']) files.push(join(repo, 'src-tauri/resources', name));
   const digest = createHash('sha256');
   const ordered = files.map(path => ({path, name: relative(repo, path).replaceAll('\\', '/')}))
     .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
