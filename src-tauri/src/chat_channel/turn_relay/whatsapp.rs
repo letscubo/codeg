@@ -4,7 +4,7 @@ use super::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
     time::Instant,
@@ -46,31 +46,28 @@ pub(super) enum Operation {
         operations: Vec<String>,
     },
 }
-pub(super) fn endpoint(urls: &[String], turn_id: &str) -> Result<reqwest::Url, &'static str> {
+pub(super) fn endpoint(raw: &str, turn_id: &str) -> Result<reqwest::Url, &'static str> {
     let id = uuid::Uuid::parse_str(turn_id).map_err(|_| "invalid turn id")?;
-    let origins: BTreeSet<_> = urls
-        .iter()
-        .filter_map(|raw| {
-            let url = reqwest::Url::parse(raw).ok()?;
-            (url.scheme() == "https"
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.path() == "/api/codeg/events"
-                && url.fragment().is_none())
-            .then(|| url.origin().ascii_serialization())
-        })
-        .collect();
-    if origins.len() != 1 {
-        return Err("one trusted webhook origin required");
+    let url = reqwest::Url::parse(raw).map_err(|_| "invalid relay endpoint")?;
+    let host = url.host_str().ok_or("relay endpoint host required")?;
+    let normalized_host = host.to_ascii_lowercase();
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != format!("/api/channels/whatsapp/relay/{id}")
+    {
+        return Err("invalid relay endpoint");
     }
-    // Existing platform webhooks carry vmId/s in their query. Derive only the
-    // trusted origin; never copy those credentials to the relay endpoint.
-    reqwest::Url::parse(&format!(
-        "{}/api/channels/whatsapp/relay/{id}",
-        origins.first().unwrap()
-    ))
-    .map_err(|_| "invalid proxy origin")
+    if normalized_host == "localhost"
+        || normalized_host.ends_with(".localhost")
+        || normalized_host.ends_with(".local")
+        || host.parse::<IpAddr>().is_ok()
+    {
+        return Err("relay endpoint must use a public hostname");
+    }
+    Ok(url)
 }
 #[derive(Debug)]
 pub(super) enum BrokerError {
@@ -501,15 +498,12 @@ mod tests {
         }
     }
     #[test]
-    fn proxy_origin_is_fixed_https_and_operation_has_no_recipient_credentials() {
+    fn explicit_relay_endpoint_is_exact_and_operation_has_no_recipient_credentials() {
         let id = "11111111-1111-4111-8111-111111111111";
-        assert!(endpoint(&["https://platform.invalid/api/codeg/events".into()], id).is_ok());
-        assert!(endpoint(&["http://platform.invalid/api/codeg/events".into()], id).is_err());
+        let raw = format!("https://platform.invalid/api/channels/whatsapp/relay/{id}");
+        assert_eq!(endpoint(&raw, id).unwrap().as_str(), raw);
         assert!(endpoint(
-            &[
-                "https://a.invalid/api/codeg/events".into(),
-                "https://b.invalid/api/codeg/events".into()
-            ],
+            &format!("http://platform.invalid/api/channels/whatsapp/relay/{id}"),
             id
         )
         .is_err());
@@ -523,29 +517,30 @@ mod tests {
         assert_eq!(value.as_object().unwrap().len(), 4);
     }
     #[test]
-    fn legacy_webhook_query_is_supported_but_never_forwarded() {
+    fn relay_endpoint_rejects_other_turns_credentials_and_local_hosts() {
         let id = "11111111-1111-4111-8111-111111111111";
-        let url = endpoint(
-            &[
-                "https://platform.invalid/api/codeg/events?vmId=test-vm&s=private-test-secret"
-                    .into(),
-            ],
-            id,
-        )
-        .unwrap();
-        assert_eq!(
-            url.as_str(),
-            format!("https://platform.invalid/api/channels/whatsapp/relay/{id}")
-        );
-        assert!(url.query().is_none());
-        assert!(!url.as_str().contains("private-test-secret"));
         assert!(endpoint(
-            &["https://user:secret@platform.invalid/api/codeg/events?vmId=test&s=x".into()],
+            &format!("https://user:secret@platform.invalid/api/channels/whatsapp/relay/{id}"),
             id
         )
         .is_err());
         assert!(endpoint(
-            &["https://platform.invalid/api/codeg/events?s=x#fragment".into()],
+            &format!("https://platform.invalid/api/channels/whatsapp/relay/{id}?s=x#fragment"),
+            id
+        )
+        .is_err());
+        assert!(endpoint(
+            "https://platform.invalid/api/channels/whatsapp/relay/22222222-2222-4222-8222-222222222222",
+            id
+        )
+        .is_err());
+        assert!(endpoint(
+            &format!("https://localhost/api/channels/whatsapp/relay/{id}"),
+            id
+        )
+        .is_err());
+        assert!(endpoint(
+            &format!("https://127.0.0.1/api/channels/whatsapp/relay/{id}"),
             id
         )
         .is_err());

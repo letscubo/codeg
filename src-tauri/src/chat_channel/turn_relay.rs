@@ -100,6 +100,9 @@ pub enum OutboundSpec {
     #[serde(rename_all = "camelCase")]
     Whatsapp {
         turn_id: String,
+        /// Exact, per-turn MyClaw relay URL. It is intentionally independent
+        /// from the ordinary Codeg event webhook configuration.
+        relay_endpoint: String,
         delivery_grant: String,
         #[serde(default)]
         presentation: Option<whatsapp::Presentation>,
@@ -837,17 +840,13 @@ fn register(
                 .run(rx)
                 .await
             }
-            OutboundSpec::Whatsapp { delivery_grant, presentation, .. } => {
-                let urls = app_metadata_service::get_value(
-                    &relay.db,
-                    super::event_subscriber::EVENT_WEBHOOKS_KEY,
-                )
-                .await
-                .ok()
-                .flatten()
-                .map(|json| super::webhook::enabled_webhook_urls(&json))
-                .unwrap_or_default();
-                match whatsapp::endpoint(&urls, &tid)
+            OutboundSpec::Whatsapp {
+                relay_endpoint,
+                delivery_grant,
+                presentation,
+                ..
+            } => {
+                match whatsapp::endpoint(&relay_endpoint, &tid)
                     .and_then(|url| whatsapp::HttpBroker::new(url, delivery_grant))
                 {
                     Ok(broker) => {
@@ -1023,6 +1022,25 @@ mod tests {
         let dbg = format!("{spec:?}");
         assert!(!dbg.contains("SECRET"));
         assert!(dbg.contains("redacted"));
+
+        let endpoint = "https://platform.invalid/api/channels/whatsapp/relay/11111111-1111-4111-8111-111111111111";
+        let spec: OutboundSpec = serde_json::from_value(serde_json::json!({
+            "kind": "whatsapp",
+            "turnId": "11111111-1111-4111-8111-111111111111",
+            "relayEndpoint": endpoint,
+            "deliveryGrant": "SECRET-GRANT",
+        }))
+        .unwrap();
+        let dbg = format!("{spec:?}");
+        assert!(!dbg.contains(endpoint));
+        assert!(!dbg.contains("SECRET-GRANT"));
+        assert!(dbg.contains("redacted"));
+        assert!(serde_json::from_value::<OutboundSpec>(serde_json::json!({
+            "kind": "whatsapp",
+            "turnId": "11111111-1111-4111-8111-111111111111",
+            "deliveryGrant": "grant",
+        }))
+        .is_err());
     }
 
     // ── worker(假 Telegram,记录调用)──

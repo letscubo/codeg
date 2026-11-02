@@ -134,3 +134,9 @@ cargo insta review
 ```
 
 本地验证：服务器模式测试代码仅编译（不运行数据库用例）；11 项已审查无数据库 Prompt 测试及 6 项执行器守卫测试通过。codeg-server、codeg-mcp、桌面 codeg 的 cargo check 通过。严格 Clippy 被 7 处既有问题阻断（event_bridge 文档空行、pi_stream/turn_relay 未使用方法、connection 的 future/参数数量、registry match、session_commands if）；未扩展本次任务清理它们。完整仓库 fmt 亦有既有差异，仅对本次重写的 Prompt 实现和测试做了格式检查。
+
+## WhatsApp 独立 relay 地址
+
+- WhatsApp outbound 必须携带 `relayEndpoint`，并同时使用原有短期 `deliveryGrant`。Codeg 只接受与本轮 `turnId` 完全匹配的公开 HTTPS relay URL。
+- WhatsApp relay 不读取 `chat_event_webhooks`，也不从普通 Codeg 事件回调推导平台地址；`vm_codeg_config.webhook_origin` 只属于普通 Codeg 事件链。
+- health 能力 `whatsapp_relay_endpoint_v1` 用于 MyClaw 协商。未提供该字段的旧调用应在反序列化阶段失败，不能静默回退到事件 webhook。
