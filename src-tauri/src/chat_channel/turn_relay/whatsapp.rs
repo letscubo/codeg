@@ -13,7 +13,6 @@ const UPDATE: Duration = Duration::from_secs(2);
 const TYPING: Duration = Duration::from_secs(4);
 const EDIT_WINDOW: Duration = Duration::from_secs(14 * 60);
 const MAX_BYTES: usize = 256 * 1024;
-const STATUS_DELAY: Duration = Duration::from_secs(15);
 
 /// Opt-in negotiated by the platform; old proxies continue using the v2 presentation.
 #[derive(Clone, Debug, Deserialize)]
@@ -333,8 +332,6 @@ impl WhatsappTurn {
         let mut status = "💭".to_owned();
         let mut dirty = false;
         let mut last = Instant::now();
-        let fallback_at = last + STATUS_DELAY;
-        let mut fallback_shown = false;
         let mut after_tool = false;
         let deadline = Instant::now() + MAX_TURN;
         let mut delivery_failed = !rich && !out.show(status.clone(), false).await;
@@ -381,8 +378,7 @@ impl WhatsappTurn {
                     _=tokio::time::sleep_until(next), if dirty=>{
                         let text = if let Some(p)=&self.presentation {
                             if !waiting.is_empty() { Some(format!("{}\n\n{}",composer.text(),p.waiting.chars().take(120).collect::<String>()).trim().to_owned()) }
-                            else if !composer.text().trim().is_empty() && (out.live.is_some() || composer.text().chars().count() >= 20) { Some(composer.text().to_owned()) }
-                            else if out.live.is_some() { Some(p.working.chars().take(120).collect()) }
+                            else if !composer.text().trim().is_empty() { Some(composer.text().to_owned()) }
                             else { None }
                         } else {
                             let note=if !waiting.is_empty(){"⏸"}else if !tools.is_empty(){&status}else if composer.text().is_empty(){"💭"}else{"✍️"};
@@ -390,13 +386,6 @@ impl WhatsappTurn {
                         };
                         if let Some(text)=text { if !out.show(text,false).await{delivery_failed=true;break Outcome::Failed;} }
                         dirty=false;last=Instant::now();
-                    }
-                    _=tokio::time::sleep_until(fallback_at), if rich && !fallback_shown=>{
-                        fallback_shown=true;
-                        if out.live.is_none() && composer.text().trim().is_empty() {
-                            let text=self.presentation.as_ref().unwrap().working.chars().take(120).collect();
-                            if !out.show(text,false).await {delivery_failed=true;break Outcome::Failed;}
-                        }
                     }
                     _=tokio::time::sleep_until(deadline)=>break Outcome::Failed,
                 }
@@ -717,7 +706,7 @@ mod tests {
         assert!(matches!(calls.last(),Some(Operation::Reaction{state}) if state=="clear"));
     }
     #[tokio::test(start_paused = true)]
-    async fn slow_turn_uses_one_delayed_text_then_replaces_it_with_the_answer() {
+    async fn slow_turn_waits_for_real_text_before_creating_a_reply() {
         use super::super::tests::{complete, delta};
         let b = Arc::new(FakeBroker::default());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -733,13 +722,19 @@ mod tests {
             .any(|op| matches!(op, Operation::Send { .. })));
         tokio::time::advance(Duration::from_secs(2)).await;
         settle_tasks().await;
-        assert!(b
+        assert!(!b
             .calls
             .lock()
             .unwrap()
             .iter()
-            .any(|op| matches!(op,Operation::Send{text,..} if text=="正在处理你的请求…")));
+            .any(|op| matches!(op, Operation::Send { .. } | Operation::Edit { .. })));
         tx.send(delta("实际结果")).unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle_tasks().await;
+        assert!(b.calls.lock().unwrap().iter().any(
+            |op| matches!(op,Operation::Send{key,text} if key=="message:0" && text=="实际结果")
+        ));
         tx.send(complete("end_turn")).unwrap();
         assert!(!task.await.unwrap().delivery_failed);
         let calls = b.calls.lock().unwrap();
@@ -872,7 +867,7 @@ mod tests {
         settle_tasks().await;
         tokio::time::advance(Duration::from_secs(3)).await;
         settle_tasks().await;
-        assert!(b
+        assert!(!b
             .calls
             .lock()
             .unwrap()
