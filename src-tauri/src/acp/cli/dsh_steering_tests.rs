@@ -19,6 +19,11 @@ def finish():
     out(dict(type='status', phase='turn_end', reason=dict(kind='completed')))
     out(dict(type='final', text='done'))
 with open(root + '/args.json', 'w') as f: json.dump(sys.argv[1:], f)
+if mode == 'effort':
+    patch = sys.argv[sys.argv.index('--patch') + 1]
+    with open(patch) as f: body = f.read()
+    with open(root + '/launches.jsonl', 'a') as f:
+        f.write(json.dumps(dict(args=sys.argv[1:], patch=body)) + '\n')
 out(dict(type='session', sessionId=sid))
 out(dict(type='text', text='before'))
 if mode == 'unknown':
@@ -56,6 +61,7 @@ struct Harness {
     tx: mpsc::Sender<ConnectionCommand>,
     events: broadcast::Receiver<Arc<EventEnvelope>>,
     task: tokio::task::JoinHandle<()>,
+    effort_context: CliEffortContext,
 }
 
 impl Harness {
@@ -76,15 +82,24 @@ impl Harness {
         session.cli_model = Some("fixture-model".into());
         let events = session.event_stream().subscribe();
         let state = Arc::new(RwLock::new(session));
+        let runtime_env = BTreeMap::from([
+            ("FAKE_DIR".into(), dir.display().to_string()),
+            ("FAKE_MODE".into(), mode.into()),
+            ("DSH_HOME".into(), dir.join("home").display().to_string()),
+        ]);
+        let effort_context = CliEffortContext {
+            agent_type: AgentType::DeepSeek,
+            provider: None,
+            executable: executable.clone(),
+            working_dir: dir.clone(),
+            runtime_env: runtime_env.clone(),
+        };
         let driver = DshDriver {
             connection_id: "dsh-native-fixture".into(),
             agent_type: AgentType::DeepSeek,
             executable,
             working_dir: dir.clone(),
-            runtime_env: BTreeMap::from([
-                ("FAKE_DIR".into(), dir.display().to_string()),
-                ("FAKE_MODE".into(), mode.into()),
-            ]),
+            runtime_env,
             state: state.clone(),
             emitter: EventEmitter::Noop,
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -110,16 +125,21 @@ impl Harness {
             tx,
             events,
             task,
+            effort_context,
         }
     }
 
     async fn prompt(&self) {
+        self.prompt_with_options(None).await;
+    }
+
+    async fn prompt_with_options(&self, cli_options: Option<CliTurnOptions>) {
         self.state.write().await.turn_in_flight = true;
         self.tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text { text: "A".into() }],
                 user_message: None,
-                cli_options: None,
+                cli_options,
             })
             .await
             .unwrap();
@@ -284,4 +304,94 @@ async fn myclaw_prompt_dsh_native_driver_stock_and_unknown_version_stay_disabled
         assert!(h.requests().is_empty());
         h.close().await;
     }
+}
+
+#[tokio::test]
+async fn myclaw_prompt_dsh_native_driver_effort_set_clear_and_legacy_each_keep_steering() {
+    use crate::acp::cli::sdk_effort::{seed_test_capabilities, ModelCapability};
+
+    let _guard = SERIAL.lock().await;
+    let mut h = Harness::new("effort");
+    seed_test_capabilities(
+        &h.effort_context,
+        "0.1.6-alpha.2",
+        ["route-set", "route-clear"]
+            .into_iter()
+            .map(|provider| ModelCapability {
+                model: "exact-model".into(),
+                provider: Some(provider.into()),
+                known: true,
+                levels: vec!["high".into()],
+                default_level: None,
+                clear_error: None,
+            })
+            .collect(),
+    );
+    let options = |provider: &str, level: Option<&str>| {
+        Some(CliTurnOptions {
+            model: Some("exact-model".into()),
+            provider: Some(provider.into()),
+            reasoning_effort: Some(level.map(str::to_owned)),
+        })
+    };
+    for config in [
+        options("route-set", Some("high")),
+        options("route-clear", None),
+        None,
+    ] {
+        h.prompt_with_options(config).await;
+        h.ready().await;
+        assert_eq!(
+            h.steer().await.await.unwrap().unwrap(),
+            crate::acp::connection::SteerOutcome::Injected
+        );
+        let events = h.completed().await;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AcpEvent::Error { .. })));
+    }
+    let launches: Vec<Value> = std::fs::read_to_string(h.dir.join("launches.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        launches.len(),
+        3,
+        "steering must not launch an extra process"
+    );
+    for (index, launch) in launches.iter().enumerate() {
+        let patch: Value =
+            serde_yaml::from_str(&launch["patch"].as_str().unwrap().replace("!!js ", "")).unwrap();
+        let runner = patch
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["insert"].as_array())
+            .flatten()
+            .find(|entry| entry["id"] == "codeg-headless-runner")
+            .unwrap();
+        match index {
+            0 => {
+                assert_eq!(runner["config"]["provider"], "route-set");
+                assert_eq!(runner["config"]["model"], "exact-model");
+                assert_eq!(runner["config"]["reasoningEffort"], "high");
+            }
+            1 => {
+                assert_eq!(runner["config"]["provider"], "route-clear");
+                assert_eq!(runner["config"]["model"], "exact-model");
+                assert!(runner["config"].get("reasoningEffort").unwrap().is_null());
+            }
+            _ => assert!(runner["config"].get("reasoningEffort").is_none()),
+        }
+        if index > 0 {
+            assert!(launch["args"]
+                .as_array()
+                .unwrap()
+                .windows(2)
+                .any(|args| { args[0] == "--session-id" && args[1] == SID }));
+        }
+    }
+    assert_eq!(h.requests().len(), 3);
+    h.close().await;
 }

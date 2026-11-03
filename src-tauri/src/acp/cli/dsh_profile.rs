@@ -31,6 +31,7 @@ const PLUGIN_SOURCE: &str = include_str!("../../../resources/dsh/codeg-tool-sear
 const PLUGIN_FILE_NAME: &str = "codeg-tool-search.mjs";
 const RUNNER_SOURCE: &str = include_str!("../../../resources/dsh/codeg-headless-runner.mjs");
 const RUNNER_FILE_NAME: &str = "codeg-headless-runner.mjs";
+const WIRE_SOURCE: &str = include_str!("../../../resources/codeg-effort-wire.mjs");
 /// `stock` keeps dsh's own headless runner (no background-subagent wait) — an
 /// escape hatch should a dsh bump break the replacement's internals.
 pub const RUNNER_ENV: &str = "CODEG_DSH_RUNNER";
@@ -73,6 +74,11 @@ pub(crate) async fn prepare_launch_profile(
     let runner_path = if runner_is_stock(runtime_env) {
         None
     } else {
+        crate::commands::mcp::write_private_text_file(
+            &dsh_home.join("codeg-effort-wire.mjs"),
+            WIRE_SOURCE,
+        )
+        .map_err(|_| "Could not prepare the Codeg effort wire validator")?;
         Some(materialize(&dsh_home, RUNNER_FILE_NAME, RUNNER_SOURCE)?)
     };
     let companion = match delegation {
@@ -99,7 +105,7 @@ pub(crate) async fn prepare_launch_profile(
     })
 }
 
-fn runner_is_stock(runtime_env: &BTreeMap<String, String>) -> bool {
+pub(super) fn runner_is_stock(runtime_env: &BTreeMap<String, String>) -> bool {
     runtime_env
         .get(RUNNER_ENV)
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("stock"))
@@ -114,14 +120,28 @@ fn background_wait_secs(runtime_env: &BTreeMap<String, String>) -> u64 {
 }
 
 /// Write `$DSH_HOME/codeg-<connection_id>.patch.yml` for the next turn.
+#[cfg(test)]
 pub(crate) fn write_turn_patch(
     profile: &DshLaunchProfile,
     connection_id: &str,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<PathBuf, String> {
+    write_turn_patch_with_options(profile, connection_id, provider, model, None)
+}
+
+pub(crate) fn write_turn_patch_with_options(
+    profile: &DshLaunchProfile,
+    connection_id: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    options: Option<&super::effort::CliTurnOptions>,
+) -> Result<PathBuf, String> {
+    if options.is_some() && profile.runner_path.is_none() {
+        return Err("Per-turn effort requires the Codeg DeepSeek Harness runner".into());
+    }
     let path = profile.patch_path(connection_id);
-    let body = render_patch(profile, provider, model);
+    let body = render_patch_with_options(profile, provider, model, options);
     crate::commands::mcp::write_private_text_file(&path, &body)
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(path)
@@ -150,10 +170,20 @@ fn tool_search_mode(runtime_env: &BTreeMap<String, String>) -> String {
 }
 
 /// The patch as YAML: a top-level list of loader patch entries.
+#[cfg(test)]
 pub(crate) fn render_patch(
     profile: &DshLaunchProfile,
     provider: Option<&str>,
     model: Option<&str>,
+) -> String {
+    render_patch_with_options(profile, provider, model, None)
+}
+
+pub(crate) fn render_patch_with_options(
+    profile: &DshLaunchProfile,
+    provider: Option<&str>,
+    model: Option<&str>,
+    options: Option<&super::effort::CliTurnOptions>,
 ) -> String {
     let mut entries: Vec<Value> = Vec::new();
     if let (Some(provider), Some(model)) = (
@@ -189,11 +219,35 @@ pub(crate) fn render_patch(
     if !inserts.is_empty() {
         entries.push(json!({ "insert": inserts }));
     }
-    let yaml = serde_yaml::to_string(&Value::Array(entries)).unwrap_or_else(|_| "[]\n".to_string());
+    // A flow-style empty list cannot be followed by the runner's block list.
+    // Let the runner begin the one sequence when there are no preceding rows.
+    let yaml = if entries.is_empty() && profile.runner_path.is_some() {
+        String::new()
+    } else {
+        serde_yaml::to_string(&Value::Array(entries)).unwrap_or_else(|_| "[]\n".to_string())
+    };
     let runner = profile
         .runner_path
         .as_deref()
-        .map(|path| runner_entries(path, profile.background_wait_secs))
+        .map(|path| {
+            let mut body = runner_entries(path, profile.background_wait_secs);
+            if let Some(options) = options {
+                for (key, value) in [
+                    (
+                        "provider",
+                        serde_json::to_value(provider).unwrap_or(Value::Null),
+                    ),
+                    ("model", serde_json::to_value(model).unwrap_or(Value::Null)),
+                    (
+                        "reasoningEffort",
+                        serde_json::to_value(&options.reasoning_effort).unwrap_or(Value::Null),
+                    ),
+                ] {
+                    body.push_str(&format!("        {key}: {value}\n"));
+                }
+            }
+            body
+        })
         .unwrap_or_default();
     format!("# Written by codeg for one CLI-transport connection; do not edit.\n{yaml}{runner}")
 }
@@ -261,6 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn myclaw_prompt_dsh_runner_only_patch_is_single_sequence() {
+        let mut profile = profile(false, "off");
+        profile.runner_path = Some("/not-created/runner.mjs".into());
+        let patch = render_patch_with_options(&profile, None, None, None);
+        let entries: Vec<Value> = serde_yaml::from_str(&patch.replace("!!js ", "")).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], "headless-runner");
+        assert_eq!(entries[0]["disabled"], true);
+        assert_eq!(entries[1]["insert"][0]["id"], "codeg-headless-runner");
+
+        profile.runner_path = None;
+        let stock = render_patch_with_options(&profile, None, None, None);
+        let entries: Vec<Value> = serde_yaml::from_str(&stock).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
     fn patch_lists_model_companion_and_plugin() {
         let yaml = render_patch(&profile(true, "auto"), Some("myclaw"), Some("kimi-k3"));
         let parsed: Vec<serde_yaml::Value> =
@@ -276,7 +347,10 @@ mod tests {
         assert_eq!(inserts[1]["name"], "/h/plugins/codeg-tool-search.mjs");
         assert_eq!(inserts[1]["config"]["mode"], "auto");
         // 豁免名单必须与 serverName 同名,否则委派工具会被 tool-search 当普通 MCP 工具藏起来
-        assert_eq!(inserts[1]["config"]["exemptServers"][0], inserts[0]["config"]["serverName"]);
+        assert_eq!(
+            inserts[1]["config"]["exemptServers"][0],
+            inserts[0]["config"]["serverName"]
+        );
     }
 
     #[test]

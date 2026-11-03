@@ -42,9 +42,10 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
 import { createInterface } from "node:readline";
+import { verifiedWireLevels } from "../codeg-effort-wire.mjs";
 
 export const name = "codeg-headless-runner";
-export const inject = ["agentDefaultModel", "agents", "sessions"];
+export const inject = ["agentDefaultModel", "agents", "sessions", "llm"];
 
 const DEFAULT_BACKGROUND_WAIT_SECS = 20 * 60;
 const DEFAULT_EXIT_GRACE_MS = 3000;
@@ -634,6 +635,59 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** Metadata-only mode: never create/resume an Agent or submit a follow-up. */
+export function verifiedModelEfforts(ctx, provider, model, info) {
+  const nativeLevels = (info.reasoning?.efforts ?? []).map(({ id }) => id);
+  if (provider !== "myclaw" && provider !== "myclaw-anthropic") return nativeLevels;
+  const section = ctx.get("settings")?.get("llm-pi-ai");
+  const profile = section?.providers?.[provider];
+  const entry = profile?.models?.find((entry) => entry.id === model);
+  return verifiedWireLevels({
+    runtime: "dsh", provider, api: profile?.api, map: entry?.reasoningEfforts,
+    compat: { ...profile?.compat, ...entry?.compat }, nativeLevels,
+  });
+}
+
+export async function effortCapabilities(ctx, queries, version) {
+  await ctx.get("loader")?.await();
+  const llm = ctx.get("llm");
+  if (typeof llm?.resolveModelInfo !== "function" || typeof llm?.resolveCallConfig !== "function") {
+    throw new Error("DeepSeek Harness model reasoning metadata is unavailable");
+  }
+  const models = [];
+  for (const { model, provider } of queries) {
+    try {
+      if (typeof provider !== "string" || provider === "") throw new Error("Exact provider required");
+      const info = await llm.resolveModelInfo(provider, model);
+      models.push({
+        model, provider, known: true,
+        levels: verifiedModelEfforts(ctx, provider, model, info).map((id) => id === "off" ? "none" : id),
+      });
+    } catch {
+      models.push({ model, provider: provider ?? null, known: false, levels: [] });
+    }
+  }
+  return { type: "codeg_effort_capabilities", version, models };
+}
+
+/** Strict turns freeze route and effort together; legacy turns retain defaults. */
+export async function turnModelSelection(defaultModel, config, llm, ctx) {
+  if (!Object.hasOwn(config, "reasoningEffort")) return defaultModel.currentSelection();
+  if (typeof config.provider !== "string" || config.provider === "" || typeof config.model !== "string" || config.model === "") {
+    throw new Error("An exact provider/model is required for per-turn reasoning effort");
+  }
+  const selection = { provider: config.provider, model: config.model };
+  const info = await llm.resolveModelInfo(selection.provider, selection.model);
+  if (config.reasoningEffort !== null) {
+    if (!verifiedModelEfforts(ctx, selection.provider, selection.model, info).includes(config.reasoningEffort)) {
+      throw new Error("The selected model does not support this reasoning effort");
+    }
+    selection.reasoningEffort = config.reasoningEffort;
+  }
+  await llm.resolveCallConfig(selection);
+  return selection;
+}
+
 async function run(ctx, config, internals) {
   await ctx.get("loader")?.await();
   const agents = ctx.get("agents");
@@ -646,7 +700,7 @@ async function run(ctx, config, internals) {
   const task = config.task === undefined || config.task === "-" ? await readStdin() : config.task;
   if (typeof task !== "string" || task.trim() === "") throw new Error("a task is required");
 
-  const selection = defaultModel.currentSelection();
+  const selection = await turnModelSelection(defaultModel, config, ctx.get("llm"), ctx);
   const agentOptions = { provider: selection.provider, model: selection.model };
   // Must return nothing: the registry calls `.commit()` on a returned value.
   const setup = (agentCtx) => {
@@ -725,6 +779,17 @@ export function apply(ctx, config) {
     // now, so a forced exit is safe; unref'd so it never delays a clean exit.
     setTimeout(() => process.exit(code), graceMs).unref();
   };
+  if (Array.isArray(config.capabilityModels)) {
+    Promise.resolve().then(async () => {
+      const version = JSON.parse(readFileSync(join(launcherRoot(), "package.json"), "utf8")).version;
+      process.stdout.write(`${JSON.stringify(await effortCapabilities(ctx, config.capabilityModels, version))}\n`);
+      return 0;
+    }).catch(() => {
+      process.stderr.write("DeepSeek Harness model metadata could not be verified\n");
+      return 1;
+    }).then(finish);
+    return;
+  }
   loadInternals()
     .then((internals) =>
       run(ctx, config, internals).catch((error) => {

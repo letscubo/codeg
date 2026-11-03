@@ -254,6 +254,7 @@ async fn myclaw_prompt_closed_channel_and_cancelled_reserve_do_not_retain_contex
             Some("CANCELLED"),
             Some(crate::acp::cli::effort::CliTurnOptions {
                 model: Some("claude-sonnet-5".into()),
+                provider: None,
                 reasoning_effort: Some(Some("max".into())),
             }),
         )
@@ -305,9 +306,10 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
         "optimistic-first".into(),
         crate::acp::user_blocks_from_prompt(&original),
     ));
-    let options = |model: &str, level: &str| {
+    let options = |provider: &str, model: &str, level: &str| {
         Some(CliTurnOptions {
             model: Some(model.into()),
+            provider: Some(provider.into()),
             reasoning_effort: Some(Some(level.into())),
         })
     };
@@ -317,7 +319,7 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
             original.clone(),
             echo.clone(),
             Some("ACCEPTED_ONLY"),
-            options("claude-opus-5", "max"),
+            options("myclaw-anthropic", "claude-opus-5", "max"),
         )
         .await
         .unwrap();
@@ -328,7 +330,7 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
                 hello(),
                 None,
                 Some("REJECTED_ONLY"),
-                options("claude-sonnet-5", "low"),
+                options("other-provider", "claude-sonnet-5", "low"),
             )
             .await,
         Err(AcpError::TurnInProgress)
@@ -346,6 +348,7 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
     assert!(text_of(&blocks[..1]).contains("ACCEPTED_ONLY"));
     assert!(!text_of(&blocks).contains("REJECTED_ONLY"));
     let accepted = cli_options.unwrap();
+    assert_eq!(accepted.provider.as_deref(), Some("myclaw-anthropic"));
     assert_eq!(accepted.model.as_deref(), Some("claude-opus-5"));
     assert_eq!(accepted.reasoning_effort, Some(Some("max".into())));
     assert_eq!(
@@ -381,7 +384,7 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
             hello(),
             None,
             Some("NEXT_ONLY"),
-            options("claude-opus-5", "low"),
+            options("myclaw", "claude-opus-5", "low"),
         )
         .await
         .unwrap();
@@ -419,6 +422,7 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
             Some("CLEAR_ONLY"),
             Some(CliTurnOptions {
                 model: Some("claude-opus-5".into()),
+                provider: None,
                 reasoning_effort: Some(None),
             }),
         )
@@ -437,4 +441,94 @@ async fn myclaw_prompt_context_and_effort_stay_with_the_accepted_turn() {
     assert!(text_of(&blocks[..1]).contains("CLEAR_ONLY"));
     assert!(!text_of(&blocks).contains("NEXT_ONLY"));
     assert_eq!(cli_options.unwrap().reasoning_effort, Some(None));
+}
+
+#[tokio::test]
+async fn myclaw_prompt_accepted_provider_switch_is_used_by_the_next_fast_turn() {
+    use crate::acp::cli::effort::{CliEffortContext, CliTurnOptions};
+    let (manager, mut rx) = fixture().await;
+    let state = manager.get_state("c").await.unwrap();
+    state.write().await.cli_effort_context = Some(CliEffortContext {
+        agent_type: AgentType::Pi,
+        provider: Some("route-a".into()),
+        executable: "/not-run".into(),
+        working_dir: "/not-read".into(),
+        runtime_env: Default::default(),
+    });
+    manager
+        .send_prompt_inner(
+            "c",
+            hello(),
+            None,
+            None,
+            Some(CliTurnOptions {
+                model: Some("model-b".into()),
+                provider: Some("route-b".into()),
+                reasoning_effort: Some(Some("high".into())),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager
+            .send_prompt_inner(
+                "c",
+                hello(),
+                None,
+                None,
+                Some(CliTurnOptions {
+                    model: Some("model-c".into()),
+                    provider: Some("route-c".into()),
+                    reasoning_effort: Some(Some("max".into())),
+                })
+            )
+            .await,
+        Err(AcpError::TurnInProgress)
+    ));
+    assert!(matches!(
+        manager
+            .send_prompt_inner(
+                "c",
+                hello(),
+                None,
+                None,
+                Some(CliTurnOptions {
+                    model: Some("legacy-model".into()),
+                    provider: Some("legacy-route".into()),
+                    reasoning_effort: None,
+                })
+            )
+            .await,
+        Err(AcpError::TurnInProgress)
+    ));
+    let ConnectionCommand::Prompt { cli_options, .. } = rx.recv().await.unwrap() else {
+        panic!("expected prompt")
+    };
+    assert_eq!(cli_options.unwrap().provider.as_deref(), Some("route-b"));
+    idle(&manager).await;
+    let saved = state.read().await;
+    // The HTTP fast path has connectionId + effort, with no new launch/provider.
+    let options = saved.cli_effort_context.as_ref().unwrap().turn_options(
+        saved.cli_model.clone(),
+        None,
+        Some(Some("low".into())),
+    );
+    drop(saved);
+    assert_eq!(options.model.as_deref(), Some("model-b"));
+    assert_eq!(options.provider.as_deref(), Some("route-b"));
+    manager
+        .send_prompt_inner("c", hello(), None, None, Some(options))
+        .await
+        .unwrap();
+    let ConnectionCommand::Prompt { cli_options, .. } = rx.recv().await.unwrap() else {
+        panic!("expected fast prompt")
+    };
+    let options = cli_options.unwrap();
+    assert_eq!(options.provider.as_deref(), Some("route-b"));
+    assert_eq!(options.reasoning_effort, Some(Some("low".into())));
+    let saved = state.read().await;
+    let (model, provider) =
+        crate::acp::cli::effort::model_route_for_turn(None, &saved, Some("route-a"));
+    assert_eq!(model.as_deref(), Some("model-b"));
+    assert_eq!(provider.as_deref(), Some("route-b"));
 }

@@ -2,6 +2,8 @@
 
 日期：2026-11-03（Asia/Shanghai）
 
+后续已在本功能分支合入 main 的每轮推理设置，完成 78 项 Rust、69 项 Node、16 项 Python 无数据库回归；冲突处理和首次失败修复见 [main 合入记录](./main-sync-2026-11-03.md)。以下 68 项为前轮实现验收快照。
+
 工作区：`/Users/cooper/Desktop/work/MyClaw/.worktrees/agent-queue-steering-codeg`
 分支：`codex/agent-queue-steering`
 基线：`origin/main` 本地 ref `d60226fd`。
@@ -103,4 +105,4 @@ git diff --check
 - 六类适配代码不代表六类运行时已在线可用或全部实测通过。未知版本/源码、缺少实际 readiness 或插件未加载时继续关闭原生转向，保留普通队列。
 - OpenClaw 需要后续在真正的原 Gateway 主机加载 owned 插件并重建 ACP 连接；已有配置/allowlist/deny/权限必须保留，不能把 ACP 本地目录当作远端 Gateway 已加载的目录。本轮未执行该实例变更。
 - 纯文本以外的原生转向不在本合同范围；附件继续正常排队发送。
-- 未编译发布包、未升级实例、未部署、未提交或 push、未创建 PR。
+- 未编译发布包、未升级实例、未部署、未 push、未创建 PR。功能代码与 main 整合已作本地提交，未改远端 main；最新交付状态见 [main 合入记录](./main-sync-2026-11-03.md)。

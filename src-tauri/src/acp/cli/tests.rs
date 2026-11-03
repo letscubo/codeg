@@ -638,6 +638,7 @@ async fn per_turn_effort_applies_to_new_resumed_and_reused_claude_processes() {
                 None,
                 Some(CliTurnOptions {
                     model: Some("claude-opus-5".into()),
+                    provider: None,
                     reasoning_effort: Some(level.map(str::to_string)),
                 }),
             )
@@ -693,6 +694,7 @@ async fn settings_changed_after_acceptance_fail_explicitly_before_claude_spawns(
             None,
             Some(CliTurnOptions {
                 model: Some("claude-opus-5".into()),
+                provider: None,
                 reasoning_effort: Some(Some("high".into())),
             }),
         )

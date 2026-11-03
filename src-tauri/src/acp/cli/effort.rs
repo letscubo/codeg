@@ -7,9 +7,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::models::agent::AgentType;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub const ALL_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 pub const EFFORT_ENV: &str = "CLAUDE_CODE_EFFORT_LEVEL";
 
 /// Missing preserves old clients; Some(None) explicitly clears this turn's override.
@@ -23,11 +25,34 @@ where
 #[derive(Debug, Clone)]
 pub struct CliTurnOptions {
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub reasoning_effort: Option<Option<String>>,
+}
+
+pub fn model_route_for_turn(
+    options: Option<&CliTurnOptions>,
+    state: &crate::acp::session_state::SessionState,
+    launch_provider: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let model = options
+        .and_then(|o| o.model.clone())
+        .or_else(|| state.cli_model.clone());
+    let provider = options
+        .and_then(|o| o.provider.clone())
+        .or_else(|| {
+            state
+                .cli_effort_context
+                .as_ref()
+                .and_then(|c| c.provider.clone())
+        })
+        .or_else(|| launch_provider.map(str::to_owned));
+    (model, provider)
 }
 
 #[derive(Clone)]
 pub struct CliEffortContext {
+    pub agent_type: AgentType,
+    pub provider: Option<String>,
     pub executable: PathBuf,
     pub working_dir: PathBuf,
     pub runtime_env: BTreeMap<String, String>,
@@ -49,7 +74,9 @@ pub struct EffortCapability {
     pub transport: &'static str,
     pub per_turn: bool,
     pub clear: bool,
-    pub levels: Vec<&'static str>,
+    pub levels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_levels: Option<BTreeMap<String, Vec<String>>>,
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -63,6 +90,7 @@ impl EffortCapability {
             per_turn: true,
             clear: true,
             levels: vec![],
+            model_levels: None,
             version,
             reason: Some(reason),
         }
@@ -94,7 +122,8 @@ pub async fn probe(executable: &Path) -> EffortCapability {
             transport: "cli",
             per_turn: true,
             clear: true,
-            levels: LEVELS.to_vec(),
+            levels: LEVELS.iter().map(|level| level.to_string()).collect(),
+            model_levels: None,
             version: Some(version),
             reason: None,
         },
@@ -129,10 +158,10 @@ async fn read_probe(executable: &Path, argument: &str) -> Result<String, String>
 
 pub fn validate_level(requested: &Option<Option<String>>) -> Result<(), String> {
     if let Some(Some(level)) = requested {
-        if !LEVELS.contains(&level.as_str()) {
+        if !ALL_LEVELS.contains(&level.as_str()) {
             return Err(format!(
                 "Unsupported reasoningEffort; available: {}",
-                LEVELS.join(", ")
+                ALL_LEVELS.join(", ")
             ));
         }
     }
@@ -140,15 +169,52 @@ pub fn validate_level(requested: &Option<Option<String>>) -> Result<(), String> 
 }
 
 impl CliEffortContext {
+    pub fn turn_options(
+        &self,
+        model: Option<String>,
+        provider: Option<String>,
+        reasoning_effort: Option<Option<String>>,
+    ) -> CliTurnOptions {
+        CliTurnOptions {
+            model,
+            provider: provider.or_else(|| self.provider.clone()),
+            reasoning_effort,
+        }
+    }
+
     pub async fn validate(
         &self,
         model: Option<&str>,
         requested: &Option<Option<String>>,
     ) -> Result<(), String> {
+        self.resolve_turn(model, self.provider.as_deref(), requested)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn resolve_turn(
+        &self,
+        model: Option<&str>,
+        provider: Option<&str>,
+        requested: &Option<Option<String>>,
+    ) -> Result<Option<String>, String> {
         if requested.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         validate_level(requested)?;
+        if matches!(self.agent_type, AgentType::Pi | AgentType::DeepSeek) {
+            return super::sdk_effort::resolve_turn(self, model, provider, requested).await;
+        }
+        if self.agent_type != AgentType::ClaudeCode {
+            return Err("Per-turn effort is unavailable for this runtime".into());
+        }
+        if requested
+            .as_ref()
+            .and_then(|v| v.as_deref())
+            .is_some_and(|v| !LEVELS.contains(&v))
+        {
+            return Err("Claude Code supports only low, medium, high, xhigh and max".into());
+        }
         if !model.is_some_and(crate::web::llm_bridge::is_claude_model) {
             return Err(
                 "Per-turn reasoning effort is supported only for native Claude models".into(),
@@ -160,7 +226,8 @@ impl CliEffortContext {
                 .reason
                 .unwrap_or_else(|| "Claude Code effort is unavailable".into()));
         }
-        self.validate_configuration(requested)
+        self.validate_configuration(requested)?;
+        Ok(requested.as_ref().and_then(Clone::clone))
     }
 
     pub fn validate_configuration(&self, requested: &Option<Option<String>>) -> Result<(), String> {

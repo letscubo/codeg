@@ -38,6 +38,7 @@ use super::driver::{
 };
 use super::dsh_driver::transcript_update_for;
 use super::dsh_prompt::flatten_prompt;
+use super::effort::{CliEffortContext, CliTurnOptions};
 use super::pi_rpc::{user_message_text, PiSteeringReceipts};
 use super::pi_stream::PiStreamMapper;
 use super::stream_json::{CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_UNKNOWN};
@@ -156,6 +157,20 @@ pub(super) fn build_args(
     args
 }
 
+pub(super) fn build_args_with_thinking(
+    session_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    session_dir: Option<&Path>,
+    thinking: Option<&str>,
+) -> Vec<String> {
+    let mut args = build_args(session_id, provider, model, session_dir);
+    if let Some(level) = thinking {
+        args.extend(["--thinking".into(), level.into()]);
+    }
+    args
+}
+
 impl PiDriver {
     pub(crate) async fn run(self, mut commands: mpsc::Receiver<ConnectionCommand>) {
         while let Some(command) = commands.recv().await {
@@ -163,9 +178,11 @@ impl PiDriver {
                 ConnectionCommand::Prompt {
                     blocks,
                     user_message,
-                    ..
+                    cli_options,
                 } => {
-                    let stop = self.run_turn(blocks, user_message, &mut commands).await;
+                    let stop = self
+                        .run_turn(blocks, user_message, cli_options, &mut commands)
+                        .await;
                     self.reclaim_questions().await;
                     if stop {
                         break;
@@ -212,6 +229,7 @@ impl PiDriver {
         &self,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<UserMessageBlock>)>,
+        cli_options: Option<CliTurnOptions>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> bool {
         self.emit(AcpEvent::StatusChanged {
@@ -223,9 +241,14 @@ impl PiDriver {
                 .await;
         }
 
-        let (session_id, model) = {
+        let (session_id, model, provider) = {
             let s = self.state.read().await;
-            (s.external_id.clone(), s.cli_model.clone())
+            let (model, provider) = super::effort::model_route_for_turn(
+                cli_options.as_ref(),
+                &s,
+                self.provider.as_deref(),
+            );
+            (s.external_id.clone(), model, provider)
         };
         let mut record = TurnRecord {
             session_id: session_id.clone(),
@@ -241,7 +264,35 @@ impl PiDriver {
         let started = Instant::now();
         let use_rpc = self.rpc_supported().await;
 
-        let (finish, disconnect) = match flatten_prompt(&blocks, &self.working_dir) {
+        let context = CliEffortContext {
+            agent_type: AgentType::Pi,
+            provider: provider.clone(),
+            executable: self.executable.clone(),
+            working_dir: self.working_dir.clone(),
+            runtime_env: self.runtime_env.clone(),
+        };
+        let thinking = match cli_options.as_ref() {
+            Some(options) => {
+                context
+                    .resolve_turn(
+                        model.as_deref(),
+                        provider.as_deref(),
+                        &options.reasoning_effort,
+                    )
+                    .await
+            }
+            None => Ok(None),
+        };
+        let prepared = thinking
+            .map_err(|message| CliTurnError {
+                code: "reasoning_effort_unavailable",
+                message,
+                details: None,
+            })
+            .and_then(|thinking| {
+                flatten_prompt(&blocks, &self.working_dir).map(|prompt| (prompt, thinking))
+            });
+        let (finish, disconnect) = match prepared {
             Err(error) => (
                 TurnFinish {
                     stop_reason: STOP_UNKNOWN.to_string(),
@@ -249,12 +300,13 @@ impl PiDriver {
                 },
                 false,
             ),
-            Ok(prompt) => {
-                let mut args = build_args(
+            Ok((prompt, thinking)) => {
+                let mut args = build_args_with_thinking(
                     session_id.as_deref(),
-                    self.provider.as_deref(),
+                    provider.as_deref(),
                     model.as_deref(),
                     self.session_dir.as_deref(),
+                    thinking.as_deref(),
                 );
                 if !use_rpc {
                     args.splice(0..2, ["--print".into(), "--mode".into(), "json".into()]);

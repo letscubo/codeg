@@ -23,6 +23,8 @@ export function sourceFingerprint(repo) {
     }
   }
   for (const dir of ['src-tauri/src', 'src-tauri/tests', 'src-tauri/vendor']) walk(join(repo, dir));
+  // Recursive collection includes effort wire/Pi/DSH resources once, together
+  // with owned ACP bootstraps and plugin metadata in nested resource directories.
   walk(join(repo, 'src-tauri/resources'), name => /\.(?:mjs|cjs|js|py|json)$/.test(name)
     && !/\.test\.(?:mjs|cjs|js|py)$/.test(name) && !name.startsWith('test_'));
   for (const name of ['Cargo.lock', 'Cargo.toml', 'build.rs']) files.push(join(repo, 'src-tauri', name));
