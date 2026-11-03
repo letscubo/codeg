@@ -13,13 +13,14 @@ const UPDATE: Duration = Duration::from_secs(2);
 const TYPING: Duration = Duration::from_secs(4);
 const EDIT_WINDOW: Duration = Duration::from_secs(14 * 60);
 const MAX_BYTES: usize = 256 * 1024;
-const STATUS_DELAY: Duration = Duration::from_secs(15);
 
 /// Opt-in negotiated by the platform; old proxies continue using the v2 presentation.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Presentation {
     pub working: String,
     pub waiting: String,
+    #[serde(default)]
+    pub question_reply: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -40,6 +41,11 @@ pub(super) enum Operation {
     },
     Reaction {
         state: String,
+    },
+    Question {
+        #[serde(rename = "questionId")]
+        question_id: String,
+        questions: Vec<crate::acp::question::QuestionSpec>,
     },
     Finish {
         outcome: String,
@@ -131,7 +137,8 @@ impl Broker for HttpBroker {
             return Err(BrokerError::Retryable);
         }
         match op {
-            Operation::Send { .. } | Operation::Edit { .. } => receipt["data"]["messageId"]
+            Operation::Send { .. } | Operation::Edit { .. } | Operation::Question { .. } => receipt
+                ["data"]["messageId"]
                 .as_str()
                 .filter(|s| !s.is_empty() && s.len() < 512)
                 .map(|s| Some(s.to_owned()))
@@ -333,8 +340,6 @@ impl WhatsappTurn {
         let mut status = "💭".to_owned();
         let mut dirty = false;
         let mut last = Instant::now();
-        let fallback_at = last + STATUS_DELAY;
-        let mut fallback_shown = false;
         let mut after_tool = false;
         let deadline = Instant::now() + MAX_TURN;
         let mut delivery_failed = !rich && !out.show(status.clone(), false).await;
@@ -348,6 +353,13 @@ impl WhatsappTurn {
                         None=>break Outcome::Aborted,
                         Some(RelayInput::Lagged)=>break Outcome::Lagged,
                         Some(RelayInput::Event(env))=>{
+                            if let crate::acp::types::AcpEvent::QuestionRequest { question_id, questions, .. } = &env.payload {
+                                if self.presentation.as_ref().is_some_and(|p| p.question_reply) {
+                                    if call(&self.broker,&Operation::Question {question_id:question_id.clone(),questions:questions.clone()}).await.is_err() {
+                                        delivery_failed=true;break Outcome::Failed;
+                                    }
+                                }
+                            }
                             match classify(&env.payload){
                                 PublicEvent::Text(text)=>{
                                     bytes+=text.len();if bytes>MAX_BYTES{break Outcome::Lagged;}
@@ -380,9 +392,8 @@ impl WhatsappTurn {
                     },
                     _=tokio::time::sleep_until(next), if dirty=>{
                         let text = if let Some(p)=&self.presentation {
-                            if !waiting.is_empty() { Some(format!("{}\n\n{}",composer.text(),p.waiting.chars().take(120).collect::<String>()).trim().to_owned()) }
-                            else if !composer.text().trim().is_empty() && (out.live.is_some() || composer.text().chars().count() >= 20) { Some(composer.text().to_owned()) }
-                            else if out.live.is_some() { Some(p.working.chars().take(120).collect()) }
+                            if !waiting.is_empty() && !(p.question_reply && waiting.iter().all(|(kind,_)| kind=="question")) { Some(format!("{}\n\n{}",composer.text(),p.waiting.chars().take(120).collect::<String>()).trim().to_owned()) }
+                            else if !composer.text().trim().is_empty() { Some(composer.text().to_owned()) }
                             else { None }
                         } else {
                             let note=if !waiting.is_empty(){"⏸"}else if !tools.is_empty(){&status}else if composer.text().is_empty(){"💭"}else{"✍️"};
@@ -390,13 +401,6 @@ impl WhatsappTurn {
                         };
                         if let Some(text)=text { if !out.show(text,false).await{delivery_failed=true;break Outcome::Failed;} }
                         dirty=false;last=Instant::now();
-                    }
-                    _=tokio::time::sleep_until(fallback_at), if rich && !fallback_shown=>{
-                        fallback_shown=true;
-                        if out.live.is_none() && composer.text().trim().is_empty() {
-                            let text=self.presentation.as_ref().unwrap().working.chars().take(120).collect();
-                            if !out.show(text,false).await {delivery_failed=true;break Outcome::Failed;}
-                        }
                     }
                     _=tokio::time::sleep_until(deadline)=>break Outcome::Failed,
                 }
@@ -479,7 +483,10 @@ mod tests {
             {
                 return Err(BrokerError::Rejected);
             }
-            if matches!(op, Operation::Send { .. } | Operation::Edit { .. }) {
+            if matches!(
+                op,
+                Operation::Send { .. } | Operation::Edit { .. } | Operation::Question { .. }
+            ) {
                 if self.block_once.swap(false, Ordering::SeqCst) {
                     self.started.notify_one();
                     self.release.notified().await;
@@ -493,6 +500,9 @@ mod tests {
             Ok(match op {
                 Operation::Send { key, .. } => Some(format!("true_group_{key}")),
                 Operation::Edit { message_id, .. } => Some(message_id.clone()),
+                Operation::Question { question_id, .. } => {
+                    Some(format!("true_group_question-{question_id}"))
+                }
                 _ => None,
             })
         }
@@ -687,6 +697,7 @@ mod tests {
             presentation: Some(Presentation {
                 working: "正在处理你的请求…".into(),
                 waiting: "请在 MyClaw 中确认。".into(),
+                question_reply: false,
             }),
         }
     }
@@ -717,7 +728,7 @@ mod tests {
         assert!(matches!(calls.last(),Some(Operation::Reaction{state}) if state=="clear"));
     }
     #[tokio::test(start_paused = true)]
-    async fn slow_turn_uses_one_delayed_text_then_replaces_it_with_the_answer() {
+    async fn slow_turn_waits_for_real_text_before_creating_a_reply() {
         use super::super::tests::{complete, delta};
         let b = Arc::new(FakeBroker::default());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -733,13 +744,19 @@ mod tests {
             .any(|op| matches!(op, Operation::Send { .. })));
         tokio::time::advance(Duration::from_secs(2)).await;
         settle_tasks().await;
-        assert!(b
+        assert!(!b
             .calls
             .lock()
             .unwrap()
             .iter()
-            .any(|op| matches!(op,Operation::Send{text,..} if text=="正在处理你的请求…")));
+            .any(|op| matches!(op, Operation::Send { .. } | Operation::Edit { .. })));
         tx.send(delta("实际结果")).unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle_tasks().await;
+        assert!(b.calls.lock().unwrap().iter().any(
+            |op| matches!(op,Operation::Send{key,text} if key=="message:0" && text=="实际结果")
+        ));
         tx.send(complete("end_turn")).unwrap();
         assert!(!task.await.unwrap().delivery_failed);
         let calls = b.calls.lock().unwrap();
@@ -872,13 +889,58 @@ mod tests {
         settle_tasks().await;
         tokio::time::advance(Duration::from_secs(3)).await;
         settle_tasks().await;
-        assert!(b
+        assert!(!b
             .calls
             .lock()
             .unwrap()
             .iter()
             .any(|op| matches!(op,Operation::Edit{text,..} if text=="正在处理你的请求…")));
         tx.send(delta("完成")).unwrap();
+        tx.send(complete("end_turn")).unwrap();
+        assert!(!task.await.unwrap().delivery_failed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn negotiated_question_delivers_agent_words_without_generic_waiting_bubble() {
+        use super::super::tests::{complete, delta, env};
+        use crate::acp::{question::QuestionSpec, types::AcpEvent};
+        let broker = Arc::new(FakeBroker::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut turn = quiet_turn(broker.clone());
+        turn.presentation.as_mut().unwrap().question_reply = true;
+        let task = tokio::spawn(turn.run(rx));
+        tx.send(env(AcpEvent::QuestionRequest {
+            question_id: "question-1".into(),
+            questions: vec![QuestionSpec {
+                id: "part".into(),
+                question: "你想改成什么内容？".into(),
+                header: String::new(),
+                multi_select: false,
+                options: vec![],
+                is_secret: false,
+            }],
+            form: None,
+        }))
+        .unwrap();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle_tasks().await;
+        {
+            let calls = broker.calls.lock().unwrap();
+            assert!(calls.iter().any(
+                |op| matches!(op, Operation::Question { question_id, questions }
+                if question_id == "question-1" && questions[0].question == "你想改成什么内容？")
+            ));
+            assert!(!calls
+                .iter()
+                .any(|op| matches!(op, Operation::Send { text, .. }
+                if text.contains("请在 MyClaw 中确认"))));
+        }
+        tx.send(env(AcpEvent::QuestionResolved {
+            question_id: "question-1".into(),
+        }))
+        .unwrap();
+        tx.send(delta("已更新")).unwrap();
         tx.send(complete("end_turn")).unwrap();
         assert!(!task.await.unwrap().delivery_failed);
     }

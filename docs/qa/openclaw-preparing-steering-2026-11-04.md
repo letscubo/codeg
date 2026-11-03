@@ -26,7 +26,7 @@ Rust 仅执行重新审查后列入 `scripts/no-db-tests.json` 的精确测试�
 
 Node 验证使用内存 operation/backend、固定发布版源码片段、假 ACP/Gateway 和私有临时文件，不导入 OpenClaw 运行时入口，不连接数据库或模型。Web 浏览器验证使用独立 headless 浏览器和假传输，不操作用户的浏览器。
 
-## 执行结果
+## 已安装源码快照的执行结果
 
 | 验证 | 结果 |
 | --- | --- |
@@ -58,6 +58,26 @@ Node 验证使用内存 operation/backend、固定发布版源码片段、假 AC
 
 `client-proof-8b335f93` 是打包标签，不是 Git commit。固定源码由真实基线 `ab88c6c12e1af4cccac7e09c96398d44d41e9022` 加 18 个已审查工作区文件组成；源码快照文件 SHA-256 为 `0aeacef48c96c3cf6d9c5d41b5699b29e978451a0be02815399d4cc3f617ef4a`，最终源码 manifest SHA-256 为 `886ab804acefe901c7b46ec423a32e753fa3239ffa533f2d8f26b17e2ba94e8f`。
 
-仅目标 VM `716b08b2-a0d2-445f-814e-52258edb0120` 的本地安装回执记录为 `installed`：server 与实际 worker executable SHA-256 均为 `f91602d4239c1356d35f467c316a34262c7cf607cbcdb9b80c67f103a96aeda0`，MCP SHA-256 为 `40fa95c2e8d8b76b064cec08821c9f93385edc58025569f042be54ae9e4c2a35`。复用 8 项资源的精确 owned 目录，保留 live DB、环境文件和配置字节；本次 checkpoint 前再次逐文件核对，18 项差异均与打包源码相同。
+仅目标 VM `716b08b2-a0d2-445f-814e-52258edb0120` 的本地安装回执记录为 `installed`：server 与实际 worker executable SHA-256 均为 `f91602d4239c1356d35f467c316a34262c7cf607cbcdb9b80c67f103a96aeda0`，MCP SHA-256 为 `40fa95c2e8d8b76b064cec08821c9f93385edc58025569f042be54ae9e4c2a35`。复用 8 项资源的精确 owned 目录，保留 live DB、环境文件和配置字节；更新本文前再次逐文件核对，原 18 项差异均与打包源码相同。Checkpoint 另行修正本文和 AGENTS 的过时记录，没有改变已安装的生产／测试源码。
 
-该安装回执证明固定包和服务加载情况，不等于六类 Agent 的真实模型测试全部通过。记录来源：[固定包核验](/private/tmp/codeg-client-proof-8b335f93-linux-build/candidate-package-verification.json)、[源码快照](/private/tmp/codeg-client-proof-8b335f93-linux-build/source-snapshot.json)、[安装回执](/private/tmp/codeg-preview-installed-client-proof-8b335f93-716b08b2.json)。后续 main 整合的验证另行记录，不复用旧指纹冒充合并版本结果。
+该安装回执证明固定包和服务加载情况，不等于六类 Agent 的真实模型测试全部通过。记录来源：[固定包核验](/private/tmp/codeg-client-proof-8b335f93-linux-build/candidate-package-verification.json)、[源码快照](/private/tmp/codeg-client-proof-8b335f93-linux-build/source-snapshot.json)、[安装回执](/private/tmp/codeg-preview-installed-client-proof-8b335f93-716b08b2.json)。本节仅记录当时交付，main 整合结果见下节。
+
+## main 整合验证（2026-11-04）
+
+用户明确批准逐文件冲突方案后，先创建 checkpoint `4bac1e9cf80e1d56d17d17c7a9fa3ef32f0aa95d`，再获取 `origin/main` 与功能分支。此次整合目标为 `f9bdbab2237195e196352ea26cee23e7174e30bb`，包含 WhatsApp 回复展示、版本 `0.30.10-81` 和 Agent 问题转发三个提交。
+
+仅两处冲突：health 的能力数组保留 `whatsapp_question_reply_v1` 与 `native_steering_v1`，三条 native 路由和原认证归属不变；无数据库清单保留原 93 个精确名称，main 的 19 项全部已经包含，不扩大执行集。main 新增的 WhatsApp fake-broker 测试继续仅编译。其改动位于 WhatsApp broker 和四个项目版本字段，没有向这 93 条调用链加入数据库、真实 Agent／SDK 或网络访问；保留功能分支递归校验生产资源的指纹算法。
+
+合并后审查冻结的源码指纹：`34a86f82c48d29a3ed5298a3a45c781dee89cec7bd98c37cdf716255184e0c91`。
+
+| 本轮检查 | 结果与日志 |
+| --- | --- |
+| server / MCP `cargo check --offline --locked --no-default-features --bin codeg-server --bin codeg-mcp` | 通过；[日志](/private/tmp/codeg-main-sync-check-20261104.log) |
+| server / lib `cargo test --offline --locked --no-default-features --bin codeg-server --lib --no-run` | 通过，仅编译；[日志](/private/tmp/codeg-main-sync-test-compile-20261104.log) |
+| `node scripts/test-no-db.mjs server` | **93/93**，无跳过；[日志](/private/tmp/codeg-main-sync-no-db-20261104.log) |
+| OpenClaw 纯回归、固定发布包／registry factory 审计、执行器守卫 | **57/57**，0 skip；[日志](/private/tmp/codeg-main-sync-node-20261104.log) |
+| `CODEG_PI_EFFORT_PROBE=0 node --test src-tauri/resources/codeg-effort.test.mjs` | **8/8**，0 skip；[日志](/private/tmp/codeg-main-sync-effort-20261104.log) |
+
+Rust 工具链使用 `/private/tmp/myclaw-rust-tools` 的既有 cargo/rustup；所有实际 Rust 执行均通过受限清单，未直接运行全量 `cargo test`。保留已有库警告和链接器 unwind 警告。Node 审计通过 `CODEG_OPENCLAW_AUDIT_PACKAGE` 与 `CODEG_OPENCLAW_REGISTRY_AUDIT` 指向已校验的本地发布包源码，不安装或启动 OpenClaw。
+
+本轮仅在功能工作区验证和提交合并；主 checkout 的 HEAD 与既有 dirty 状态保持不变。不推送 main、不发版、不部署、不操作实例，不把合并后源码当作已经安装的新包。
