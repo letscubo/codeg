@@ -128,7 +128,7 @@ test('OpenClaw queue ACK-shaped results and unknown dependencies never advertise
   h.backend.messageInjectionV2.queueMessage = async () => ({ queued: true })
   assert.equal((await h.gateway.submit(p, h.client, h.context)).outcome, 'unconfirmed')
   const unknown = createGatewayController(async () => { throw new Error('unsupported bundle') })
-  assert.deepEqual(await unknown.capability(), { version: 0 })
+  assert.deepEqual(await unknown.capability(), { version: 0, reason: 'load_failed' })
   assert.equal((await unknown.state(h.scope, h.client, h.context)).ready, false)
 })
 test('OpenClaw ended A, caller disconnect, provider failure and full ledger never resend', async () => {

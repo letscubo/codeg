@@ -47,6 +47,48 @@ fn myclaw_prompt_native_acp_capability_is_distinct_from_legacy_feedback() {
         !state.native_steer_v1_available,
         "handshake is not active-turn readiness"
     );
+
+    // Diagnostic stderr never supplies authority or opaque identifiers. Only
+    // the independently validated, data-only vocabulary can reach INFO.
+    let prefix = "[codeg-openclaw-native] ";
+    for value in [
+        json!({"phase":"boot","event":"registered"}),
+        json!({"phase":"initialize","result":"failed","elapsedMs":86400000,
+            "code":"FORBIDDEN","detailCode":"MISSING_SCOPE","reason":"load_failed"}),
+        json!({"phase":"prompt","supported":false,"tracking":false}),
+        json!({"phase":"readiness","turn":1000000000,"ready":false,
+            "reason":"backend_not_available","elapsedMs":0,"sessionKeyChanged":true,
+            "activeRunMatches":true,"controllerMatches":false}),
+        json!({"phase":"connection","event":"gateway_disconnect","activeTurns":10000}),
+    ] {
+        assert_eq!(
+            parse_owned_diagnostic(&format!("{prefix}{value}")),
+            Some(value)
+        );
+    }
+    for invalid in [
+        json!({"phase":"boot","event":"registered","token":"must-not-log"}),
+        json!({"phase":"boot","event":"must-not-log"}),
+        json!({"phase":"prompt","supported":"true","tracking":false}),
+        json!({"phase":"prompt","supported":true}),
+        json!({"phase":"prompt","supported":true,"tracking":true,"connection_id":"foreign"}),
+        json!({"phase":"initialize","result":"failed","elapsedMs":86400001}),
+        json!({"phase":"initialize","result":"failed","elapsedMs":-1}),
+        json!({"phase":"initialize","result":"failed","elapsedMs":1.5}),
+        json!({"phase":"initialize","result":"failed","elapsedMs":0,"code":"secret"}),
+        json!({"phase":"initialize","result":"failed","elapsedMs":0,"detailCode":"secret"}),
+        json!({"phase":"readiness","turn":1000000001,"ready":true,"reason":"ready","elapsedMs":0}),
+        json!({"phase":"readiness","turn":1,"ready":true,"reason":"foreign","elapsedMs":0}),
+        json!({"phase":"connection","event":"shutdown","activeTurns":10001}),
+        json!({"phase":"unknown","event":"shutdown"}),
+        json!([]),
+    ] {
+        assert!(parse_owned_diagnostic(&format!("{prefix}{invalid}")).is_none());
+    }
+    assert!(parse_owned_diagnostic("ordinary stderr must not become INFO").is_none());
+    assert!(parse_owned_diagnostic(&format!(" {prefix}{{}}")).is_none());
+    assert!(parse_owned_diagnostic(&format!("{prefix}{{}} trailing")).is_none());
+    assert!(parse_owned_diagnostic(&format!("{prefix}{}", " ".repeat(2048))).is_none());
 }
 
 #[test]

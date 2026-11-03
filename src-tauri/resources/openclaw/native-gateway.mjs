@@ -10,6 +10,16 @@ export const CAPABILITY = { version: 1, activeOnly: true, receipts: 'consumed' }
 const text = value => typeof value === 'string' && value.length > 0 && value.length <= 512
 const validScope = p => p?.version === 1 && ['sessionKey', 'gatewayRunId', 'hostTurnId'].every(k => text(p[k]))
 const reply = (p, outcome) => ({ version: 1, submissionId: p?.submissionId ?? '', hostTurnId: p?.hostTurnId ?? '', nativeTurnId: p?.expectedNativeTurnId ?? '', outcome })
+const loadFailureReason = error => {
+  try {
+    const descriptor = error && Object.getOwnPropertyDescriptor(error, 'message')
+    const message = descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined
+    if (message === 'unsupported_openclaw_version') return 'unsupported_runtime'
+    if (message === 'unsupported_openclaw_bundle') return 'unsupported_bundle'
+    if (message === 'unsupported_openclaw_exports') return 'unsupported_exports'
+  } catch {}
+  return 'load_failed'
+}
 
 export function createGatewayController(loadInternals, { limit = 8192, deliveryTimeoutMs = 120000 } = {}) {
   let internals
@@ -23,23 +33,25 @@ export function createGatewayController(loadInternals, { limit = 8192, deliveryT
 
   // Every check uses the exact original request owner and original runtime
   // objects. Looking up a newer run by session is deliberately forbidden.
-  function capture(p, client, context, deps) {
-    if (!validScope(p) || !text(client?.connId)) return null
+  function capture(p, client, context, deps, diagnostic) {
+    const reject = reason => { if (diagnostic) diagnostic.reason = reason; return null }
+    if (!validScope(p) || !text(client?.connId)) return reject('inactive_or_unowned')
     const entry = context?.chatAbortControllers?.get(p.gatewayRunId)
     if (!entry || entry.ownerConnId !== client.connId || entry.sessionKey !== p.sessionKey ||
-        entry.registrationCleanupRequested || entry.controller?.signal?.aborted) return null
+        entry.registrationCleanupRequested || entry.controller?.signal?.aborted) return reject('inactive_or_unowned')
     const operation = deps.operations.get(entry.controller.signal)
     if (!operation || operation.key !== p.sessionKey || operation.sessionId !== entry.sessionId ||
-        operation.phase !== 'running' || operation.result || deps.registry.get(operation.key) !== operation) return null
+        operation.phase !== 'running' || operation.result || deps.registry.get(operation.key) !== operation) return reject('inactive_or_unowned')
     const backend = deps.backend(operation)
     // This first release audits the embedded OpenClaw implementation only.
     // Its success waits for the matching queueIdentity's user message_end.
-    if (backend?.kind !== 'embedded' || !text(backend.runId) ||
+    if (!backend) return reject('backend_missing')
+    if (backend.kind !== 'embedded' || !text(backend.runId) ||
         backend.supportsTranscriptCommitWait !== true || backend.messageInjectionV2?.version !== 2 ||
-        typeof backend.messageInjectionV2.queueMessage !== 'function' ||
-        backend.messageInjectionV2.isAvailable?.() !== true) return null
+        typeof backend.messageInjectionV2.queueMessage !== 'function') return reject('backend_unsupported')
+    if (backend.messageInjectionV2.isAvailable?.() !== true) return reject('backend_not_available')
     const fingerprint = backend.toolAuthorityFingerprint ?? operation.toolAuthorityFingerprint
-    if (!text(fingerprint)) return null
+    if (!text(fingerprint)) return reject('authority_missing')
     const nativeTurnId = createHash('sha256').update(JSON.stringify([
       p.gatewayRunId, entry.sessionId, backend.runId, fingerprint, identity(entry), identity(operation), identity(backend),
     ])).digest('hex')
@@ -53,13 +65,14 @@ export function createGatewayController(loadInternals, { limit = 8192, deliveryT
     return { entry, operation, backend, fingerprint, nativeTurnId, current }
   }
   async function capability() {
-    try { await load(); return CAPABILITY } catch { return { version: 0 } }
+    try { await load(); return CAPABILITY } catch (error) { return { version: 0, reason: loadFailureReason(error) } }
   }
   async function state(p, client, context) {
     try {
-      const owner = capture(p, client, context, await load())
-      return { version: 1, ready: Boolean(owner), ...(owner ? { nativeTurnId: owner.nativeTurnId } : {}) }
-    } catch { return { version: 1, ready: false } }
+      const diagnostic = { reason: 'inactive_or_unowned' }
+      const owner = capture(p, client, context, await load(), diagnostic)
+      return { version: 1, ready: Boolean(owner), ...(owner ? { nativeTurnId: owner.nativeTurnId } : { reason: diagnostic.reason }) }
+    } catch { return { version: 1, ready: false, reason: 'inactive_or_unowned' } }
   }
   async function submit(p, client, context) {
     const fingerprint = JSON.stringify([client?.connId, p?.sessionKey, p?.gatewayRunId, p?.hostTurnId, p?.expectedNativeTurnId, p?.text])

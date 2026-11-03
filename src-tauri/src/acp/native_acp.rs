@@ -64,8 +64,146 @@ fn identifier(value: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty() && value.len() <= 2048)
 }
 
+/// A peer's stderr is untrusted. Only this bounded, version-owned diagnostic
+/// vocabulary may be promoted to INFO; the original line is never returned.
+pub(super) fn parse_owned_diagnostic(line: &str) -> Option<Value> {
+    if line.len() > 2048 {
+        return None;
+    }
+    let raw = line.strip_prefix("[codeg-openclaw-native] ")?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let fields = value.as_object()?;
+    let phase = fields.get("phase")?.as_str()?;
+    let (allowed, required): (&[&str], &[&str]) = match phase {
+        "boot" => (&["phase", "event", "reason"], &["event"]),
+        "initialize" => (
+            &[
+                "phase",
+                "result",
+                "elapsedMs",
+                "reason",
+                "code",
+                "detailCode",
+            ],
+            &["result", "elapsedMs"],
+        ),
+        "prompt" => (
+            &["phase", "supported", "validHostMeta", "tracking"],
+            &["supported", "tracking"],
+        ),
+        "readiness" => (
+            &[
+                "phase",
+                "turn",
+                "ready",
+                "reason",
+                "elapsedMs",
+                "code",
+                "detailCode",
+                "sessionKeyChanged",
+                "activeRunMatches",
+                "controllerMatches",
+            ],
+            &["turn", "ready", "reason", "elapsedMs"],
+        ),
+        "connection" => (
+            &["phase", "event", "activeTurns"],
+            &["event", "activeTurns"],
+        ),
+        _ => return None,
+    };
+    if fields.keys().any(|key| !allowed.contains(&key.as_str()))
+        || required.iter().any(|key| !fields.contains_key(*key))
+    {
+        return None;
+    }
+    let mut safe = Map::new();
+    for (key, value) in fields {
+        let valid = match key.as_str() {
+            "phase" => true, // The phase was matched to a static schema above.
+            "supported" | "validHostMeta" | "tracking" | "ready" | "sessionKeyChanged"
+            | "activeRunMatches" | "controllerMatches" => value.is_boolean(),
+            "elapsedMs" => value.as_u64().is_some_and(|v| v <= 86_400_000),
+            "turn" => value.as_u64().is_some_and(|v| v <= 1_000_000_000),
+            "activeTurns" => value.as_u64().is_some_and(|v| v <= 10_000),
+            "result" => matches!(
+                value.as_str(),
+                Some("ready" | "timeout" | "unavailable" | "unsupported_contract" | "failed")
+            ),
+            "code" => matches!(
+                value.as_str(),
+                Some("FORBIDDEN" | "UNAVAILABLE" | "INVALID_REQUEST" | "CLIENT_TIMEOUT")
+            ),
+            "detailCode" => matches!(
+                value.as_str(),
+                Some("MISSING_SCOPE" | "AUTHENTICATED_PROFILE_UNAVAILABLE")
+            ),
+            "event" if phase == "boot" => matches!(
+                value.as_str(),
+                Some("registered" | "skipped" | "patch_applied" | "guard_rejected")
+            ),
+            "event" => matches!(value.as_str(), Some("gateway_disconnect" | "shutdown")),
+            "reason" if phase == "boot" => matches!(
+                value.as_str(),
+                Some("not_acp" | "node_unsupported" | "version_guard" | "bundle_guard")
+            ),
+            "reason" if phase == "initialize" => matches!(
+                value.as_str(),
+                Some(
+                    "unsupported_runtime"
+                        | "unsupported_bundle"
+                        | "unsupported_exports"
+                        | "load_failed"
+                )
+            ),
+            "reason" => matches!(
+                value.as_str(),
+                Some(
+                    "ready"
+                        | "inactive_or_unowned"
+                        | "backend_missing"
+                        | "backend_unsupported"
+                        | "backend_not_available"
+                        | "authority_missing"
+                        | "unsupported_contract"
+                        | "rpc_timeout"
+                        | "rpc_unavailable"
+                        | "rpc_failed"
+                )
+            ),
+            _ => false,
+        };
+        if !valid {
+            return None;
+        }
+        safe.insert(key.clone(), value.clone());
+    }
+    Some(Value::Object(safe))
+}
+
+fn log_state_gate(state: &SessionState, reason: &'static str) {
+    tracing::info!(
+        connection_id = %state.connection_id,
+        conversation_id = ?state.conversation_id,
+        reason,
+        advertised = state.native_steer_acp_v1,
+        in_flight = state.turn_in_flight,
+        ready = state.native_steer_v1_available,
+        "[ACP][native_steer_v1] state notification"
+    );
+}
+
 pub fn apply_state(state: &mut SessionState, value: &Value) {
-    if !state.native_steer_acp_v1 || !state.turn_in_flight || value["version"] != 1 {
+    if !state.native_steer_acp_v1 {
+        log_state_gate(state, "protocol_unadvertised");
+        return;
+    }
+    if !state.turn_in_flight {
+        log_state_gate(state, "not_in_flight");
+        return;
+    }
+    if value["version"] != 1 {
+        log_state_gate(state, "version_invalid");
         return;
     }
     let (Some(session), Some(host), Some(native)) = (
@@ -73,11 +211,15 @@ pub fn apply_state(state: &mut SessionState, value: &Value) {
         identifier(&value["hostTurnId"]),
         identifier(&value["nativeTurnId"]),
     ) else {
+        log_state_gate(state, "identifier_invalid");
         return;
     };
-    if state.external_id.as_deref() != Some(session)
-        || state.native_steer_acp_host.as_deref() != Some(host)
-    {
+    if state.external_id.as_deref() != Some(session) {
+        log_state_gate(state, "session_mismatch");
+        return;
+    }
+    if state.native_steer_acp_host.as_deref() != Some(host) {
+        log_state_gate(state, "host_mismatch");
         return;
     }
     if value["ready"] == false {
@@ -90,6 +232,9 @@ pub fn apply_state(state: &mut SessionState, value: &Value) {
             state.native_steer_v1_available = false;
             state.native_steer_v1_turn_id = None;
             state.native_steer_acp_turn = None;
+            log_state_gate(state, "retired");
+        } else {
+            log_state_gate(state, "stale_retirement");
         }
     } else if value["ready"] == true {
         let identity =
@@ -103,6 +248,7 @@ pub fn apply_state(state: &mut SessionState, value: &Value) {
         });
         state.native_steer_v1_turn_id = Some(token);
         state.native_steer_v1_available = true;
+        log_state_gate(state, "ready_accepted");
     }
 }
 
