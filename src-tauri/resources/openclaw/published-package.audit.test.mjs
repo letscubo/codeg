@@ -5,12 +5,22 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
+import vm from 'node:vm'
 import { checkedFile, digest, packageRoot } from './compat.mjs'
 import { patchAcpSource } from './acp-bootstrap.mjs'
 
 const root = process.env.CODEG_OPENCLAW_AUDIT_PACKAGE
 assert.ok(root, 'Set CODEG_OPENCLAW_AUDIT_PACKAGE to the already-published 2026.9.4 package; do not install or start it')
 assert.equal(packageRoot(join(root, 'openclaw.mjs')), root)
+
+test('OpenClaw published startup planner selects the native steering RPC plugin', () => {
+  const source = readFileSync(join(root, 'dist/installed-plugin-index-scope-lookup-hT11eO5V.mjs'), 'utf8')
+  const fragment = source.match(/function shouldConsiderForGatewayStartup\(params\) \{[\s\S]*?\n\}/)?.[0]
+  assert.ok(fragment, 'the audited startup planner must still exist')
+  const consider = vm.runInNewContext(`(${fragment})`, { isGatewayStartupMemoryPlugin: () => false })
+  const manifest = JSON.parse(readFileSync(new URL('./openclaw.plugin.json', import.meta.url)))
+  assert.equal(consider({ manifest, plugin: { pluginId: manifest.id } }), true)
+})
 
 test('OpenClaw published bundle anchors and copied native consumer match audited source exactly', () => {
   const server = checkedFile(root, 'server')
