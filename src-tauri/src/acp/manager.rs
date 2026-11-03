@@ -394,6 +394,7 @@ fn prune_reaped(draining: &mut DrainingChildren) {
 }
 
 pub struct ConnectionManager {
+    pub(crate) native_steering: Arc<crate::acp::steering::NativeSteeringLedger>,
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Connections whose teardown was requested but whose child process has
     /// not been reaped yet.
@@ -501,6 +502,7 @@ impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            native_steering: Arc::new(Default::default()),
             external_restore_lock: Arc::new(tokio::sync::RwLock::new(())),
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -518,6 +520,7 @@ impl ConnectionManager {
     pub fn clone_ref(&self) -> Self {
         Self {
             connections: self.connections.clone(),
+            native_steering: self.native_steering.clone(),
             external_restore_lock: self.external_restore_lock.clone(),
             draining: self.draining.clone(),
             spawn_locks: self.spawn_locks.clone(),
@@ -568,6 +571,7 @@ impl ConnectionManager {
     fn with_spawn_handshake_timeout(timeout: Duration) -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            native_steering: Arc::new(Default::default()),
             external_restore_lock: Arc::new(tokio::sync::RwLock::new(())),
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),

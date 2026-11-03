@@ -511,6 +511,16 @@ pub struct SessionState {
     /// opt-in), rerouting subsequent notes to the MCP pull path.
     pub native_steering_available: bool,
 
+    /// NativeSteer v1 driver readiness, independent of legacy feedback MCP.
+    pub native_steer_v1_available: bool,
+    /// Driver-owned opaque token when one host turn spans several native
+    /// turns. A delayed steer must not cross those internal turn boundaries.
+    pub native_steer_v1_turn_id: Option<String>,
+    /// Independent handshake and exact host/native binding for owned ACP adapters.
+    pub native_steer_acp_v1: bool,
+    pub native_steer_acp_host: Option<String>,
+    pub native_steer_acp_turn: Option<super::native_acp::NativeAcpTurn>,
+
     /// Which generation of codex-acp's `request_user_input` bridge this
     /// connection is talking to — 1.12.0 swapped the question and the tab
     /// header between a form property's `title` and `description`, and nothing
@@ -746,6 +756,11 @@ impl SessionState {
             delegation_token: None,
             delegation_enabled: false,
             feedback_tool_available: false,
+            native_steer_v1_available: false,
+            native_steer_v1_turn_id: None,
+            native_steer_acp_v1: false,
+            native_steer_acp_host: None,
+            native_steer_acp_turn: None,
             native_steering_available: false,
             codex_user_input_shape: None,
             neutral_goal_channel: false,
@@ -1197,6 +1212,10 @@ impl SessionState {
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
                 // discard the state entirely, so no stale flag can outlive them.)
                 self.turn_in_flight = false;
+                self.native_steer_v1_available = false;
+                self.native_steer_v1_turn_id = None;
+                self.native_steer_acp_host = None;
+                self.native_steer_acp_turn = None;
                 // Same edge, the identity half: anyone holding "the turn I was
                 // admitted against" can now see that it is gone, even if a new
                 // turn sets `turn_in_flight` again before they look.

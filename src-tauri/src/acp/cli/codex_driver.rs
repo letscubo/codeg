@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use super::codex_stream::CodexStreamMapper;
@@ -39,8 +39,9 @@ use super::stream_json::{CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, 
 use crate::acp::connection::{
     map_prompt_blocks, record_prompt, record_transcript_header_continuing,
     record_transcript_update, record_turn_end, record_turn_error_raw, AgentConnection,
-    CompanionLaunchSpec, ConnectionCommand, DelegationInjection,
+    CompanionLaunchSpec, ConnectionCommand, DelegationInjection, SteerOutcome,
 };
+use crate::acp::error::AcpError;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessageBlock};
 use crate::models::agent::AgentType;
@@ -52,6 +53,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// After `turn/interrupt`, how long to wait for `turn/completed{interrupted}`
 /// before killing the process (A3: it answers at once).
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+const STEER_ACK_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound for the prompt text; the JSON-RPC line has no hard limit, but a
 /// runaway paste should fail with a code the caller can act on.
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
@@ -106,6 +108,7 @@ enum Phase {
     StartingTurn,
     Streaming,
     Interrupting,
+    Settling,
 }
 
 impl CodexDriver {
@@ -195,6 +198,7 @@ impl CodexDriver {
                 ),
             },
         };
+        self.state.write().await.native_steer_v1_available = false;
         self.child_pid.store(0, Ordering::SeqCst);
         let duration_ms = started.elapsed().as_millis() as u64;
         self.finish_turn(finish, &record, duration_ms, model).await;
@@ -327,10 +331,10 @@ impl CodexDriver {
 
     /// The JSON-RPC exchange for one turn.
     #[allow(clippy::too_many_arguments)]
-    async fn pump(
+    async fn pump<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         &self,
-        mut stdin: ChildStdin,
-        stdout: tokio::process::ChildStdout,
+        mut stdin: W,
+        stdout: R,
         input: Vec<Value>,
         model: Option<String>,
         mapper: &mut CodexStreamMapper,
@@ -342,6 +346,15 @@ impl CodexDriver {
         let mut phase = Phase::Initializing;
         let mut thread_id: Option<String> = None;
         let mut turn_id: Option<String> = None;
+        let mut pending_finish: Option<TurnFinish> = None;
+        let mut steer_sequence = 100_u64;
+        let mut pending_steers = HashMap::<
+            u64,
+            (
+                Vec<PromptInputBlock>,
+                tokio::sync::oneshot::Sender<Result<SteerOutcome, AcpError>>,
+            ),
+        >::new();
         // Handshake budget; once streaming, a silent model / long command is
         // legitimate and only a cancel ends the turn early.
         let mut deadline = Some(tokio::time::Instant::now() + HANDSHAKE_TIMEOUT);
@@ -361,7 +374,7 @@ impl CodexDriver {
                 line = lines.next_line() => {
                     let line = match line {
                         Ok(Some(line)) => line,
-                        Ok(None) => return TurnEnd::Eof,
+                        Ok(None) => return pending_finish.take().map_or(TurnEnd::Eof, TurnEnd::Finished),
                         Err(e) => {
                             tracing::warn!(connection_id = %self.connection_id, "[CLI][codex] stdout read failed: {e}");
                             return TurnEnd::Eof;
@@ -390,6 +403,25 @@ impl CodexDriver {
                             }
                         }
                         Message::Response(id) => {
+                            if let Some((blocks, reply)) = pending_steers.remove(&id) {
+                                let outcome = codex_steer_outcome(&msg, turn_id.as_deref());
+                                if matches!(outcome, Ok(SteerOutcome::Injected)) {
+                                    if let Some(sid) = record.session_id.as_ref() {
+                                        record_prompt(self.agent_type, sid, &map_prompt_blocks(blocks)).await;
+                                    }
+                                }
+                                if msg["error"]["code"].as_i64() == Some(-32601) {
+                                    self.state.write().await.native_steer_v1_available = false;
+                                }
+                                let _ = reply.send(outcome);
+                                if pending_steers.is_empty() {
+                                    if let Some(finish) = pending_finish.take() {
+                                        drop(stdin);
+                                        return TurnEnd::Finished(finish);
+                                    }
+                                }
+                                continue;
+                            }
                             if let Some(error) = msg.get("error") {
                                 if id == ID_INTERRUPT {
                                     // Already over; `turn/completed` or EOF follows.
@@ -431,6 +463,7 @@ impl CodexDriver {
                                         mapper.set_turn_id(id);
                                     }
                                     phase = Phase::Streaming;
+                                    self.state.write().await.native_steer_v1_available = turn_id.is_some();
                                     deadline = None;
                                 }
                                 _ => {}
@@ -446,8 +479,16 @@ impl CodexDriver {
                                 for event in events {
                                     self.emit_recorded(event, record).await;
                                 }
-                                drop(stdin);
-                                return TurnEnd::Finished(finish);
+                                self.state.write().await.native_steer_v1_available = false;
+                                if pending_steers.is_empty() {
+                                    drop(stdin);
+                                    return TurnEnd::Finished(finish);
+                                }
+                                // Consumption ACK may follow the terminal frame.
+                                // Keep reading it before closing the transcript.
+                                pending_finish = Some(finish);
+                                phase = Phase::Settling;
+                                deadline = Some(tokio::time::Instant::now() + STEER_ACK_GRACE);
                             }
                             LineOutcome::Unparsable => {}
                         },
@@ -457,6 +498,7 @@ impl CodexDriver {
                 _ = timeout => {
                     return match phase {
                         Phase::Interrupting => TurnEnd::Cancelled,
+                        Phase::Settling => TurnEnd::Finished(pending_finish.take().expect("settling has a terminal turn")),
                         _ => TurnEnd::Failed(CliTurnError {
                             code: "cli_handshake_timeout",
                             message: format!("Codex did not start the turn within {}s", HANDSHAKE_TIMEOUT.as_secs()),
@@ -464,7 +506,25 @@ impl CodexDriver {
                         }),
                     };
                 }
-                command = commands.recv(), if phase != Phase::Interrupting => match command {
+                command = commands.recv(), if phase != Phase::Interrupting && phase != Phase::Settling => match command {
+                    Some(ConnectionCommand::NativeSteer { expected_turn_id, blocks, reply, .. }) => {
+                        let valid = phase == Phase::Streaming && crate::acp::steering::matches_turn(&*self.state.read().await, &expected_turn_id);
+                        if !valid {
+                            let _ = reply.send(Err(AcpError::NoActiveTurn));
+                            continue;
+                        }
+                        let input = match build_input(&blocks, &self.working_dir) {
+                            Ok(input) => input,
+                            Err(_) => { let _ = reply.send(Ok(SteerOutcome::PromptRequired)); continue; }
+                        };
+                        let (Some(thread), Some(turn)) = (thread_id.as_deref(), turn_id.as_deref()) else {
+                            let _ = reply.send(Err(AcpError::NoActiveTurn)); continue;
+                        };
+                        steer_sequence += 1;
+                        let request = steer_request(steer_sequence, thread, turn, &input);
+                        if send(&mut stdin, &request).await.is_err() { continue; }
+                        pending_steers.insert(steer_sequence, (blocks, reply));
+                    }
                     Some(ConnectionCommand::Cancel) => {
                         // A running turn gets a real interrupt (the thread stays
                         // consistent for the next turn); before that, just stop.
@@ -501,9 +561,10 @@ impl CodexDriver {
                     .await;
                 record.prompt_recorded = true;
             }
-        } else if let (Some(sid), Some(update)) =
-            (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
-        {
+        } else if let (Some(sid), Some(update)) = (
+            &record.session_id,
+            transcript_update_for(&event, Some(&self.working_dir)),
+        ) {
             record_transcript_update(self.agent_type, sid, &update);
         }
         self.emit(event).await;
@@ -607,7 +668,7 @@ fn classify(msg: &Value) -> Message {
     }
 }
 
-async fn send(stdin: &mut ChildStdin, msg: &Value) -> std::io::Result<()> {
+async fn send<W: AsyncWrite + Unpin>(stdin: &mut W, msg: &Value) -> std::io::Result<()> {
     let mut line = msg.to_string();
     line.push('\n');
     stdin.write_all(line.as_bytes()).await?;
@@ -705,6 +766,29 @@ fn turn_request(thread_id: &str, input: &[Value], model: Option<&str>) -> Value 
     json!({ "id": ID_TURN, "method": "turn/start", "params": params })
 }
 
+fn steer_request(id: u64, thread_id: &str, turn_id: &str, input: &[Value]) -> Value {
+    json!({"id":id,"method":"turn/steer","params":{"threadId":thread_id,"expectedTurnId":turn_id,"input":input}})
+}
+
+fn codex_steer_outcome(
+    message: &Value,
+    expected_turn: Option<&str>,
+) -> Result<SteerOutcome, AcpError> {
+    if matches!(
+        message["error"]["code"].as_i64(),
+        Some(-32600 | -32601 | -32602)
+    ) {
+        return Ok(SteerOutcome::PromptRequired);
+    }
+    if message.get("error").is_none()
+        && expected_turn.is_some()
+        && message["result"]["turnId"].as_str() == expected_turn
+    {
+        return Ok(SteerOutcome::Injected);
+    }
+    Err(AcpError::protocol("native steer delivery unconfirmed"))
+}
+
 fn interrupt_request(thread_id: &str, turn_id: &str) -> Value {
     json!({
         "id": ID_INTERRUPT,
@@ -790,6 +874,31 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn myclaw_prompt_native_steer_codex_wire_is_turn_bound_and_confirmation_is_strict() {
+        let request = steer_request(
+            101,
+            "thread-a",
+            "turn-a",
+            &[json!({"type":"text","text":"focus"})],
+        );
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(request["params"]["expectedTurnId"], "turn-a");
+        assert!(request["params"].get("model").is_none());
+        assert!(matches!(
+            codex_steer_outcome(&json!({"result":{"turnId":"turn-a"}}), Some("turn-a")),
+            Ok(SteerOutcome::Injected)
+        ));
+        assert!(
+            codex_steer_outcome(&json!({"result":{"turnId":"turn-b"}}), Some("turn-a")).is_err()
+        );
+        assert!(codex_steer_outcome(&json!({"error":{"code":-32000}}), Some("turn-a")).is_err());
+        assert!(matches!(
+            codex_steer_outcome(&json!({"error":{"code":-32601}}), Some("turn-a")),
+            Ok(SteerOutcome::PromptRequired)
+        ));
+    }
+
+    #[test]
     fn new_session_starts_a_thread_and_a_known_one_resumes_it() {
         let start = thread_request(None, Path::new("/ws"), Some("gpt-5.4-mini"));
         assert_eq!(start["method"], "thread/start");
@@ -822,9 +931,7 @@ mod tests {
         };
         let args = app_server_args(Some(&spec));
         assert_eq!(args[0], "app-server");
-        assert!(
-            args.contains(&r#"mcp_servers.myclaw.command="/opt/codeg/codeg-mcp""#.to_string())
-        );
+        assert!(args.contains(&r#"mcp_servers.myclaw.command="/opt/codeg/codeg-mcp""#.to_string()));
         assert!(args.contains(&r#"mcp_servers.myclaw.args=["--parent","c1"]"#.to_string()));
         assert_eq!(app_server_args(None), vec!["app-server".to_string()]);
     }
@@ -890,3 +997,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "codex_steering_tests.rs"]
+mod steering_tests;

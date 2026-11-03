@@ -1,9 +1,35 @@
 import assert from 'node:assert/strict';
+import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import test from 'node:test';
-import {assertAllowedTests, runNoDbTests} from './test-no-db.mjs';
+import {assertAllowedTests, runNoDbTests, sourceFingerprint} from './test-no-db.mjs';
 
 const name = 'acp::myclaw_prompt::tests::myclaw_prompt_example';
 const manifest = {schemaVersion: 1, sourceSha256: 'reviewed-source', tests: [name]};
+
+test('bundled JavaScript, Python and plugin metadata changes invalidate review before cargo', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'codeg-steering-review-'));
+  try {
+    for (const dir of ['src', 'tests', 'vendor', 'resources/dsh', 'resources/hermes', 'resources/openclaw']) {
+      mkdirSync(join(repo, 'src-tauri', dir), {recursive: true});
+    }
+    for (const file of ['Cargo.lock', 'Cargo.toml', 'build.rs']) {
+      writeFileSync(join(repo, 'src-tauri', file), 'reviewed fixture');
+    }
+    for (const file of ['dsh/runner.mjs', 'hermes/steering.py', 'openclaw/openclaw.plugin.json']) {
+      const source = join(repo, 'src-tauri/resources', file);
+      writeFileSync(source, 'reviewed fixture');
+      const reviewed = {...manifest, sourceSha256: sourceFingerprint(repo)};
+      writeFileSync(source, 'changed fixture');
+      assert.throws(() => runNoDbTests({repo, mode: 'server', manifest: reviewed,
+        invoke: () => { throw new Error('must not invoke cargo'); },
+      }), /source\/dependencies changed/);
+    }
+  } finally {
+    rmSync(repo, {recursive: true});
+  }
+});
 
 test('unknown, missing and duplicate test names cannot enter the executable suite', () => {
   assertAllowedTests(`${name}: test\r\n1 test, 0 benchmarks\r\n`, [name]);

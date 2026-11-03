@@ -1,0 +1,61 @@
+{
+  "metadata": {
+    "name": "hermes-agent",
+    "version": "0.21.3",
+    "dist": {
+      "shasum": "fae082e1f76fff3b1959940d9e9cdc1033c89d5f",
+      "tarball": "https://registry.npmjs.org/hermes-agent/-/hermes-agent-0.21.3.tgz",
+      "fileCount": 17,
+      "integrity": "sha512-LvPt2/1z6hm4pTRJu34F6uAkBVSlSt94QeZp8fMBLFqASU9/wv7iMODSGMzF1WmrpNENXYGMnWN8s9hi/EUM5Q==",
+      "signatures": [
+        {
+          "sig": "MEQCIAzL6SJS0+iNGe28jYCSYr8kVvUHhM3JWKP6ky7KM10RAiBzrCDMMdJjdlNcKX7ud4ErPVOkZrSrDXCQo9x7H0Ks8g==",
+          "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+        },
+        {
+          "sig": "MEUCID9CahpLyzxpEtgadx812jPDpWAVw/cHll6LGj43hdx7AiEA/e4kyYv47nZ0Gdwo65elt+wKt2dQ6kfK4iVw+zMdOuk=",
+          "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+        }
+      ],
+      "attestations": {
+        "url": "https://registry.npmjs.org/-/npm/v1/attestations/hermes-agent@0.21.3",
+        "provenance": {
+          "predicateType": "https://slsa.dev/provenance/v1"
+        }
+      },
+      "unpackedSize": 103926
+    }
+  },
+  "notice": "Audited official hermes-agent@0.21.3 launcher only. No installer, dependencies or Hermes runtime included.",
+  "files": {
+    "package.json": "{\n  \"name\": \"hermes-agent\",\n  \"version\": \"0.21.3\",\n  \"description\": \"Unofficial npm bridge for Hermes Agent 0.21.3: The self-improving AI agent \\u2014 creates skills from experience, improves them during use, and runs anywhere\",\n  \"license\": \"MIT\",\n  \"keywords\": [\n    \"hermes-agent\",\n    \"ai-agent\",\n    \"npm-bridge\",\n    \"uv\",\n    \"python\",\n    \"cross-platform\"\n  ],\n  \"type\": \"commonjs\",\n  \"bin\": {\n    \"hermes\": \"bin/hermes.js\",\n    \"hermes-agent\": \"bin/hermes-agent.js\",\n    \"hermes-npm\": \"bin/hermes-npm.js\"\n  },\n  \"scripts\": {\n    \"build:alias\": \"node scripts/build-alias-package.js\",\n    \"postinstall\": \"node scripts/postinstall.js\",\n    \"smoke\": \"node scripts/runtime-smoke.js\",\n    \"test\": \"node --test \\\"test/*.test.js\\\"\"\n  },\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/wyrtensi/hermes-agent-npm.git\"\n  },\n  \"bugs\": {\n    \"url\": \"https://github.com/wyrtensi/hermes-agent-npm/issues\"\n  },\n  \"homepage\": \"https://github.com/wyrtensi/hermes-agent-npm#readme\",\n  \"engines\": {\n    \"node\": \">=20.0.0\"\n  },\n  \"files\": [\n    \"bin/\",\n    \"lib/\",\n    \"scripts/postinstall.js\",\n    \"DISCLAIMER.md\",\n    \"LICENSE\",\n    \"NOTICE\",\n    \"PRIVACY.md\",\n    \"README.md\",\n    \"SECURITY.md\"\n  ],\n  \"hermesAgent\": {\n    \"upstreamVersion\": \"0.21.3\",\n    \"upstreamRepository\": \"NousResearch/hermes-agent\",\n    \"upstreamGitTag\": \"v2026.9.14\",\n    \"upstreamCommit\": \"345cd2b057a452236de401d3534b8502a7465e8d\",\n    \"pythonVersion\": \"3.11\",\n    \"runtimeDirectory\": \"runtime/hermes-agent\"\n  }\n}\n",
+    "bin/hermes.js": "#!/usr/bin/env node\n\nconst { runHermes } = require(\"../lib/python-launcher\");\n\nrunHermes(\"hermes\", process.argv.slice(2));\n",
+    "lib/python-launcher.js": "const { spawn } = require(\"node:child_process\");\nconst fs = require(\"node:fs\");\nconst path = require(\"node:path\");\n\nconst packageJson = require(\"../package.json\");\n\nconst packageRoot = path.resolve(__dirname, \"..\");\n\nfunction getRuntimeSourceDirectory() {\n  const configured = packageJson.hermesAgent?.runtimeDirectory || \"runtime/hermes-agent\";\n  return path.join(packageRoot, ...configured.split(\"/\"));\n}\n\nfunction getVenvDirectory() {\n  return path.join(getRuntimeSourceDirectory(), \"venv\");\n}\n\nfunction normalizeBinName(binName) {\n  const baseName = path.basename(binName || \"hermes-agent\").toLowerCase();\n  return baseName.replace(/(\\.cmd|\\.exe)$/i, \"\");\n}\n\nfunction getConsoleExecutable(binName, platform = process.platform) {\n  const normalized = normalizeBinName(binName) === \"hermes\" ? \"hermes\" : \"hermes-agent\";\n  if (platform === \"win32\") {\n    return path.join(getVenvDirectory(), \"Scripts\", `${normalized}.exe`);\n  }\n  return path.join(getVenvDirectory(), \"bin\", normalized);\n}\n\nfunction buildConsoleInvocation(binName, userArgs, platform = process.platform) {\n  return {\n    command: getConsoleExecutable(binName, platform),\n    args: [...userArgs]\n  };\n}\n\nfunction getRuntimeEnvironment() {\n  const env = {\n    ...process.env,\n    VIRTUAL_ENV: getVenvDirectory(),\n    HERMES_NPM_BRIDGE: \"1\",\n    HERMES_NPM_PACKAGE_ROOT: packageRoot,\n    HERMES_NPM_PACKAGE_VERSION: packageJson.version,\n    HERMES_NPM_RELEASE_TAG: packageJson.hermesAgent?.upstreamGitTag || \"\"\n  };\n  delete env.PYTHONHOME;\n  delete env.PYTHONPATH;\n  return env;\n}\n\nfunction runHermes(binName, userArgs, stdio = \"inherit\") {\n  const invocation = buildConsoleInvocation(binName, userArgs);\n\n  if (!fs.existsSync(invocation.command)) {\n    console.error(\"Hermes Agent isolated runtime is not ready.\");\n    console.error(\"Run 'npm rebuild hermes-agent' or reinstall the npm package.\");\n    process.exitCode = 1;\n    return 1;\n  }\n\n  const child = spawn(invocation.command, invocation.args, {\n    env: getRuntimeEnvironment(),\n    stdio,\n    windowsHide: false\n  });\n\n  child.on(\"exit\", (code, signal) => {\n    if (signal) {\n      process.kill(process.pid, signal);\n      return;\n    }\n    process.exit(code ?? 1);\n  });\n\n  child.on(\"error\", (error) => {\n    console.error(error.message);\n    process.exit(1);\n  });\n\n  return 0;\n}\n\nmodule.exports = {\n  buildConsoleInvocation,\n  getConsoleExecutable,\n  getRuntimeEnvironment,\n  getRuntimeSourceDirectory,\n  getVenvDirectory,\n  normalizeBinName,\n  runHermes\n};\n",
+    "LICENSE": "MIT License\n\nCopyright (c) 2026 wyrtensi\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
+  },
+  "sha256": {
+    "package.json": "ad1c65cc1c6d56a52a1e6ad0b563b2e30fd240473b3c99f7730bc964532a9d9f",
+    "bin/hermes.js": "e0f9d55a7345c1a12a8871c6c622fc88799403a8b3c839e0d63c56c603b3e1e1",
+    "lib/python-launcher.js": "d2bd674fc9ddeb274be0ad56afacdd2385b0f5069ee1564937622cd50ae3c23a",
+    "LICENSE": "3e465c63b2f1de1a3ed83d1fb6366543c8a61be068697dafba279596fba17e44"
+  },
+  "registryKeys": {
+    "keys": [
+      {
+        "expires": "2025-01-29T00:00:00.000Z",
+        "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+        "keytype": "ecdsa-sha2-nistp256",
+        "scheme": "ecdsa-sha2-nistp256",
+        "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1Olb3zMAFFxXKHiIkQO5cJ3Yhl5i6UPp+IhuteBJbuHcA5UogKo0EWtlWwW6KSaKoTNEYL7JlCQiVnkhBktUgg=="
+      },
+      {
+        "expires": null,
+        "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
+        "keytype": "ecdsa-sha2-nistp256",
+        "scheme": "ecdsa-sha2-nistp256",
+        "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEY6Ya7W++7aUPzvMTrezH6Ycx3c+HOKYCcNGybJZSCJq/fd7Qa8uuAKtdIkUQtQiEKERhAmE5lMMJhP8OkDOa2g=="
+      }
+    ]
+  },
+  "registryKeysSource": "https://registry.npmjs.org/-/npm/v1/keys"
+}

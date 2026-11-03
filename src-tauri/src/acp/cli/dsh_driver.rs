@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use super::driver::{
@@ -40,10 +40,19 @@ use crate::acp::connection::{
     record_transcript_update, record_turn_end, record_turn_error_raw, AgentConnection,
     ConnectionCommand, DelegationInjection,
 };
+use crate::acp::error::AcpError;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessageBlock};
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
+
+#[path = "dsh_steering.rs"]
+mod native_steering;
+use native_steering::{Control, NativeBridge};
+
+#[cfg(all(test, unix))]
+#[path = "dsh_steering_tests.rs"]
+mod native_steering_tests;
 
 pub(crate) struct DshDriver {
     pub connection_id: String,
@@ -119,6 +128,7 @@ impl DshDriver {
         user_message: Option<(String, Vec<UserMessageBlock>)>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> bool {
+        self.set_native_turn(None).await;
         self.emit(AcpEvent::StatusChanged {
             status: ConnectionStatus::Prompting,
         })
@@ -187,6 +197,7 @@ impl DshDriver {
             },
         };
         self.child_pid.store(0, Ordering::SeqCst);
+        self.set_native_turn(None).await;
         let duration_ms = started.elapsed().as_millis() as u64;
         self.finish_turn(finish, &record, duration_ms, model).await;
         if !disconnect {
@@ -204,7 +215,13 @@ impl DshDriver {
             .args(args)
             .current_dir(&self.working_dir)
             .envs(&self.runtime_env)
-            .stdin(Stdio::null())
+            // The stock runner reads stdin as an ordinary initial prompt. Only
+            // our bundled plugin implements the versioned control protocol.
+            .stdin(if self.profile.runner_path.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -242,10 +259,12 @@ impl DshDriver {
             Some(self.working_dir.clone()),
             model,
         );
+        let stdin = child.stdin.take();
         let end = match child.stdout.take() {
-            Some(stdout) => self.pump(stdout, &mut mapper, record, commands).await,
+            Some(stdout) => self.pump(stdout, stdin, &mut mapper, record, commands).await,
             None => TurnEnd::Eof,
         };
+        self.set_native_turn(None).await;
 
         match end {
             TurnEnd::Finished(finish) => {
@@ -309,18 +328,40 @@ impl DshDriver {
     async fn pump(
         &self,
         stdout: tokio::process::ChildStdout,
+        mut stdin: Option<ChildStdin>,
         mapper: &mut DshStreamMapper,
         record: &mut TurnRecord,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> TurnEnd {
         let mut lines = BufReader::new(stdout).lines();
         let mut unparsable = 0usize;
+        let mut native = NativeBridge::default();
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
                         if line.trim().is_empty() {
                             continue;
+                        }
+                        if self.profile.runner_path.is_some() {
+                            if let Some(control) = native.control(&line, record.session_id.as_deref()) {
+                                match control {
+                                    Control::State(turn) => self.set_native_turn(turn.filter(|_| stdin.is_some())).await,
+                                    Control::Receipt(pending, outcome) => {
+                                        // Record B in Codeg history before acknowledging consumption.
+                                        // Native user/message append proves consumption; the native
+                                        // session's disk flush still happens at runner completion.
+                                        if matches!(outcome, Ok(crate::acp::connection::SteerOutcome::Injected)) {
+                                            if let Some(sid) = &record.session_id {
+                                                record_prompt(self.agent_type, sid, &map_prompt_blocks(pending.blocks)).await;
+                                            }
+                                        }
+                                        let _ = pending.reply.send(outcome);
+                                    }
+                                    Control::Ignore => {}
+                                }
+                                continue;
+                            }
                         }
                         match mapper.map_line(&line) {
                             LineOutcome::Events(events) => {
@@ -361,10 +402,45 @@ impl DshDriver {
                         connection_id = %self.connection_id,
                         "[CLI][dsh] in-turn Prompt DROPPED — the turn_in_flight gate should have rejected this"
                     ),
+                    Some(ConnectionCommand::NativeSteer { expected_turn_id, blocks, reply, .. }) => {
+                        let valid = {
+                            let state = self.state.read().await;
+                            state.native_steer_v1_available
+                                && crate::acp::steering::matches_turn(&state, &expected_turn_id)
+                        };
+                        if !valid || stdin.is_none() || record.session_id.is_none() {
+                            let _ = reply.send(Err(AcpError::NoActiveTurn));
+                            continue;
+                        }
+                        let line = native.request(record.session_id.as_deref().unwrap_or_default(), blocks, reply);
+                        if let (Some(line), Some(input)) = (line, stdin.as_mut()) {
+                            // A partial write is ambiguous. Dropping the pending sender on
+                            // pump exit preserves unknown custody rather than retrying.
+                            if input.write_all(line.as_bytes()).await.is_err()
+                                || input.flush().await.is_err()
+                            {
+                                self.set_native_turn(None).await;
+                                return TurnEnd::Eof;
+                            }
+                        }
+                    }
                     Some(other) => reject_unsupported(other),
                 },
             }
         }
+    }
+
+    async fn set_native_turn(&self, turn: Option<u64>) {
+        let mut state = self.state.write().await;
+        state.native_steer_v1_available = turn.is_some();
+        state.native_steer_v1_turn_id = turn.map(|turn| {
+            format!(
+                "{}:{}:{}:dsh:{turn}",
+                self.connection_id,
+                state.conversation_id.unwrap_or_default(),
+                state.turns_completed
+            )
+        });
     }
 
     /// Emit one mapped event, recording it to codeg's transcript. A

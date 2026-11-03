@@ -1,0 +1,7 @@
+{
+  "name": "@codeg/openclaw-native-steering",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "openclaw": { "extensions": ["./plugin.mjs"] }
+}

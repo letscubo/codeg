@@ -29,6 +29,9 @@ pub mod manager;
 // fork(letscubo)专属: 统一记忆 —— 每轮送达运行时前注入平台给的 <myclaw_memory> 块。
 pub mod myclaw_memory;
 pub mod myclaw_prompt;
+pub mod native_acp;
+mod owned_bootstrap;
+mod openclaw_bootstrap;
 pub mod opencode_catalog;
 pub mod opencode_plugins;
 pub mod plan_approval;
@@ -45,6 +48,7 @@ pub mod session_info;
 pub mod session_title;
 pub mod session_state;
 pub mod stderr_tail;
+pub mod steering;
 pub mod temp_reclaim;
 pub mod terminal_runtime;
 pub mod types;

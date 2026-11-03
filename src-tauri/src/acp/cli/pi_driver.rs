@@ -1,18 +1,11 @@
 //! fork(letscubo)专属: the per-turn pi CLI driver behind a
 //! `ConnectionTransport::Cli` connection for `AgentType::Pi`.
 //!
-//! Each `Prompt` spawns one `pi --print --mode json` process with the prompt as
-//! its positional argument; the process prints NDJSON session events and exits
-//! after `agent_settled`. Mapping lives in [`super::pi_stream`].
-//!
-//! ## Why not `--mode rpc`
-//!
-//! Pi also speaks a long-lived JSONL RPC with steering, queueing and `abort`.
-//! It is the richer transport, but it is a different lifecycle than every other
-//! CLI driver here (one process per turn), and the two modes emit the *same*
-//! session events — so the mapper is shared and moving to RPC later changes
-//! only this file. Per-turn first keeps the admission path, `manager.cancel`
-//! and the `turn_in_flight` gate working exactly as they do for claude and dsh.
+//! Each `Prompt` spawns one `pi --mode rpc` process and keeps stdin open
+//! through the owning turn. Native `steer` changes that process's current run;
+//! normal queued messages stay host-owned. Close stdin only after
+//! `agent_settled` and all steering receipts are reconciled. Session events
+//! still use the existing [`super::pi_stream`] mapper and transcript recorder.
 //!
 //! ## Why not the ACP shim
 //!
@@ -31,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
@@ -43,6 +38,7 @@ use super::driver::{
 };
 use super::dsh_driver::transcript_update_for;
 use super::dsh_prompt::flatten_prompt;
+use super::pi_rpc::{user_message_text, PiSteeringReceipts};
 use super::pi_stream::PiStreamMapper;
 use super::stream_json::{CliTurnError, LineOutcome, TurnFinish, STOP_CANCELLED, STOP_UNKNOWN};
 use crate::acp::connection::{
@@ -50,6 +46,7 @@ use crate::acp::connection::{
     record_transcript_update, record_turn_end, record_turn_error_raw, AgentConnection,
     ConnectionCommand, DelegationInjection,
 };
+use crate::acp::error::AcpError;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, PromptInputBlock, UserMessageBlock};
 use crate::models::agent::AgentType;
@@ -129,24 +126,15 @@ struct TurnRecord {
     prompt_recorded: bool,
 }
 
-/// `pi --print --mode json [options]`. The prompt is **not** an argument: it is
-/// written to stdin, like the claude driver does.
-///
-/// Not a positional argument because `pi [options] [messages...]` has no way to
-/// stop option parsing on the version we run — the `--` separator only exists
-/// from pi 1.x (`Error: Unknown option: --` on 0.84.2), so a prompt starting
-/// with `-` would be read as a flag. stdin also has no argv length limit.
+/// Keep exact session/provider/model selection while using official JSONL RPC.
+/// Prompts are protocol records on stdin, never positional arguments.
 pub(super) fn build_args(
     session_id: Option<&str>,
     provider: Option<&str>,
     model: Option<&str>,
     session_dir: Option<&Path>,
 ) -> Vec<String> {
-    let mut args = vec![
-        "--print".to_string(),
-        "--mode".to_string(),
-        "json".to_string(),
-    ];
+    let mut args = vec!["--mode".to_string(), "rpc".to_string()];
     if let Some(provider) = provider {
         args.push("--provider".to_string());
         args.push(provider.to_string());
@@ -185,6 +173,9 @@ impl PiDriver {
                 }
                 ConnectionCommand::Disconnect => break,
                 ConnectionCommand::Cancel => {}
+                ConnectionCommand::NativeSteer { reply, .. } => {
+                    let _ = reply.send(Err(AcpError::NoActiveTurn));
+                }
                 other => reject_unsupported(other),
             }
         }
@@ -248,6 +239,7 @@ impl PiDriver {
             record.prompt_recorded = true;
         }
         let started = Instant::now();
+        let use_rpc = self.rpc_supported().await;
 
         let (finish, disconnect) = match flatten_prompt(&blocks, &self.working_dir) {
             Err(error) => (
@@ -258,14 +250,20 @@ impl PiDriver {
                 false,
             ),
             Ok(prompt) => {
-                let args = build_args(
+                let mut args = build_args(
                     session_id.as_deref(),
                     self.provider.as_deref(),
                     model.as_deref(),
                     self.session_dir.as_deref(),
                 );
-                match self.spawn(&args, &prompt).await {
-                    Ok(child) => self.drive(child, &mut record, model.clone(), commands).await,
+                if !use_rpc {
+                    args.splice(0..2, ["--print".into(), "--mode".into(), "json".into()]);
+                }
+                match self.spawn(&args, &prompt, use_rpc).await {
+                    Ok(child) => {
+                        self.drive(child, &mut record, model.clone(), commands, use_rpc)
+                            .await
+                    }
                     Err(err) => (
                         TurnFinish {
                             stop_reason: STOP_UNKNOWN.to_string(),
@@ -280,6 +278,7 @@ impl PiDriver {
                 }
             }
         };
+        self.state.write().await.native_steer_v1_available = false;
         self.child_pid.store(0, Ordering::SeqCst);
         let duration_ms = started.elapsed().as_millis() as u64;
         self.finish_turn(finish, &record, duration_ms, model).await;
@@ -292,11 +291,9 @@ impl PiDriver {
         disconnect
     }
 
-    /// Spawn pi and hand it the prompt on stdin, then EOF — `--print` runs the
-    /// turn and exits. Writing before the stdout pump starts is safe: the
-    /// prompt is far below the pipe buffer, and pi does not emit anything until
-    /// it has read it.
-    async fn spawn(&self, args: &[String], prompt: &str) -> std::io::Result<Child> {
+    /// Spawn RPC; the pump reads stdout before writing the prompt so large
+    /// inputs cannot deadlock against Pi's stdout backpressure.
+    async fn spawn(&self, args: &[String], prompt: &str, use_rpc: bool) -> std::io::Result<Child> {
         let mut command = crate::process::tokio_command(&self.executable);
         command
             .args(args)
@@ -316,12 +313,33 @@ impl PiDriver {
         #[cfg(unix)]
         command.process_group(0);
         let mut child = crate::process::spawn_retrying_exec_busy(|| command.spawn()).await?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-            // Dropping closes it: pi reads until EOF.
+        if !use_rpc {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(prompt.as_bytes()).await?;
+                stdin.flush().await?;
+            }
         }
         Ok(child)
+    }
+
+    /// PATH installs may lag the registry pin. Require an actual stable binary
+    /// version whose RPC lifecycle was audited; otherwise preserve print mode.
+    async fn rpc_supported(&self) -> bool {
+        let mut probe = crate::process::tokio_command(&self.executable);
+        probe
+            .arg("--version")
+            .current_dir(&self.working_dir)
+            .envs(&self.runtime_env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        match tokio::time::timeout(Duration::from_secs(5), probe.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                supports_rpc_version(&String::from_utf8_lossy(&output.stdout))
+            }
+            _ => false,
+        }
     }
 
     async fn drive(
@@ -330,6 +348,7 @@ impl PiDriver {
         record: &mut TurnRecord,
         _model: Option<String>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
+        use_rpc: bool,
     ) -> (TurnFinish, bool) {
         let pid = child.id().unwrap_or(0);
         self.child_pid.store(pid, Ordering::SeqCst);
@@ -350,10 +369,19 @@ impl PiDriver {
 
         let mut mapper =
             PiStreamMapper::new(record.session_id.clone(), Some(self.working_dir.clone()));
-        let end = match child.stdout.take() {
-            Some(stdout) => self.pump(stdout, &mut mapper, record, commands).await,
-            None => TurnEnd::Eof,
+        let mut stdin = child.stdin.take();
+        let end = match (child.stdout.take(), stdin.as_mut(), use_rpc) {
+            (Some(stdout), Some(stdin), true) => {
+                self.pump(stdout, stdin, &mut mapper, record, commands)
+                    .await
+            }
+            (Some(stdout), _, false) => {
+                self.pump_print(stdout, &mut mapper, record, commands).await
+            }
+            _ => TurnEnd::Eof,
         };
+        self.state.write().await.native_steer_v1_available = false;
+        drop(stdin); // RPC orderly shutdown, still one subprocess per turn.
 
         match end {
             TurnEnd::Finished(finish) => {
@@ -413,6 +441,139 @@ impl PiDriver {
     }
 
     async fn pump(
+        &self,
+        stdout: tokio::process::ChildStdout,
+        stdin: &mut tokio::process::ChildStdin,
+        mapper: &mut PiStreamMapper,
+        record: &mut TurnRecord,
+        commands: &mut mpsc::Receiver<ConnectionCommand>,
+    ) -> TurnEnd {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut receipts = PiSteeringReceipts::default();
+        let mut unparsable = 0usize;
+        let mut started = false;
+        let mut initial_user_seen = false;
+        let mut initial_prompt: Option<String> = None;
+        let mut settled: Option<TurnFinish> = None;
+        let mut settle_deadline: Option<tokio::time::Instant> = None;
+        let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        if write_rpc(stdin, &json!({"id":"codeg-state", "type":"get_state"}))
+            .await
+            .is_err()
+        {
+            return TurnEnd::Eof;
+        }
+        loop {
+            if settled.is_some() {
+                if receipts.is_empty() {
+                    return TurnEnd::Finished(settled.take().unwrap());
+                }
+                if let Some(command) = receipts.clear_after_settle() {
+                    if write_rpc(stdin, &command).await.is_err() {
+                        receipts.unconfirmed();
+                        return TurnEnd::Finished(settled.take().unwrap());
+                    }
+                }
+            }
+            let deadline = settle_deadline;
+            tokio::select! {
+                // Drain available stdout before taking a steering command: a
+                // queued agent_settled must disable admission first.
+                biased;
+                line = lines.next_line() => match line {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() { continue; }
+                        let value = serde_json::from_str::<Value>(&line).ok();
+                        if let Some(value) = &value {
+                            if value["type"] == "response" && value["id"] == "codeg-state" {
+                                let Some(session_id) = value["data"]["sessionId"].as_str().filter(|id| !id.is_empty()) else {
+                                    return rpc_failure("Pi did not report an exact session identity");
+                                };
+                                if value["success"] != true || record.session_id.as_deref().is_some_and(|id| id != session_id) {
+                                    return rpc_failure("Pi refused the requested session identity");
+                                }
+                                let session = json!({"type":"session", "id":session_id}).to_string();
+                                if let LineOutcome::Events(events) = mapper.map_line(&session) {
+                                    for event in events { self.emit_recorded(event, record).await; }
+                                }
+                                let prompt = match flatten_prompt(&record.prompt_blocks, &self.working_dir) {
+                                    Ok(prompt) => prompt,
+                                    Err(_) => return rpc_failure("Pi prompt preparation failed"),
+                                };
+                                initial_prompt = Some(prompt.clone());
+                                if write_rpc(stdin, &json!({"id":"codeg-prompt", "type":"prompt", "message":prompt})).await.is_err() { return TurnEnd::Eof; }
+                                continue;
+                            }
+                            if value["type"] == "response" && value["id"] == "codeg-prompt" {
+                                if value["success"] != true { return rpc_failure(value["error"].as_str().unwrap_or("Pi rejected the prompt")); }
+                                if value["data"]["disposition"] == "handled" && !started {
+                                    return TurnEnd::Finished(TurnFinish { stop_reason: super::stream_json::STOP_END_TURN.into(), error: None });
+                                }
+                            }
+                            if value["type"] == "agent_start" { started = true; }
+                            if !initial_user_seen && initial_prompt.is_some()
+                                && user_message_text(value).as_deref() == initial_prompt.as_deref() {
+                                initial_user_seen = true;
+                            } else {
+                                for blocks in receipts.observe(value) {
+                                    if let Some(session_id) = &record.session_id {
+                                        record_prompt(self.agent_type, session_id, &map_prompt_blocks(blocks)).await;
+                                    }
+                                }
+                            }
+                            if receipts.observe_clear(value) && settled.is_some() {
+                                return TurnEnd::Finished(settled.take().unwrap());
+                            }
+                            self.state.write().await.native_steer_v1_available = started && initial_user_seen && settled.is_none();
+                        }
+                        match mapper.map_line(&line) {
+                            LineOutcome::Events(events) => {
+                                unparsable = 0;
+                                for event in events { self.emit_recorded(event, record).await; }
+                            }
+                            LineOutcome::Finished { events, finish } => {
+                                for event in events { self.emit_recorded(event, record).await; }
+                                self.state.write().await.native_steer_v1_available = false;
+                                settled = Some(finish);
+                                settle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                            }
+                            LineOutcome::Unparsable => {
+                                unparsable += 1;
+                                tracing::warn!(connection_id = %self.connection_id, "[CLI][pi] unparsable stdout: {}", truncate(&line, 200));
+                                if unparsable >= MAX_CONSECUTIVE_UNPARSABLE { return TurnEnd::Protocol(truncate(&line, PROTOCOL_SAMPLE_BYTES)); }
+                            }
+                        }
+                    }
+                    Ok(None) => return settled.map(TurnEnd::Finished).unwrap_or(TurnEnd::Eof),
+                    Err(_) => return TurnEnd::Eof,
+                },
+                _ = async move {
+                    match deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending::<()>().await }
+                } => { receipts.unconfirmed(); return TurnEnd::Finished(settled.take().unwrap()); },
+                _ = tokio::time::sleep_until(startup_deadline), if !started => {
+                    return rpc_failure("Pi RPC did not start the requested turn");
+                },
+                command = commands.recv() => match command {
+                    Some(ConnectionCommand::Cancel) => return TurnEnd::Cancelled,
+                    Some(ConnectionCommand::Disconnect) | None => return TurnEnd::Disconnected,
+                    Some(ConnectionCommand::NativeSteer { expected_turn_id, blocks, reply, .. }) => {
+                        let current = self.state.read().await;
+                        let allowed = started && initial_user_seen && settled.is_none()
+                            && crate::acp::steering::matches_turn(&current, &expected_turn_id);
+                        drop(current);
+                        if !allowed { let _ = reply.send(Err(AcpError::NoActiveTurn)); continue; }
+                        if let Some(command) = receipts.enqueue(blocks, reply) {
+                            if write_rpc(stdin, &command).await.is_err() { return TurnEnd::Eof; }
+                        }
+                    }
+                    Some(ConnectionCommand::Prompt { .. }) => tracing::warn!(connection_id = %self.connection_id, "[CLI][pi] rejected in-turn Prompt"),
+                    Some(other) => reject_unsupported(other),
+                },
+            }
+        }
+    }
+
+    async fn pump_print(
         &self,
         stdout: tokio::process::ChildStdout,
         mapper: &mut PiStreamMapper,
@@ -495,8 +656,10 @@ impl PiDriver {
                     .await;
                 record.prompt_recorded = true;
             }
-        } else if let (Some(sid), Some(update)) = (&record.session_id, transcript_update_for(&event, Some(&self.working_dir)))
-        {
+        } else if let (Some(sid), Some(update)) = (
+            &record.session_id,
+            transcript_update_for(&event, Some(&self.working_dir)),
+        ) {
             record_transcript_update(self.agent_type, sid, &update);
         }
         self.emit(event).await;
@@ -582,6 +745,35 @@ impl PiDriver {
     }
 }
 
+async fn write_rpc(stdin: &mut tokio::process::ChildStdin, value: &Value) -> std::io::Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await
+}
+
+fn supports_rpc_version(version: &str) -> bool {
+    let version = version.trim();
+    let parts: Option<Vec<u64>> = version
+        .strip_prefix('v')
+        .unwrap_or(version)
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect();
+    matches!(parts.as_deref(), Some([major, minor, patch]) if (*major, *minor, *patch) >= (1, 3, 0))
+}
+
+fn rpc_failure(message: &str) -> TurnEnd {
+    TurnEnd::Finished(TurnFinish {
+        stop_reason: STOP_UNKNOWN.into(),
+        error: Some(CliTurnError {
+            code: "cli_protocol",
+            message: message.into(),
+            details: None,
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,9 +784,8 @@ mod tests {
         assert_eq!(
             args,
             [
-                "--print",
                 "--mode",
-                "json",
+                "rpc",
                 "--provider",
                 "myclaw",
                 "--model",
@@ -610,9 +801,8 @@ mod tests {
         assert_eq!(
             args,
             [
-                "--print",
                 "--mode",
-                "json",
+                "rpc",
                 "--session-dir",
                 "/home/ubuntu/.myclaw/agents/a/pi-home/sessions",
                 "--session-id",
@@ -630,8 +820,25 @@ mod tests {
             build_args(Some("s"), Some("p"), Some("m"), Some(Path::new("/d"))),
         ] {
             assert!(!args.iter().any(|a| a == "--"), "{args:?}");
-            assert_eq!(args[0], "--print");
-            assert!(args.iter().all(|a| a.starts_with('-') || !a.contains(' ')), "{args:?}");
+            assert_eq!(args[0], "--mode");
+            assert_eq!(args[1], "rpc");
+            assert!(
+                args.iter().all(|a| a.starts_with('-') || !a.contains(' ')),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn myclaw_prompt_pi_rpc_version_is_fail_closed() {
+        assert!(supports_rpc_version("1.3.0\n"));
+        assert!(supports_rpc_version("v1.4.0"));
+        for version in ["0.84.2", "1.2.9", "", "1.3.0-alpha.1", "unknown", "vv1.3.0"] {
+            assert!(!supports_rpc_version(version), "{version}");
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "pi_driver_rpc_tests.rs"]
+mod rpc_tests;

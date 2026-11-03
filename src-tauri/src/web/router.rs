@@ -94,6 +94,9 @@ pub fn build_router(
             "/set_feedback_settings",
             post(handlers::feedback::set_feedback_settings),
         )
+        .route("/native_steering_state", post(handlers::steering::native_steering_state))
+        .route("/native_steer", post(handlers::steering::native_steer))
+        .route("/native_steer_result", post(handlers::steering::native_steer_result))
         .route(
             "/submit_session_feedback",
             post(handlers::feedback::submit_session_feedback),
@@ -1981,7 +1984,7 @@ async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         // Inbox protocol only. This does not claim that WhatsApp delivery is enabled.
-        "capabilities": ["whatsapp_relay_proxy_v2", "whatsapp_relay_endpoint_v1", "whatsapp_relay_presentation_v1", "internal_prompt_inline_v1"],
+        "capabilities": ["whatsapp_relay_proxy_v2", "whatsapp_relay_endpoint_v1", "whatsapp_relay_presentation_v1", "internal_prompt_inline_v1", "native_steering_v1"],
     }))
 }
 

@@ -3,8 +3,9 @@
 //!
 //! It consumes the connection's `cmd_tx` where an ACP adapter loop would, so the
 //! manager's admission path and `manager.cancel` work unchanged. Each `Prompt`
-//! spawns one `claude -p` process that reads a single stream-json user message
-//! from stdin, then EOF, and exits after its `result` line.
+//! spawns one `claude -p` process. Verified versions retain stream-json stdin
+//! for context-only native steering until the owning task completes; older or
+//! unadvertised versions keep the original one-message-and-EOF behavior.
 //!
 //! Invariant: every turn ends with exactly one `TurnComplete`. It is the only
 //! event that clears `turn_in_flight`; a missed one would wedge the connection
@@ -21,6 +22,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+#[path = "claude_steering.rs"]
+mod native_steering;
 
 use super::stream_json::{
     CliTurnError, LineOutcome, StreamMapper, TurnFinish, STOP_CANCELLED, STOP_UNKNOWN,
@@ -215,7 +219,11 @@ impl CliDriver {
             .await;
             return false;
         }
+        let native_steering = self.supports_native_steering().await;
         let mut args = build_args(&session_id, resume, model.as_deref());
+        if native_steering {
+            args.push("--replay-user-messages".into());
+        }
         if let Some(Some(level)) = &reasoning_effort {
             args.push("--effort".into());
             args.push(level.clone());
@@ -227,8 +235,14 @@ impl CliDriver {
 
         let (finish, disconnect) = match self.spawn(&args, model.as_deref()).await {
             Ok(child) => {
-                self.drive(child, build_stdin_line(&blocks), &session_id, commands)
-                    .await
+                self.drive(
+                    child,
+                    build_stdin_line(&blocks),
+                    &session_id,
+                    commands,
+                    native_steering,
+                )
+                .await
             }
             Err(err) => (
                 TurnFinish {
@@ -242,6 +256,7 @@ impl CliDriver {
                 false,
             ),
         };
+        self.set_native_ready(false, "").await;
         self.child_pid.store(0, Ordering::SeqCst);
         let duration_ms = started.elapsed().as_millis() as u64;
         self.finish_turn(finish, &session_id, duration_ms, model)
@@ -285,18 +300,36 @@ impl CliDriver {
         stdin_line: String,
         session_id: &str,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
+        native_steering: bool,
     ) -> (TurnFinish, bool) {
         let pid = child.id().unwrap_or(0);
         self.child_pid.store(pid, Ordering::SeqCst);
         tracing::info!(connection_id = %self.connection_id, pid, "[CLI] turn started");
 
+        let mut native_stdin = None;
+        let initial_uuid = uuid::Uuid::new_v4().to_string();
         if let Some(mut stdin) = child.stdin.take() {
-            tokio::spawn(async move {
-                if let Err(e) = stdin.write_all(stdin_line.as_bytes()).await {
-                    tracing::warn!("[CLI] failed to write the prompt to stdin: {e}");
+            if native_steering {
+                let mut input: Value =
+                    serde_json::from_str(&stdin_line).expect("stdin line is generated JSON");
+                input["uuid"] = json!(initial_uuid);
+                input["origin"] = json!({"kind":"human"});
+                if stdin
+                    .write_all(format!("{input}\n").as_bytes())
+                    .await
+                    .is_ok()
+                {
+                    native_stdin = Some(stdin);
                 }
-                // Dropping stdin sends EOF: the CLI exits after this turn.
-            });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(e) = stdin.write_all(stdin_line.as_bytes()).await {
+                        tracing::warn!("[CLI] failed to write the prompt to stdin: {e}");
+                    }
+                    // Preserve EOF and the original one-input behavior for an
+                    // unverified/old CLI; it never advertises native steering.
+                });
+            }
         }
 
         let stderr_tail = Arc::new(std::sync::Mutex::new(OutputTail::default()));
@@ -313,7 +346,13 @@ impl CliDriver {
         });
 
         let end = match child.stdout.take() {
-            Some(stdout) => self.pump(stdout, session_id, commands).await,
+            Some(stdout) => match native_stdin {
+                Some(stdin) => {
+                    self.pump_native(stdout, stdin, session_id, &initial_uuid, commands)
+                        .await
+                }
+                None => self.pump(stdout, session_id, commands).await,
+            },
             None => TurnEnd::Eof,
         };
 
@@ -623,6 +662,11 @@ pub(super) fn reject_unsupported(command: ConnectionCommand) {
         }
         ConnectionCommand::Steer { reply, .. } => {
             let _ = reply.send(Err(unsupported()));
+        }
+        ConnectionCommand::NativeSteer { reply, .. } => {
+            // Outside a verified active native pump nothing was written, so
+            // the host safely retains this message in its ordinary queue.
+            let _ = reply.send(Err(AcpError::NoActiveTurn));
         }
         ConnectionCommand::StopAsyncTask { reply, .. } => {
             let _ = reply.send(Ok(false));

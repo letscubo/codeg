@@ -24,6 +24,7 @@ pub mod dsh_tool_info;
 pub mod effort;
 pub mod pi_binary;
 pub mod pi_driver;
+mod pi_rpc;
 pub mod pi_stream;
 pub mod stream_json;
 pub mod tool_info;
