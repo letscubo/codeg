@@ -25,6 +25,7 @@ pub struct NativeAcpTurn {
     pub session_id: String,
     pub host_turn_id: String,
     pub native_turn_id: String,
+    pub initial_backend: bool,
 }
 
 pub fn advertised(agent: AgentType, meta: Option<&Map<String, Value>>) -> bool {
@@ -39,8 +40,27 @@ pub fn advertised(agent: AgentType, meta: Option<&Map<String, Value>>) -> bool {
         && capability["receipts"] == "consumed"
 }
 
-/// Called once for an admitted ordinary prompt, before it reaches the peer.
-/// The host id remains stable even after readiness supplies a native token.
+pub fn preparation_wait_advertised(agent: AgentType, meta: Option<&Map<String, Value>>) -> bool {
+    agent == AgentType::OpenClaw
+        && advertised(agent, meta)
+        && meta
+            .and_then(|meta| meta.get(CAPABILITY))
+            .is_some_and(|cap| cap["preparationWait"] == 1)
+}
+
+pub fn token_for_turn(state: &SessionState, turn: &NativeAcpTurn) -> String {
+    let identity = serde_json::to_vec(&(
+        &state.connection_id,
+        state.conversation_id,
+        &turn.host_turn_id,
+        &turn.native_turn_id,
+    ))
+    .expect("string turn identity is serializable");
+    format!("acp:{:x}", Sha256::digest(identity))
+}
+
+/// Called at admission and again before the ordinary prompt reaches the peer.
+/// Reusing this host must not reset a first-backend proof or native readiness.
 pub fn begin_prompt(state: &mut SessionState) -> Option<Value> {
     if !state.native_steer_acp_v1 || !state.turn_in_flight {
         return None;
@@ -51,11 +71,27 @@ pub fn begin_prompt(state: &mut SessionState) -> Option<Value> {
         state.conversation_id.unwrap_or_default(),
         state.turns_completed
     );
-    state.native_steer_acp_host = Some(host.clone());
-    state.native_steer_acp_turn = None;
-    state.native_steer_v1_available = false;
-    state.native_steer_v1_turn_id = None;
+    if state.native_steer_acp_host.as_deref() != Some(host.as_str()) {
+        state.native_steer_acp_host = Some(host.clone());
+        state.native_steer_acp_turn = None;
+        state.native_steer_acp_first_turn = None;
+        state.native_steer_v1_available = false;
+        state.native_steer_v1_turn_id = None;
+    }
     Some(json!({"version":1,"hostTurnId":host}))
+}
+
+/// Stop intent is not a synthetic terminal event. It fences preparation and
+/// queued steering while the original ACP prompt drains its real terminal.
+pub fn cancel_prompt(state: &mut SessionState) {
+    if state.agent_type == AgentType::OpenClaw && state.turn_in_flight {
+        state.native_steer_acp_cancelled_turn = Some(state.turns_completed);
+    }
+}
+
+pub fn cancel_requested(state: &SessionState) -> bool {
+    state.agent_type == AgentType::OpenClaw
+        && state.native_steer_acp_cancelled_turn == Some(state.turns_completed)
 }
 
 fn identifier(value: &Value) -> Option<&str> {
@@ -237,15 +273,20 @@ pub fn apply_state(state: &mut SessionState, value: &Value) {
             log_state_gate(state, "stale_retirement");
         }
     } else if value["ready"] == true {
-        let identity =
-            serde_json::to_vec(&(&state.connection_id, state.conversation_id, host, native))
-                .expect("string turn identity is serializable");
-        let token = format!("acp:{:x}", Sha256::digest(identity));
-        state.native_steer_acp_turn = Some(NativeAcpTurn {
+        let turn = NativeAcpTurn {
             session_id: session.into(),
             host_turn_id: host.into(),
             native_turn_id: native.into(),
-        });
+            initial_backend: state.native_steer_acp_preparation_wait
+                && value["initialBackend"] == true,
+        };
+        let token = token_for_turn(state, &turn);
+        if state.agent_type == AgentType::OpenClaw {
+            state
+                .native_steer_acp_first_turn
+                .get_or_insert_with(|| turn.clone());
+        }
+        state.native_steer_acp_turn = Some(turn);
         state.native_steer_v1_turn_id = Some(token);
         state.native_steer_v1_available = true;
         log_state_gate(state, "ready_accepted");
@@ -264,6 +305,7 @@ pub fn build_request(
     };
     if !state.native_steer_acp_v1
         || !state.native_steer_v1_available
+        || cancel_requested(state)
         || !super::steering::matches_turn(state, expected_turn_id)
         || turn.session_id != session_id
         || state.native_steer_acp_host.as_deref() != Some(turn.host_turn_id.as_str())

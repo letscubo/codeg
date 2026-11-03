@@ -65,13 +65,20 @@ export function createGatewayController(loadInternals, { limit = 8192, deliveryT
     return { entry, operation, backend, fingerprint, nativeTurnId, current }
   }
   async function capability() {
-    try { await load(); return CAPABILITY } catch (error) { return { version: 0, reason: loadFailureReason(error) } }
+    try {
+      const deps = await load()
+      return typeof deps.firstBackend === 'function' ? { ...CAPABILITY, preparationWait: 1 } : CAPABILITY
+    } catch (error) { return { version: 0, reason: loadFailureReason(error) } }
   }
   async function state(p, client, context) {
     try {
       const diagnostic = { reason: 'inactive_or_unowned' }
-      const owner = capture(p, client, context, await load(), diagnostic)
-      return { version: 1, ready: Boolean(owner), ...(owner ? { nativeTurnId: owner.nativeTurnId } : { reason: diagnostic.reason }) }
+      const deps = await load()
+      const owner = capture(p, client, context, deps, diagnostic)
+      return { version: 1, ready: Boolean(owner), ...(owner ? {
+        nativeTurnId: owner.nativeTurnId,
+        ...(typeof deps.firstBackend === 'function' ? { initialBackend: deps.firstBackend(owner.operation) === owner.backend } : {}),
+      } : { reason: diagnostic.reason }) }
     } catch { return { version: 1, ready: false, reason: 'inactive_or_unowned' } }
   }
   async function submit(p, client, context) {

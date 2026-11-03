@@ -38,11 +38,11 @@ codeg 自带的工作台。因此：
 
 - 测试不得创建或初始化数据库，包括内存 SQLite、临时 SQLite 文件、测试数据库及任何迁移、种子写入。
 - 现有依赖真实数据库的用例仅保留编译检查（`cargo test --no-run`），不得直接执行全量 `cargo test`。这不代表数据库集成测试已通过。
-- Rust 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前功能分支为 78 项已审查测试。它们只使用请求反序列化、内存状态／ACP 通道、Noop emitter、纯参数／patch 构造、本地假 CLI 与私有临时 JSON／转录／资源文件，不创建 SQLite，也不运行真实 SDK probe、Agent 或模型。
+- Rust 实际执行统一通过 `scripts/test-no-db.mjs`：只运行 `scripts/no-db-tests.json` 中已审查的无数据库测试，当前清单为 93 项已审查测试。它们只使用请求反序列化、内存状态／ACP 通道、Noop emitter、纯参数／patch 构造、本地假 CLI 与私有临时 JSON／转录／资源文件，不创建 SQLite，也不运行真实 SDK probe、Agent 或模型。
 - `src-tauri/resources/codeg-effort.test.mjs` 的 8 项 Node 用例也已经逐项审查：只调用纯 wire 校验、mock metadata/selection、只读 settings backend、每模型默认 getter 和 sampling 对象合并，不调用 runner apply、原生 SDK、Agent、Session 或 CLI。可用 `CODEG_PI_EFFORT_PROBE=0 node --test src-tauri/resources/codeg-effort.test.mjs` 执行。生产 MJS 资源与 Rust 源码一起纳入清单指纹。
 - 新增或修改测试应使用 mock/fake 等无数据库方式。Rust 源码或依赖变化后，必须重新核对允许执行用例的调用链并更新清单指纹；不能只为通过 CI 自动刷新指纹或扩大匹配条件。
 - 按用户要求不修改 `.github/workflows/test.yml`。该工作流仍含建库测试，不得触发；本次发布提交使用 `[skip ci]` 跳过 push/pull_request 自动测试，通过 `gh workflow run release.yml --ref <版本标签>` 手动触发 Release。
-- Release 在打包发布前执行保护脚本测试和已审查的 78 项无数据库测试（`node scripts/test-no-db.mjs server --release`）；不会执行全量数据库测试。不得把这一结果描述为全量测试通过。
+- Release 在打包发布前执行保护脚本测试和已审查的 93 项无数据库测试（`node scripts/test-no-db.mjs server --release`）；不会执行全量数据库测试。不得把这一结果描述为全量测试通过。
 
 ### Rust（在 `src-tauri/` 目录下执行）
 

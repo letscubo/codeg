@@ -52,6 +52,7 @@ export function installAcpBridge(agent, connection, gateway, { sleep = delay } =
   if (!stream?.sessionStore?.setActiveRun || !stream.pendingPrompts || !gateway?.request) return false
   const turns = new Map()
   let supported = false
+  let preparationWait = false
   let diagnosticTurn = 0
   const initialize = agent.initialize.bind(agent)
   agent.initialize = async params => {
@@ -61,9 +62,12 @@ export function installAcpBridge(agent, connection, gateway, { sleep = delay } =
     try {
       cap = await gateway.request(RPC.capability, { version: 1 }, { timeoutMs: 2000 })
       supported = cap?.version === 1 && cap.activeOnly === true && cap.receipts === 'consumed'
+      preparationWait = supported && cap.preparationWait === 1
     } catch (error) { supported = false; failed = true; failure = error }
     diagnostic({ phase: 'initialize', ...probeDiagnostic(supported, cap, failed, failure), elapsedMs: elapsed(started) })
-    return supported ? { ...result, _meta: { ...result._meta, [META]: CAPABILITY } } : result
+    return supported ? { ...result, _meta: { ...result._meta, [META]: {
+      ...CAPABILITY, ...(preparationWait ? { preparationWait: 1 } : {}),
+    } } } : result
   }
   const noteReadiness = (turn, reason, error) => {
     try {
@@ -84,12 +88,14 @@ export function installAcpBridge(agent, connection, gateway, { sleep = delay } =
       diagnostic({ phase: 'readiness', turn: turn.diagnosticTurn, ready: reason === 'ready', ...fields, elapsedMs: elapsed(turn.diagnosticStarted) })
     } catch {}
   }
-  const notify = (turn, ready, nativeTurnId = turn.nativeTurnId ?? '') => {
+  const notify = (turn, ready, nativeTurnId = turn.nativeTurnId ?? '', initialBackend = false) => {
     // Retire the last published identity before clearing it. Never send an
     // empty/undefined native id: Rust cannot attribute that to a live turn.
     if (!ready && !turn.nativeTurnId) return
     if (ready && (typeof nativeTurnId !== 'string' || !nativeTurnId)) return
-    const state = { version: 1, sessionId: turn.sessionId, hostTurnId: turn.hostTurnId, nativeTurnId, ready }
+    const state = { version: 1, sessionId: turn.sessionId, hostTurnId: turn.hostTurnId, nativeTurnId, ready,
+      ...(preparationWait ? { initialBackend: ready && initialBackend === true } : {}),
+    }
     const key = JSON.stringify(state)
     if (turn.lastState === key) return
     turn.lastState = key
@@ -106,7 +112,7 @@ export function installAcpBridge(agent, connection, gateway, { sleep = delay } =
         if (!active(turn)) break
         const ready = state?.version === 1 && state.ready === true && typeof state.nativeTurnId === 'string' && state.nativeTurnId.length > 0
         noteReadiness(turn, readinessReason(ready, state))
-        notify(turn, ready, state?.nativeTurnId)
+        notify(turn, ready, state?.nativeTurnId, state?.initialBackend)
       } catch (error) {
         if (!active(turn)) break
         noteReadiness(turn, 'rpc_' + requestFailure(error), error)

@@ -4,6 +4,7 @@ import { readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, parse } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { installBackendLifecycleObserver } from './backend-lifecycle.mjs'
 
 export const VERSION = '2026.9.4'
 export const FILES = {
@@ -117,5 +118,6 @@ export async function loadGatewayInternals(root = packageRoot(), reportCleanupFa
     throw new Error('unsupported_openclaw_exports')
   }
   installMcpCloseObserver({ Client: client.Client, Protocol: protocol.Protocol, StdioTransport: lifecycle.a }, reportCleanupFailure)
-  return { registry: module.h, operations: module.V, backend: module.A }
+  const firstBackend = installBackendLifecycleObserver(module.V, module.A)
+  return { registry: module.h, operations: module.V, backend: module.A, firstBackend }
 }

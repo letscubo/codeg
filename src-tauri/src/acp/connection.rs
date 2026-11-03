@@ -6239,10 +6239,15 @@ async fn run_connection(
                 // agents could ship it someday).
                 s.native_steering_available = native_steering_available;
                 s.native_steer_acp_v1 = super::native_acp::advertised(agent_type, init_resp.meta.as_ref());
+                s.native_steer_acp_preparation_wait = super::native_acp::preparation_wait_advertised(
+                    agent_type,
+                    init_resp.meta.as_ref(),
+                );
                 tracing::info!(
                     connection_id = %conn_id,
                     conversation_id = ?s.conversation_id,
                     native_acp_v1_advertised = s.native_steer_acp_v1,
+                    preparation_wait = s.native_steer_acp_preparation_wait,
                     "[ACP][native_steer_v1] owned protocol initialized"
                 );
                 s.codex_user_input_shape = codex_user_input_shape;
@@ -10787,6 +10792,7 @@ async fn run_conversation_loop<'a>(
                                     );
                                 }
                                 Some(ConnectionCommand::Cancel) => {
+                                    super::native_acp::cancel_prompt(&mut *state.write().await);
                                     // Send CancelNotification to agent to stop the current turn
                                     let _ = cx.send_notification_to(
                                         Agent,

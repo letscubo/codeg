@@ -25,6 +25,66 @@ fn ready(host: &str, native: &str) -> Value {
 }
 
 #[test]
+fn myclaw_prompt_native_acp_begin_preserves_the_same_host_first_backend() {
+    let (mut state, host) = fixture();
+    state.agent_type = AgentType::OpenClaw;
+    state.native_steer_acp_preparation_wait = true;
+    let meta = begin_prompt(&mut state).unwrap();
+    assert_eq!(meta["hostTurnId"], host);
+    let mut first = ready(&host, "native-1");
+    first["initialBackend"] = json!(true);
+    apply_state(&mut state, &first);
+    let first_token = state.native_steer_v1_turn_id.clone();
+    assert_eq!(begin_prompt(&mut state), Some(meta.clone()));
+    assert_eq!(state.native_steer_v1_turn_id, first_token);
+    assert!(state.native_steer_v1_available);
+    assert!(
+        state
+            .native_steer_acp_first_turn
+            .as_ref()
+            .unwrap()
+            .initial_backend
+    );
+    first["ready"] = json!(false);
+    apply_state(&mut state, &first);
+    assert_eq!(begin_prompt(&mut state), Some(meta.clone()));
+    assert!(!state.native_steer_v1_available);
+    assert_eq!(
+        state
+            .native_steer_acp_first_turn
+            .as_ref()
+            .unwrap()
+            .native_turn_id,
+        "native-1"
+    );
+    apply_state(&mut state, &ready(&host, "native-2"));
+    let second_token = state.native_steer_v1_turn_id.clone();
+    assert_eq!(begin_prompt(&mut state), Some(meta));
+    assert_eq!(state.native_steer_v1_turn_id, second_token);
+    assert_eq!(
+        state.native_steer_acp_turn.as_ref().unwrap().native_turn_id,
+        "native-2"
+    );
+    assert_eq!(
+        state
+            .native_steer_acp_first_turn
+            .as_ref()
+            .unwrap()
+            .native_turn_id,
+        "native-1"
+    );
+    state.turns_completed += 1;
+    let successor = begin_prompt(&mut state).unwrap();
+    assert_ne!(successor["hostTurnId"], host);
+    assert!(state.native_steer_acp_first_turn.is_none());
+    assert!(state.native_steer_acp_turn.is_none());
+    assert!(state.native_steer_v1_turn_id.is_none());
+    assert!(!state.native_steer_v1_available);
+    apply_state(&mut state, &ready(&host, "native-1"));
+    assert!(state.native_steer_acp_first_turn.is_none());
+}
+
+#[test]
 fn myclaw_prompt_native_acp_capability_is_distinct_from_legacy_feedback() {
     let legacy = json!({"steering":{"supported":true}})
         .as_object()

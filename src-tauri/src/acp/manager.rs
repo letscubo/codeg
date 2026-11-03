@@ -1187,15 +1187,29 @@ impl ConnectionManager {
                 );
                 return Err(AcpError::TurnInProgress);
             }
-            if let Some(model) = cli_options.as_ref().and_then(|options| options.model.as_ref()) {
+            if let Some(model) = cli_options
+                .as_ref()
+                .and_then(|options| options.model.as_ref())
+            {
                 s.cli_model = Some(model.clone());
             }
-            if let Some(provider) = cli_options.as_ref().and_then(|options| options.provider.as_ref()) {
+            if let Some(provider) = cli_options
+                .as_ref()
+                .and_then(|options| options.provider.as_ref())
+            {
                 if let Some(context) = s.cli_effort_context.as_mut() {
                     context.provider = Some(provider.clone());
                 }
             }
+            s.native_steer_client_message_id = user_message
+                .as_ref()
+                .and_then(|(id, _)| uuid::Uuid::parse_str(id).ok().map(|_| id.clone()));
             s.turn_in_flight = true;
+            if s.agent_type == AgentType::OpenClaw {
+                // Establish the host atomically with admission. The ACP loop
+                // reuses this identity when it later puts A on the wire.
+                let _ = super::native_acp::begin_prompt(&mut s);
+            }
         }
         permit.send(ConnectionCommand::Prompt {
             blocks,
@@ -2065,7 +2079,18 @@ impl ConnectionManager {
             .map_err(|_| AcpError::protocol("Async task stop reply channel closed".to_string()))?
     }
 
-    pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
+    /// Queue the native cancellation independently of the conversation status
+    /// write. Tests exercise this admission boundary without constructing a DB.
+    pub(crate) async fn enqueue_cancel(
+        &self,
+        conn_id: &str,
+    ) -> Result<
+        (
+            Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+            EventEmitter,
+        ),
+        AcpError,
+    > {
         let (cmd_tx, state_arc, emitter) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -2077,10 +2102,16 @@ impl ConnectionManager {
                 conn.emitter.clone(),
             )
         };
+        super::native_acp::cancel_prompt(&mut *state_arc.write().await);
         cmd_tx
             .send(ConnectionCommand::Cancel)
             .await
             .map_err(|_| AcpError::ProcessExited)?;
+        Ok((state_arc, emitter))
+    }
+
+    pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
+        let (state_arc, emitter) = self.enqueue_cancel(conn_id).await?;
 
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
         // "running" state immediately. The agent typically replies with
@@ -3616,9 +3647,14 @@ impl ConnectionManager {
     /// (见 `web::handlers::myclaw::mcp` 的 `agent_session`)。只认 `Prompting`:提问只会
     /// 发生在一轮之中,空闲的连接不可能是调用方。
     pub async fn prompting_connections_for_agent(&self, agent_key: &str) -> Vec<String> {
-        let candidates: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>)> = {
+        let candidates: Vec<(
+            String,
+            Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        )> = {
             let map = self.connections.lock().await;
-            map.values().map(|c| (c.id.clone(), c.state.clone())).collect()
+            map.values()
+                .map(|c| (c.id.clone(), c.state.clone()))
+                .collect()
         };
         let mut out = Vec::new();
         for (id, state) in candidates {
@@ -4047,9 +4083,14 @@ impl ConnectionManager {
         conversation_id: i32,
         agent_key: &str,
     ) -> Option<String> {
-        let candidates: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>)> = {
+        let candidates: Vec<(
+            String,
+            Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        )> = {
             let map = self.connections.lock().await;
-            map.values().map(|c| (c.id.clone(), c.state.clone())).collect()
+            map.values()
+                .map(|c| (c.id.clone(), c.state.clone()))
+                .collect()
         };
         for (id, state) in candidates {
             let s = state.read().await;

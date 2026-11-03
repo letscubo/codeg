@@ -33,6 +33,10 @@ const RESOURCES: &[(&str, &str)] = &[
         "acp-bootstrap.mjs",
         include_str!("../../resources/openclaw/acp-bootstrap.mjs"),
     ),
+    (
+        "backend-lifecycle.mjs",
+        include_str!("../../resources/openclaw/backend-lifecycle.mjs"),
+    ),
 ];
 
 fn plan(

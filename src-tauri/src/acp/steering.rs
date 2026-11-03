@@ -2,17 +2,27 @@
 //! are never retried after an ambiguous delivery. The process epoch prevents a
 //! restart from forgetting an accepted id and executing it a second time.
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::connection::{ConnectionCommand, SteerOutcome};
+#[cfg(test)]
+use super::connection::ConnectionCommand;
+use super::connection::SteerOutcome;
 use super::error::AcpError;
 use super::manager::ConnectionManager;
 use super::session_state::SessionState;
 use super::types::{AcpEvent, PromptInputBlock};
 use crate::web::event_bridge::emit_with_state_gated;
+
+#[path = "steering_pending.rs"]
+mod pending;
+
+#[cfg(test)]
+#[path = "steering_preparation_tests.rs"]
+mod preparation_tests;
 
 const MAX_SUBMISSIONS: usize = 8192;
 const MAX_STEER_BYTES: usize = 512 * 1024;
@@ -25,6 +35,8 @@ pub struct NativeSteeringState {
     pub agent_type: Option<String>,
     pub native_supported: bool,
     pub active_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
     pub attachments_supported: bool,
 }
 
@@ -80,6 +92,7 @@ struct Submission {
 pub(crate) struct NativeSteeringLedger {
     epoch: String,
     submissions: Mutex<HashMap<String, Submission>>,
+    preparation_wait_timeout: Duration,
 }
 
 impl Default for NativeSteeringLedger {
@@ -87,6 +100,7 @@ impl Default for NativeSteeringLedger {
         Self {
             epoch: uuid::Uuid::new_v4().to_string(),
             submissions: Mutex::new(HashMap::new()),
+            preparation_wait_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -121,6 +135,20 @@ fn result(id: &str, state: NativeSteerStatus, reason: &str) -> NativeSteerResult
     }
 }
 
+fn existing_submission(
+    ledger: &HashMap<String, Submission>,
+    key: &str,
+    fingerprint: &[u8],
+) -> Result<Option<NativeSteerResult>, String> {
+    match ledger.get(key) {
+        Some(existing) if existing.fingerprint != fingerprint => {
+            Err("submission_id_conflict".into())
+        }
+        Some(existing) => Ok(Some(existing.result.clone())),
+        None => Ok(None),
+    }
+}
+
 impl ConnectionManager {
     pub async fn native_steering_state(&self, connection_id: &str) -> NativeSteeringState {
         let state = self.get_state(connection_id).await;
@@ -137,6 +165,10 @@ impl ConnectionManager {
                 .as_ref()
                 .filter(|s| s.turn_in_flight)
                 .map(|s| turn_id(s)),
+            client_message_id: guard
+                .as_ref()
+                .filter(|s| s.turn_in_flight)
+                .and_then(|s| s.native_steer_client_message_id.clone()),
             // The first contract deliberately accepts text only. Uploads stay
             // queued intact instead of losing their image/file content.
             attachments_supported: false,
@@ -221,14 +253,28 @@ impl ConnectionManager {
         }
         let fingerprint = Sha256::digest(payload).to_vec();
         let key = input.submission_id.clone();
+        // Idempotency precedes mutable admission state: an existing receipt
+        // remains queryable even after its host or connection has disappeared.
+        if let Some(existing) = existing_submission(
+            &*self.native_steering.submissions.lock().await,
+            &key,
+            &fingerprint,
+        )? {
+            return Ok(existing);
+        }
+        let admission = if blocks
+            .iter()
+            .any(|b| !matches!(b, PromptInputBlock::Text { .. }))
+        {
+            Err("attachments_not_supported")
+        } else {
+            pending::capture(self, &input, self.native_steering.preparation_wait_timeout).await
+        };
         let pending = result(&input.submission_id, NativeSteerStatus::Pending, "");
         {
             let mut ledger = self.native_steering.submissions.lock().await;
-            if let Some(existing) = ledger.get(&key) {
-                if existing.fingerprint != fingerprint {
-                    return Err("submission_id_conflict".into());
-                }
-                return Ok(existing.result.clone());
+            if let Some(existing) = existing_submission(&ledger, &key, &fingerprint)? {
+                return Ok(existing);
             }
             // Never evict an accepted id: forgetting it could duplicate a steer.
             if ledger.len() >= MAX_SUBMISSIONS {
@@ -245,11 +291,20 @@ impl ConnectionManager {
                 },
             );
         }
+        tracing::info!(connection_id = ?uuid::Uuid::parse_str(&input.connection_id).ok(), conversation_id = input.expected_conversation_id,
+            submission_id = %input.submission_id, phase = "admitted",
+            preparation_wait = admission.as_ref().is_ok_and(|target| target.waits_for_preparation()),
+            "[ACP][native_steer_v1] submission");
         let manager = self.clone_ref();
         // The ledger reservation and spawn have no intervening await. Once
         // admitted, a disconnected HTTP caller cannot abandon the dispatch.
         tokio::spawn(async move {
-            let outcome = manager.dispatch_native_steer(&input, blocks).await;
+            let outcome = manager
+                .dispatch_native_steer(&input, blocks, admission)
+                .await;
+            tracing::info!(connection_id = ?uuid::Uuid::parse_str(&input.connection_id).ok(), conversation_id = input.expected_conversation_id,
+                submission_id = %input.submission_id, phase = "settled", state = ?outcome.state,
+                reason = outcome.reason.as_deref().unwrap_or(""), "[ACP][native_steer_v1] submission");
             if let Some(entry) = manager
                 .native_steering
                 .submissions
@@ -267,51 +322,26 @@ impl ConnectionManager {
         &self,
         input: &NativeSteerInput,
         blocks: Vec<PromptInputBlock>,
+        admission: Result<pending::Admission, &'static str>,
     ) -> NativeSteerResult {
         let rejected =
             |reason| result(&input.submission_id, NativeSteerStatus::NotInjected, reason);
-        if blocks
-            .iter()
-            .any(|b| !matches!(b, PromptInputBlock::Text { .. }))
-        {
-            return rejected("attachments_not_supported");
-        }
-        let connection = {
-            let connections = self.connections.lock().await;
-            connections
-                .get(&input.connection_id)
-                .map(|c| (c.state.clone(), c.cmd_tx.clone(), c.emitter.clone()))
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(reason) => return rejected(reason),
         };
-        let Some((state, commands, emitter)) = connection else {
-            return rejected("connection_not_found");
+        let dispatched = match admission.dispatch(self, input, blocks).await {
+            Ok(dispatched) => dispatched,
+            Err(reason) => return rejected(reason),
         };
-        {
-            let s = state.read().await;
-            if s.conversation_id != Some(input.expected_conversation_id)
-                || s.agent_type.as_wire() != input.expected_agent_type
-            {
-                return rejected("connection_scope_mismatch");
-            }
-            if !native_supported(&s) {
-                return rejected("native_steering_unsupported");
-            }
-            if !matches_turn(&s, &input.expected_turn_id) {
-                return rejected("turn_changed");
-            }
-        }
-        let (reply, receiver) = tokio::sync::oneshot::channel();
-        if commands
-            .send(ConnectionCommand::NativeSteer {
-                submission_id: input.submission_id.clone(),
-                expected_turn_id: input.expected_turn_id.clone(),
-                blocks,
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return rejected("connection_closed_before_dispatch");
-        }
+        let pending::Dispatched {
+            state,
+            emitter,
+            expected_turn_id,
+            receiver,
+        } = dispatched;
+        tracing::info!(connection_id = ?uuid::Uuid::parse_str(&input.connection_id).ok(), conversation_id = input.expected_conversation_id,
+            submission_id = %input.submission_id, phase = "dispatched", "[ACP][native_steer_v1] submission");
         match receiver.await {
             Ok(Ok(SteerOutcome::Injected)) => {
                 emit_with_state_gated(
@@ -325,7 +355,7 @@ impl ConnectionManager {
                             None,
                         ),
                     },
-                    |s| matches_turn(s, &input.expected_turn_id),
+                    |s| matches_turn(s, &expected_turn_id),
                 )
                 .await;
                 result(&input.submission_id, NativeSteerStatus::Injected, "")

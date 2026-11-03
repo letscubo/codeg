@@ -52,6 +52,199 @@ async fn idle(manager: &ConnectionManager) {
 }
 
 #[tokio::test]
+async fn myclaw_prompt_native_steering_client_message_proof_tracks_admitted_turn() {
+    let manager = ConnectionManager::new();
+    let mut rx = manager
+        .insert_test_connection_live("c", AgentType::OpenClaw, None, EventEmitter::Noop)
+        .await;
+    let state = manager.get_state("c").await.unwrap();
+    {
+        let mut state = state.write().await;
+        state.external_id = Some("test-session".into());
+        state.conversation_id = Some(42);
+        state.native_steer_acp_v1 = true;
+        state.native_steer_acp_preparation_wait = true;
+    }
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    let echo = |id: &str| {
+        Some((
+            id.to_string(),
+            crate::acp::user_blocks_from_prompt(&hello()),
+        ))
+    };
+    assert!(manager
+        .native_steering_state("c")
+        .await
+        .client_message_id
+        .is_none());
+    manager
+        .send_prompt_inner_raw("c", hello(), echo(&first), None)
+        .await
+        .unwrap();
+    let admitted = manager.native_steering_state("c").await;
+    assert!(!admitted.native_supported);
+    assert_eq!(admitted.client_message_id.as_deref(), Some(first.as_str()));
+    assert_eq!(
+        serde_json::to_value(&admitted).unwrap()["clientMessageId"],
+        first
+    );
+    assert_eq!(
+        state.read().await.native_steer_acp_host,
+        admitted.active_turn_id
+    );
+    // B is accepted before the connection has dequeued A or called begin_prompt.
+    let submission = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        manager
+            .native_steer(crate::acp::steering::NativeSteerInput {
+                connection_id: "c".into(),
+                expected_conversation_id: 42,
+                expected_agent_type: "open_claw".into(),
+                server_epoch: admitted.server_epoch.clone(),
+                expected_turn_id: admitted.active_turn_id.clone().unwrap(),
+                submission_id: submission.clone(),
+                text: "B belongs only to A".into(),
+                blocks: None,
+            })
+            .await
+            .unwrap()
+            .state,
+        crate::acp::steering::NativeSteerStatus::Pending
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        manager
+            .native_steer_result(crate::acp::steering::NativeSteerLookup {
+                connection_id: "c".into(),
+                expected_conversation_id: 42,
+                expected_agent_type: "open_claw".into(),
+                server_epoch: admitted.server_epoch,
+                submission_id: submission,
+            })
+            .await
+            .state,
+        crate::acp::steering::NativeSteerStatus::Pending
+    );
+    assert_eq!(take(&mut rx).await.1.unwrap().0, first);
+    assert!(matches!(
+        manager
+            .send_prompt_inner_raw("c", hello(), echo(&second), None)
+            .await,
+        Err(AcpError::TurnInProgress)
+    ));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        manager
+            .native_steering_state("c")
+            .await
+            .client_message_id
+            .as_deref(),
+        Some(first.as_str())
+    );
+    state.write().await.apply_event(&AcpEvent::TurnComplete {
+        session_id: "test-session".into(),
+        stop_reason: "end_turn".into(),
+        agent_type: "open_claw".into(),
+        duration_ms: None,
+    });
+    assert!(state.read().await.native_steer_client_message_id.is_none());
+    assert!(manager
+        .native_steering_state("c")
+        .await
+        .client_message_id
+        .is_none());
+    manager
+        .send_prompt_inner_raw("c", hello(), echo(&second), None)
+        .await
+        .unwrap();
+    assert_eq!(take(&mut rx).await.1.unwrap().0, second);
+    assert_eq!(
+        manager
+            .native_steering_state("c")
+            .await
+            .client_message_id
+            .as_deref(),
+        Some(second.as_str())
+    );
+    // Even stale internal data must never become an idle proof.
+    idle(&manager).await;
+    assert_eq!(
+        state.read().await.native_steer_client_message_id.as_deref(),
+        Some(second.as_str())
+    );
+    let inactive = manager.native_steering_state("c").await;
+    assert!(inactive.client_message_id.is_none());
+    assert!(serde_json::to_value(inactive)
+        .unwrap()
+        .get("clientMessageId")
+        .is_none());
+}
+
+#[tokio::test]
+async fn myclaw_prompt_native_steering_client_message_proof_clears_without_uuid() {
+    let (manager, mut rx) = fixture().await;
+    let state = manager.get_state("c").await.unwrap();
+    let previous = uuid::Uuid::new_v4().to_string();
+    for id in [
+        None,
+        Some("user-c-1"),
+        Some("optimistic-d93b83f8-12d5-41c3-a659-83cafc721627"),
+        Some(""),
+    ] {
+        {
+            let mut state = state.write().await;
+            state.turn_in_flight = false;
+            state.native_steer_client_message_id = Some(previous.clone());
+        }
+        let echo = id.map(|id| {
+            (
+                id.to_string(),
+                crate::acp::user_blocks_from_prompt(&hello()),
+            )
+        });
+        manager
+            .send_prompt_inner_raw("c", hello(), echo, None)
+            .await
+            .unwrap();
+        take(&mut rx).await;
+        assert!(state.read().await.native_steer_client_message_id.is_none());
+        assert!(manager
+            .native_steering_state("c")
+            .await
+            .client_message_id
+            .is_none());
+    }
+    idle(&manager).await;
+    state.write().await.native_steer_client_message_id = Some(previous.clone());
+    let rejected = uuid::Uuid::new_v4().to_string();
+    assert!(manager
+        .send_prompt_inner_raw("c", vec![], Some((rejected.clone(), vec![])), None)
+        .await
+        .is_err());
+    assert_eq!(
+        state.read().await.native_steer_client_message_id.as_deref(),
+        Some(previous.as_str())
+    );
+    drop(rx);
+    assert!(matches!(
+        manager
+            .send_prompt_inner_raw("c", hello(), Some((rejected, vec![])), None)
+            .await,
+        Err(AcpError::ProcessExited)
+    ));
+    assert_eq!(
+        state.read().await.native_steer_client_message_id.as_deref(),
+        Some(previous.as_str())
+    );
+    assert!(manager
+        .native_steering_state("c")
+        .await
+        .client_message_id
+        .is_none());
+}
+
+#[tokio::test]
 async fn myclaw_prompt_inline_context_preserves_user_echo_and_attachments() {
     let (manager, mut rx) = fixture().await;
     let mut original = hello();
