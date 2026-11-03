@@ -5,6 +5,8 @@ export default {
   id: 'codeg-native-steering',
   name: 'Codeg native steering',
   register(api) {
-    registerGatewayMethods(api, () => loadGatewayInternals())
+    registerGatewayMethods(api, () => loadGatewayInternals(undefined, () => {
+      api.logger?.warn('Codeg MCP stdio cleanup remains uncertain')
+    }))
   },
 }
