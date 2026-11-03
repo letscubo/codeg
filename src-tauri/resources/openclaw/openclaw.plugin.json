@@ -1,0 +1,7 @@
+{
+  "id": "codeg-native-steering",
+  "name": "Codeg native steering",
+  "version": "1.0.0",
+  "activation": { "onStartup": true },
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+}

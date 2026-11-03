@@ -511,6 +511,28 @@ pub struct SessionState {
     /// opt-in), rerouting subsequent notes to the MCP pull path.
     pub native_steering_available: bool,
 
+    /// NativeSteer v1 driver readiness, independent of legacy feedback MCP.
+    pub native_steer_v1_available: bool,
+    /// UUID supplied with the currently admitted prompt's user echo. This binds
+    /// preparation-time callers to that exact local message, never a successor.
+    pub native_steer_client_message_id: Option<String>,
+    /// Driver-owned opaque token when one host turn spans several native
+    /// turns. A delayed steer must not cross those internal turn boundaries.
+    pub native_steer_v1_turn_id: Option<String>,
+    /// Independent handshake and exact host/native binding for owned ACP adapters.
+    pub native_steer_acp_v1: bool,
+    /// OpenClaw peer proves the operation's actual first backend, independently
+    /// of the ACP monitor's sampling. Only this contract admits preparation waits.
+    pub native_steer_acp_preparation_wait: bool,
+    pub native_steer_acp_host: Option<String>,
+    pub native_steer_acp_turn: Option<super::native_acp::NativeAcpTurn>,
+    /// The first native identity observed for this host. Retirement clears the
+    /// current identity, but must never turn a later native into the first one.
+    pub native_steer_acp_first_turn: Option<super::native_acp::NativeAcpTurn>,
+    /// Cancel admission precedes the native terminal event. Keep its generation
+    /// so preparation-time steering cannot revive a host that was already stopped.
+    pub native_steer_acp_cancelled_turn: Option<u64>,
+
     /// Which generation of codex-acp's `request_user_input` bridge this
     /// connection is talking to — 1.12.0 swapped the question and the tab
     /// header between a form property's `title` and `description`, and nothing
@@ -746,6 +768,15 @@ impl SessionState {
             delegation_token: None,
             delegation_enabled: false,
             feedback_tool_available: false,
+            native_steer_v1_available: false,
+            native_steer_client_message_id: None,
+            native_steer_v1_turn_id: None,
+            native_steer_acp_v1: false,
+            native_steer_acp_preparation_wait: false,
+            native_steer_acp_host: None,
+            native_steer_acp_turn: None,
+            native_steer_acp_first_turn: None,
+            native_steer_acp_cancelled_turn: None,
             native_steering_available: false,
             codex_user_input_shape: None,
             neutral_goal_channel: false,
@@ -1197,6 +1228,13 @@ impl SessionState {
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
                 // discard the state entirely, so no stale flag can outlive them.)
                 self.turn_in_flight = false;
+                self.native_steer_v1_available = false;
+                self.native_steer_client_message_id = None;
+                self.native_steer_v1_turn_id = None;
+                self.native_steer_acp_host = None;
+                self.native_steer_acp_turn = None;
+                self.native_steer_acp_first_turn = None;
+                self.native_steer_acp_cancelled_turn = None;
                 // Same edge, the identity half: anyone holding "the turn I was
                 // admitted against" can now see that it is gone, even if a new
                 // turn sets `turn_in_flight` again before they look.

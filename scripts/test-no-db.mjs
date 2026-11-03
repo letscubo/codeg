@@ -9,21 +9,25 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const filter = 'myclaw_prompt';
 
-// Pin the source revision and Rust dependency lockfile. A source/dependency
-// change requires another review before even the allowlisted tests may run.
+// Pin Rust, its dependency lockfile and the executable owned runtime resources
+// bundled with include_str!. A runtime-source change requires another review
+// before even the allowlisted tests may run.
 export function sourceFingerprint(repo) {
   const files = [];
-  function walk(dir) {
+  function walk(dir, include = name => name.endsWith('.rs') || name === 'Cargo.toml') {
     for (const entry of readdirSync(dir, {withFileTypes: true})) {
       const path = join(dir, entry.name);
       if (entry.isSymbolicLink()) throw new Error(`Unexpected source symlink: ${path}`);
-      if (entry.isDirectory() && entry.name !== 'target' && entry.name !== '.git') walk(path);
-      else if (entry.isFile() && (entry.name.endsWith('.rs') || entry.name === 'Cargo.toml')) files.push(path);
+      if (entry.isDirectory() && entry.name !== 'target' && entry.name !== '.git') walk(path, include);
+      else if (entry.isFile() && include(entry.name)) files.push(path);
     }
   }
   for (const dir of ['src-tauri/src', 'src-tauri/tests', 'src-tauri/vendor']) walk(join(repo, dir));
+  // Recursive collection includes effort wire/Pi/DSH resources once, together
+  // with owned ACP bootstraps and plugin metadata in nested resource directories.
+  walk(join(repo, 'src-tauri/resources'), name => /\.(?:mjs|cjs|js|py|json)$/.test(name)
+    && !/\.test\.(?:mjs|cjs|js|py)$/.test(name) && !name.startsWith('test_'));
   for (const name of ['Cargo.lock', 'Cargo.toml', 'build.rs']) files.push(join(repo, 'src-tauri', name));
-  for (const name of ['codeg-effort-wire.mjs', 'pi/effort-probe.mjs', 'dsh/codeg-headless-runner.mjs']) files.push(join(repo, 'src-tauri/resources', name));
   const digest = createHash('sha256');
   const ordered = files.map(path => ({path, name: relative(repo, path).replaceAll('\\', '/')}))
     .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);

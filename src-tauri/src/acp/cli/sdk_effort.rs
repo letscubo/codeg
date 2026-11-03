@@ -40,6 +40,24 @@ struct ProbeResult {
 #[path = "sdk_effort_cache.rs"]
 mod cache;
 
+/// Isolated fixtures can exercise the production cache/resolve/driver path
+/// without inspecting an installed SDK or launching a metadata probe.
+#[cfg(test)]
+pub(crate) fn seed_test_capabilities(
+    context: &CliEffortContext,
+    version: &str,
+    models: Vec<ModelCapability>,
+) {
+    let fingerprint = cache::fingerprint(context).expect("isolated metadata cache fingerprint");
+    cache::put(
+        &fingerprint,
+        &ProbeResult {
+            version: version.to_owned(),
+            models,
+        },
+    );
+}
+
 pub fn validate_models(models: &[ModelRequest]) -> Result<(), String> {
     if models.len() > 256 {
         return Err("At most 256 model capabilities may be requested".into());

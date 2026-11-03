@@ -41,6 +41,7 @@ import {
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
+import { createInterface } from "node:readline";
 import { verifiedWireLevels } from "../codeg-effort-wire.mjs";
 
 export const name = "codeg-headless-runner";
@@ -126,7 +127,164 @@ async function loadInternals() {
   for (const [key, value] of Object.entries(internals)) {
     if (typeof value !== "function") throw new Error(`codeg-runner: dsh internal ${key} is unavailable`);
   }
+  // Missing/unknown package metadata disables the extension, without breaking
+  // the existing one-shot/background runner behavior.
+  try {
+    internals.nativeSteeringSupported = pinnedSteeringVersions([
+      JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
+      ...["dsh-agent", "dsh-agent-loop", "dsh-llm", "dsh-session"].map((pkg) =>
+        JSON.parse(readFileSync(join(packageDir(root, pkg), "package.json"), "utf8")).version),
+    ]);
+  } catch { internals.nativeSteeringSupported = false; }
   return internals;
+}
+
+/** Only this exact published API and its phase/inbox/commit semantics were reviewed. */
+export function pinnedSteeringVersions(versions) {
+  return versions.length === 5 && versions.every((version) => version === "0.1.6-alpha.2");
+}
+
+/** Native next-step input on the same Agent; a queued inbox splice is NOT a
+ * consumption receipt. Only the exact user/message append in that native turn
+ * confirms consumption (native disk flush remains at runner completion).
+ * This bridge never cancels or calls followup(). */
+export function nativeSteeringBridge(ctx, agent, createUserMessage, initialMessageId, {
+  supported = false, input = process.stdin, output = process.stdout,
+} = {}) {
+  const requests = new Map();
+  let turn;
+  let stepTurn;
+  let initialConsumed = false;
+  let accepting = false;
+  let disposed = false;
+  const emit = (value) => output.write(`${JSON.stringify({ protocol: 1, version: "0.1.6-alpha.2", sessionId: agent.session.id, ...value })}\n`);
+  const state = (available) => {
+    accepting = available;
+    emit({ type: "codeg_native_state", turn: turn ?? null, supported: available });
+  };
+  const complete = (item, status) => {
+    if (item.status !== undefined) return;
+    item.status = status;
+    emit({ type: "codeg_native_result", id: item.id, turn: item.turn, status });
+  };
+  const active = (expected) => agent.phase?.kind === "running" && agent.phase.turn === expected
+    && agent.phase.abort?.signal?.aborted === false;
+  const retire = (nativeTurn) => {
+    for (const item of requests.values()) {
+      if (item.turn !== nativeTurn || item.status !== undefined) continue;
+      // Remove only this exact user message, preserving system/subagent input.
+      let removed = false;
+      try { removed = agent.inbox.remove(item.messageId); } catch { /* ambiguous, never retry */ }
+      if (item.status === undefined) complete(item, removed ? "not_injected" : "unconfirmed");
+    }
+  };
+  if (!supported || typeof agent.inject !== "function" || typeof agent.inbox?.remove !== "function"
+    || typeof initialMessageId !== "string" || input.readableEnded) return { dispose() {} };
+  const stopSession = ctx.on("session/event", (session, event) => {
+    if (session !== agent.session || disposed) return;
+    if (event.type === "turn/start") {
+      turn = event.data.turn;
+      stepTurn = undefined;
+    } else if (event.type === "step/start") stepTurn = event.data.turn;
+    else if (event.type === "user/message") {
+      const messageId = event.data.id;
+      if (messageId === initialMessageId) initialConsumed = true;
+      for (const item of requests.values()) {
+        if (item.messageId !== messageId || item.status !== undefined) continue;
+        complete(item, item.turn === turn && item.turn === stepTurn ? "injected" : "unconfirmed");
+      }
+      if (initialConsumed && Number.isSafeInteger(turn) && stepTurn === turn && active(turn)) state(true);
+    } else if (event.type === "turn/end") {
+      state(false);
+      // Session.append publishes synchronously with a reentrancy guard. Never
+      // mutate the inbox here: owner hooks below run outside that append.
+      turn = undefined;
+      stepTurn = undefined;
+    }
+  });
+  const stopStopping = ctx.on("agent/turn-stopping", ({ agent: subject, turn: nativeTurn }) => {
+    if (subject !== agent || disposed) return;
+    state(false);
+    retire(nativeTurn);
+  });
+  const stopStatus = ctx.on("agent/status", ({ agent: subject, status }) => {
+    if (subject !== agent || status !== "idle" || disposed) return;
+    state(false);
+    // kick() emits idle after turn() settles and before any latched wake, so
+    // error/abort/rejected-step paths also remove only our pending messages.
+    for (const nativeTurn of new Set([...requests.values()].map((item) => item.turn))) retire(nativeTurn);
+  });
+  const stopPreStep = ctx.on("agent/pre-step", async ({ agent: subject, turn: nativeTurn }, next) => {
+    const decision = await next();
+    if (subject !== agent || decision.kind === "reject") return decision;
+    // Background reports may open another native turn without an idle status.
+    // This official admission hook prevents stale owned ids from entering it,
+    // even if a preceding error/disposal path could not retract an inbox item.
+    const stale = new Map([...requests.values()].filter((item) => item.turn !== nativeTurn)
+      .map((item) => [item.messageId, item]));
+    const messages = decision.messages.filter((message) => {
+      const item = stale.get(message.id);
+      if (item === undefined) return true;
+      complete(item, "not_injected");
+      return false;
+    });
+    return messages.length === decision.messages.length ? decision : { ...decision, messages };
+  });
+  const stopClaim = ctx.on("agent/inbox/claimed", ({ agent: subject, message, turn: claimedTurn }) => {
+    if (subject !== agent) return;
+    for (const item of requests.values()) {
+      if (item.messageId !== message.id || item.status !== undefined) continue;
+      item.claimed = true;
+      if (claimedTurn !== item.turn) complete(item, "unconfirmed");
+    }
+  });
+  const stopDiscard = ctx.on("agent/inbox/discarded", ({ agent: subject, message }) => {
+    if (subject !== agent) return;
+    for (const item of requests.values()) {
+      if (item.messageId === message.id) complete(item, item.claimed ? "unconfirmed" : "not_injected");
+    }
+  });
+  const lines = createInterface({ input, terminal: false });
+  lines.on("line", (line) => {
+    if (disposed || Buffer.byteLength(line) > 128 * 1024) return;
+    let command;
+    try { command = JSON.parse(line); } catch { return; }
+    if (command?.type !== "codeg_native_steer" || command.protocol !== 1
+      || typeof command.id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(command.id)) return;
+    const previous = requests.get(command.id);
+    if (previous !== undefined) {
+      if (previous.status !== undefined) emit({ type: "codeg_native_result", id: previous.id, turn: previous.turn, status: previous.status });
+      return;
+    }
+    const invalid = command.sessionId !== agent.session.id || !Number.isSafeInteger(command.turn)
+      || command.turn !== turn || !accepting || !initialConsumed || !active(command.turn)
+      || typeof command.text !== "string" || command.text.trim() === "" || Array.from(command.text).length > 16000
+      || requests.size >= 1024;
+    if (invalid) {
+      emit({ type: "codeg_native_result", id: command.id, turn: command.turn ?? null, status: "not_injected" });
+      return;
+    }
+    const message = createUserMessage({ content: [{ type: "text", text: command.text }], source: { kind: "user" } });
+    const item = { id: command.id, turn, messageId: message.id, claimed: false };
+    requests.set(item.id, item);
+    // Public inject() is send(next-step, false): it cannot wake a new turn or
+    // reroute to next-turn on cancellation as steer() deliberately can.
+    try { agent.inject(message); }
+    catch {
+      const removed = agent.inbox.remove(message.id);
+      if (item.status === undefined) complete(item, removed ? "not_injected" : "unconfirmed");
+    }
+  });
+  return {
+    dispose() {
+      if (disposed) return;
+      state(false);
+      for (const nativeTurn of new Set([...requests.values()].map((item) => item.turn))) retire(nativeTurn);
+      disposed = true;
+      stopSession(); stopStopping(); stopStatus(); stopPreStep(); stopClaim(); stopDiscard();
+      lines.close(); input.pause();
+    },
+  };
 }
 
 // ── pure helpers (unit-tested) ─────────────────────────────────────────────
@@ -570,10 +728,12 @@ async function run(ctx, config, internals) {
           { cwd },
         )
       : undefined;
+  const initialMessage = internals.createUserMessage({ content: [{ type: "text", text: task }], source: { kind: "user" } });
+  const steering = nativeSteeringBridge(ctx, agent, internals.createUserMessage, initialMessage.id, {
+    supported: config.json === true && internals.nativeSteeringSupported,
+  });
   try {
-    agent.followup(
-      internals.createUserMessage({ content: [{ type: "text", text: task }], source: { kind: "user" } }),
-    );
+    agent.followup(initialMessage);
     const budgetSecs = Number(config.backgroundWaitSecs) > 0 ? Number(config.backgroundWaitSecs) : DEFAULT_BACKGROUND_WAIT_SECS;
     const settled = await settle(agents, agent, budgetSecs * 1000);
     if (!settled) {
@@ -584,6 +744,7 @@ async function run(ctx, config, internals) {
     await ctx.get("subagents")?.drainContinuableDescendants?.([agent]);
     if (!settled) agent.cancel?.({ kind: "user" });
     await agent.whenIdle();
+    steering.dispose();
     await sessions.flush(agent.session);
     const outcome = summarize(agent.session, firstSeq, internals.SessionSeq);
     await handle.dispose?.();
@@ -602,6 +763,7 @@ async function run(ctx, config, internals) {
     }
     return outcome.reason?.kind === "completed" ? 0 : 1;
   } finally {
+    steering.dispose();
     projection?.dispose?.();
   }
 }

@@ -1,9 +1,48 @@
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {dirname, join} from 'node:path';
 import test from 'node:test';
-import {assertAllowedTests, runNoDbTests} from './test-no-db.mjs';
+import {assertAllowedTests, runNoDbTests, sourceFingerprint} from './test-no-db.mjs';
 
 const name = 'acp::myclaw_prompt::tests::myclaw_prompt_example';
 const manifest = {schemaVersion: 1, sourceSha256: 'reviewed-source', tests: [name]};
+
+test('all bundled resource types and main effort sources are fingerprinted once before cargo', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'codeg-steering-review-'));
+  try {
+    for (const dir of ['src', 'tests', 'vendor']) {
+      mkdirSync(join(repo, 'src-tauri', dir), {recursive: true});
+    }
+    const resources = ['codeg-effort-wire.mjs', 'pi/effort-probe.mjs', 'dsh/codeg-headless-runner.mjs',
+      'hermes/steering.py', 'openclaw/openclaw.plugin.json', 'nested/deep/bootstrap.cjs', 'nested/deep/plugin.js'];
+    const files = ['Cargo.lock', 'Cargo.toml', 'build.rs'].map(file => `src-tauri/${file}`)
+      .concat(['src-tauri/src/fixture.rs'], resources.map(file => `src-tauri/resources/${file}`));
+    const contents = 'reviewed fixture\r\n';
+    for (const file of files) {
+      const source = join(repo, file);
+      mkdirSync(dirname(source), {recursive: true});
+      writeFileSync(source, contents);
+    }
+    // Independent, explicit file set catches both a skipped resource and a
+    // duplicate main resource appended after the recursive directory walk.
+    const expected = createHash('sha256');
+    for (const file of [...files].sort()) expected.update(`${file}\0${contents.replaceAll('\r\n', '\n')}\0`);
+    assert.equal(sourceFingerprint(repo), expected.digest('hex'));
+    for (const file of resources) {
+      const source = join(repo, 'src-tauri/resources', file);
+      writeFileSync(source, 'reviewed fixture');
+      const reviewed = {...manifest, sourceSha256: sourceFingerprint(repo)};
+      writeFileSync(source, 'changed fixture');
+      assert.throws(() => runNoDbTests({repo, mode: 'server', manifest: reviewed,
+        invoke: () => { throw new Error('must not invoke cargo'); },
+      }), /source\/dependencies changed/);
+    }
+  } finally {
+    rmSync(repo, {recursive: true});
+  }
+});
 
 test('unknown, missing and duplicate test names cannot enter the executable suite', () => {
   assertAllowedTests(`${name}: test\r\n1 test, 0 benchmarks\r\n`, [name]);

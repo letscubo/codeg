@@ -219,7 +219,13 @@ pub(crate) fn render_patch_with_options(
     if !inserts.is_empty() {
         entries.push(json!({ "insert": inserts }));
     }
-    let yaml = serde_yaml::to_string(&Value::Array(entries)).unwrap_or_else(|_| "[]\n".to_string());
+    // A flow-style empty list cannot be followed by the runner's block list.
+    // Let the runner begin the one sequence when there are no preceding rows.
+    let yaml = if entries.is_empty() && profile.runner_path.is_some() {
+        String::new()
+    } else {
+        serde_yaml::to_string(&Value::Array(entries)).unwrap_or_else(|_| "[]\n".to_string())
+    };
     let runner = profile
         .runner_path
         .as_deref()
@@ -306,6 +312,23 @@ mod tests {
             runner_path: None,
             background_wait_secs: 1200,
         }
+    }
+
+    #[test]
+    fn myclaw_prompt_dsh_runner_only_patch_is_single_sequence() {
+        let mut profile = profile(false, "off");
+        profile.runner_path = Some("/not-created/runner.mjs".into());
+        let patch = render_patch_with_options(&profile, None, None, None);
+        let entries: Vec<Value> = serde_yaml::from_str(&patch.replace("!!js ", "")).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], "headless-runner");
+        assert_eq!(entries[0]["disabled"], true);
+        assert_eq!(entries[1]["insert"][0]["id"], "codeg-headless-runner");
+
+        profile.runner_path = None;
+        let stock = render_patch_with_options(&profile, None, None, None);
+        let entries: Vec<Value> = serde_yaml::from_str(&stock).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

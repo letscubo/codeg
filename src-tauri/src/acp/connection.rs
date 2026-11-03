@@ -1212,6 +1212,12 @@ pub enum ConnectionCommand {
     /// in the manager's cancellation-shielded task, mirroring Fork's
     /// protocol/persistence split. The idle arm replies `Err(NoActiveTurn)`
     /// so the oneshot can never hang.
+    NativeSteer {
+        submission_id: String,
+        expected_turn_id: String,
+        blocks: Vec<PromptInputBlock>,
+        reply: tokio::sync::oneshot::Sender<Result<SteerOutcome, AcpError>>,
+    },
     Steer {
         blocks: Vec<PromptInputBlock>,
         reply: tokio::sync::oneshot::Sender<Result<SteerOutcome, AcpError>>,
@@ -1874,11 +1880,23 @@ fn agent_debug_callback(
     agent_name: String,
     stderr_tail: Arc<StderrTail>,
     stdio_debug_enabled: bool,
+    native_diagnostic: Option<(String, Arc<RwLock<SessionState>>)>,
 ) -> impl Fn(&str, sacp_tokio::LineDirection) + Send + Sync + 'static {
     move |line, dir| {
         let (tag, enabled) = match dir {
             sacp_tokio::LineDirection::Stderr => {
                 stderr_tail.push(line);
+                if let Some((connection_id, state)) = &native_diagnostic {
+                    if let Some(diagnostic) = super::native_acp::parse_owned_diagnostic(line) {
+                        let conversation_id = state.try_read().ok().and_then(|s| s.conversation_id);
+                        tracing::info!(
+                            connection_id = %connection_id,
+                            conversation_id = ?conversation_id,
+                            diagnostic = %diagnostic,
+                            "[ACP][native_steer_v1] owned stderr diagnostic"
+                        );
+                    }
+                }
                 ("stderr", true)
             }
             sacp_tokio::LineDirection::Stdout => ("stdout", stdio_debug_enabled),
@@ -1912,6 +1930,7 @@ async fn build_agent(
     cwd: &Path,
     stderr_tail: &Arc<StderrTail>,
     scratch: Option<&Path>,
+    native_diagnostic: Option<(String, Arc<RwLock<SessionState>>)>,
 ) -> Result<AcpAgent, AcpError> {
     // A conversation can outlive the custom-agent definition it was started
     // with (the user deleted it in settings). `get_agent_meta` cannot report
@@ -1963,6 +1982,8 @@ async fn build_agent(
                 }
             }
             let mut merged_env = merge_agent_env(env, runtime_env, scratch);
+            super::owned_bootstrap::prepare_launch_env(agent_type, &mut merged_env);
+            super::openclaw_bootstrap::prepare_launch_env(agent_type, &mut merged_env);
             // Resolve the config-derived preset HERE (like Grok's
             // `grok_launch_permission_mode` below) so the policy helper stays a
             // pure function over the env list.
@@ -2055,7 +2076,12 @@ async fn build_agent(
                     // `false`: this branch never logged stdin/stdout, and the
                     // shared callback must not quietly widen that. Only the
                     // Binary branch opts into the CODEG_ACP_DEBUG stdio dump.
-                    a.with_debug(agent_debug_callback(agent_name, tail, false))
+                    a.with_debug(agent_debug_callback(
+                        agent_name,
+                        tail,
+                        false,
+                        native_diagnostic.clone(),
+                    ))
                 })
                 .map_err(|e| AcpError::SpawnFailed(e.to_string()))
         }
@@ -2232,7 +2258,12 @@ async fn build_agent(
             let tail = Arc::clone(stderr_tail);
             Ok(
                 AcpAgent::new(sacp::schema::McpServer::Stdio(server)).with_debug(
-                    agent_debug_callback(agent_name, tail, stdio_debug_enabled),
+                    agent_debug_callback(
+                        agent_name,
+                        tail,
+                        stdio_debug_enabled,
+                        native_diagnostic.clone(),
+                    ),
                 ),
             )
         }
@@ -2295,7 +2326,12 @@ async fn build_agent(
             AcpAgent::from_args(&refs)
                 .map(|a| {
                     // `false` for the same reason as the Npx branch above.
-                    a.with_debug(agent_debug_callback(agent_name, tail, false))
+                    a.with_debug(agent_debug_callback(
+                        agent_name,
+                        tail,
+                        false,
+                        native_diagnostic.clone(),
+                    ))
                 })
                 .map_err(|e| AcpError::SpawnFailed(e.to_string()))
         }
@@ -2451,6 +2487,8 @@ pub async fn spawn_agent_connection(
         &launch_cwd,
         &stderr_tail,
         scratch.as_ref().map(|s| s.path()),
+        (agent_type == AgentType::OpenClaw)
+            .then(|| (connection_id.clone(), Arc::clone(&session_state))),
     )
     .await
     {
@@ -6200,6 +6238,18 @@ async fn run_connection(
                 // that needs no tool; OpenClaw-style `supports_mcp: false`
                 // agents could ship it someday).
                 s.native_steering_available = native_steering_available;
+                s.native_steer_acp_v1 = super::native_acp::advertised(agent_type, init_resp.meta.as_ref());
+                s.native_steer_acp_preparation_wait = super::native_acp::preparation_wait_advertised(
+                    agent_type,
+                    init_resp.meta.as_ref(),
+                );
+                tracing::info!(
+                    connection_id = %conn_id,
+                    conversation_id = ?s.conversation_id,
+                    native_acp_v1_advertised = s.native_steer_acp_v1,
+                    preparation_wait = s.native_steer_acp_preparation_wait,
+                    "[ACP][native_steer_v1] owned protocol initialized"
+                );
                 s.codex_user_input_shape = codex_user_input_shape;
                 s.neutral_goal_channel = neutral_goal_channel;
                 // The vocabulary is decided HERE for every adapter, advertising
@@ -8963,7 +9013,7 @@ async fn handle_fork_or_exit(
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
-    prompt_ledger: &background_watch::PromptLedger,
+    prompt_ledger: &Arc<background_watch::PromptLedger>,
     // Threaded through from run_connection so the forked session's
     // run_conversation_loop call has the same delegation cascade
     // capability as the original.
@@ -9774,7 +9824,7 @@ async fn run_conversation_loop<'a>(
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
-    prompt_ledger: &background_watch::PromptLedger,
+    prompt_ledger: &Arc<background_watch::PromptLedger>,
     // Source of the broker reference used to cascade-cancel pending
     // delegations on parent prompt cancel / non-success TurnComplete.
     // `None` for test paths that don't wire delegation.
@@ -10009,7 +10059,11 @@ async fn run_conversation_loop<'a>(
                 // rebuilt from history show the same duration.
                 let turn_elapsed_ms =
                     move || crate::acp_transcript::now_epoch_ms().saturating_sub(turn_started_at_ms);
-                let prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
+                let mut prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
+                if let Some(meta) = super::native_acp::begin_prompt(&mut *state.write().await) {
+                    prompt_request.meta.get_or_insert_with(Default::default)
+                        .insert(super::native_acp::PROMPT_META.into(), meta);
+                }
                 // Snapshot the stderr write position BEFORE the request is
                 // dispatched. An agent that fails the moment the prompt lands
                 // (bad credentials, unknown model) prints its error almost
@@ -10087,6 +10141,7 @@ async fn run_conversation_loop<'a>(
                 // Read updates until turn completes.
                 // We must also listen for commands (e.g. RespondPermission)
                 // to avoid deadlocking when the agent awaits a permission response.
+                let native_receipts = super::native_acp::ReceiptBatch::default();
                 loop {
                     tokio::select! {
                         update = session.read_update() => {
@@ -10209,6 +10264,9 @@ async fn run_conversation_loop<'a>(
                                     }
                                 }
                                 SessionMessage::StopReason(reason) => {
+                                    if state.read().await.native_steer_acp_v1 {
+                                        native_receipts.finish().await;
+                                    }
                                     if !tracked_terminal_tool_calls.is_empty() {
                                         poll_tracked_terminal_tool_calls(
                                             terminal_runtime.as_ref(),
@@ -10301,6 +10359,9 @@ async fn run_conversation_loop<'a>(
                             }
                         }
                         prompt_result = &mut prompt_response => {
+                            if state.read().await.native_steer_acp_v1 {
+                                native_receipts.finish().await;
+                            }
                             // ACP defines the `authRequired` rejection as the
                             // signal that the CLIENT should run its auth flow
                             // and come back — the session survives it, so this
@@ -10647,6 +10708,35 @@ async fn run_conversation_loop<'a>(
                                         let _ = reply.send(landed);
                                     }
                                 }
+                                Some(ConnectionCommand::NativeSteer { submission_id, expected_turn_id, blocks, reply }) => {
+                                    let request = super::native_acp::build_request(
+                                        &*state.read().await, sid.0.as_ref(), &expected_turn_id, &submission_id, &blocks,
+                                    );
+                                    match request {
+                                        Err(error) => { let _ = reply.send(Err(error)); }
+                                        Ok(request) => {
+                                            let steer_cx = cx.clone();
+                                            let steer_sid = sid.0.to_string();
+                                            let ledger = Arc::clone(prompt_ledger);
+                                            let receipt = native_receipts.start();
+                                            // A receipt may wait on a long-running tool. Spawn through
+                                            // the existing ACP reactor so Cancel/Disconnect remain live,
+                                            // and late receipts can settle after the owning prompt ends.
+                                            let _ = cx.spawn(async move {
+                                                let mut outcome = super::native_acp::send(steer_cx, request).await;
+                                                if matches!(outcome, Ok(SteerOutcome::Injected)) {
+                                                    if receipt.record(agent_type, &steer_sid, &blocks).await {
+                                                        ledger.record_prompt_blocks(&blocks);
+                                                    } else {
+                                                        outcome = Err(AcpError::protocol("native receipt arrived after turn history closed"));
+                                                    }
+                                                }
+                                                let _ = reply.send(outcome);
+                                                Ok(())
+                                            });
+                                        }
+                                    }
+                                }
                                 Some(ConnectionCommand::Steer { blocks, reply }) => {
                                     // Protocol round-trip only — the manager's
                                     // cancellation-shielded task records the
@@ -10702,6 +10792,7 @@ async fn run_conversation_loop<'a>(
                                     );
                                 }
                                 Some(ConnectionCommand::Cancel) => {
+                                    super::native_acp::cancel_prompt(&mut *state.write().await);
                                     // Send CancelNotification to agent to stop the current turn
                                     let _ = cx.send_notification_to(
                                         Agent,
@@ -10714,30 +10805,33 @@ async fn run_conversation_loop<'a>(
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
                                     tracked_terminal_tool_calls.clear();
+                                    let await_native_terminal = state.read().await.native_steer_acp_v1;
                                     // Also cancel any pending permission requests
                                     // (queued ones included), clearing the card
-                                    // that was on screen, and immediately emit
-                                    // TurnComplete so the frontend transitions out
-                                    // of "prompting" and the user can send new
-                                    // messages. Don't wait for the agent -- it may
-                                    // be slow to respond or not respond at all.
+                                    // that was on screen. Legacy adapters retain
+                                    // their immediate TurnComplete; owned native
+                                    // adapters wait for the original prompt to end.
                                     // One critical section for the same reason as
                                     // the turn-end exits: a request admitted
                                     // between the two would be published and then
                                     // silently un-displayed by TurnComplete,
                                     // wedging the queue.
-                                    drain_permissions_then_emit(
-                                        perms,
-                                        state,
-                                        emitter,
-                                        AcpEvent::TurnComplete {
-                                            session_id: sid.0.to_string(),
-                                            stop_reason: "cancelled".into(),
-                                            agent_type: agent_type.to_string(),
-                                            duration_ms: Some(turn_elapsed_ms()),
-                                        },
-                                    )
-                                    .await;
+                                    if await_native_terminal {
+                                        drain_permissions(perms, state, emitter).await;
+                                    } else {
+                                        drain_permissions_then_emit(
+                                            perms,
+                                            state,
+                                            emitter,
+                                            AcpEvent::TurnComplete {
+                                                session_id: sid.0.to_string(),
+                                                stop_reason: "cancelled".into(),
+                                                agent_type: agent_type.to_string(),
+                                                duration_ms: Some(turn_elapsed_ms()),
+                                            },
+                                        )
+                                        .await;
+                                    }
                                     // Cascade-cancel any in-flight delegations owned by
                                     // this parent connection. Idempotent with the
                                     // cleanup-guard cancel_by_parent at the end of
@@ -10788,6 +10882,12 @@ async fn run_conversation_loop<'a>(
                                         inj.plan_approvals
                                             .cancel_plan_approvals_by_parent(conn_id)
                                             .await;
+                                    }
+                                    if await_native_terminal {
+                                        // Pending permissions/questions/delegations are now
+                                        // cancelled, but the owning native prompt still must
+                                        // provide its terminal proof before releasing the queue.
+                                        continue;
                                     }
                                     // Drain the prompt response in the background so
                                     // the SACP library doesn't log "receiver dropped"
@@ -10935,7 +11035,7 @@ async fn run_conversation_loop<'a>(
                     let _ = reply.send(landed);
                 }
             }
-            Some(ConnectionCommand::Steer { blocks: _, reply }) => {
+            Some(ConnectionCommand::NativeSteer { reply, .. }) | Some(ConnectionCommand::Steer { blocks: _, reply }) => {
                 // Steering only means something for a RUNNING turn. Reply —
                 // never drop — so the manager's shielded task can't hang on
                 // the oneshot; the caller falls back to a normal prompt (the
@@ -14407,6 +14507,7 @@ fn handle_auth_status_update(agent_type: AgentType, notif: AuthStatusUpdateNotif
 /// exactly the gap this log exists to expose.
 fn is_known_ext_method(method: &str) -> bool {
     method == CLAUDE_SDK_EXT_METHOD || GROK_EXT_UPDATE_METHODS.contains(&method)
+        || method == super::native_acp::STATE_METHOD
 }
 
 /// Last stop for a dispatch the typed `session/update` pipeline didn't claim.
@@ -14443,6 +14544,10 @@ async fn maybe_emit_ext_notification(
             return;
         }
     };
+    if notification.method() == super::native_acp::STATE_METHOD {
+        super::native_acp::apply_state(&mut *state.write().await, notification.params());
+        return;
+    }
 
     // The CURRENT connection status decides whether a grok `subagent_progress`
     // tick may touch the live tool call — the same Prompting predicate the
