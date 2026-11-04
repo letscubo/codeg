@@ -273,6 +273,11 @@ pub trait ArtifactUploadAccess: Send + Sync {
     /// 传一个本地文件, 成功回公开链接, 失败回一句给模型看的原因。
     async fn upload(&self, path: &str) -> Result<String, String>;
 
+    /// Native local preparation followed by signed preview registration.
+    async fn expose_preview(&self, _arguments: serde_json::Value) -> Result<serde_json::Value,String> {
+        Err("native preview is unavailable".into())
+    }
+
     /// 平台工具清单(MCP Tool 形状)。
     async fn platform_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
         Err("platform tools are unavailable".to_string())
@@ -308,6 +313,10 @@ impl DbArtifactUpload {
 
 #[async_trait::async_trait]
 impl ArtifactUploadAccess for DbArtifactUpload {
+    async fn expose_preview(&self, arguments: serde_json::Value) -> Result<serde_json::Value,String> {
+        crate::commands::myclaw_preview::expose(&self.db, arguments).await
+    }
+
     async fn upload(&self, path: &str) -> Result<String, String> {
         upload_file(&self.db, path).await
     }

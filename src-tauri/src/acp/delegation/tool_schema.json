@@ -289,5 +289,28 @@
       },
       "additionalProperties": false
     }
+  },
+  {
+    "name": "expose_preview",
+    "description": "Expose an already running local HTTP service as a public HTTPS preview including WebSocket. Pass only port. Prepare the local proxy and register with MyClaw. Anyone with the returned URL can access the service; use only when the user wants a preview. Return the tool URL, never localhost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
   }
 ]

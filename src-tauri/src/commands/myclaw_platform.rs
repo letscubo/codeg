@@ -195,7 +195,7 @@ async fn signed_request_with_query(
     Ok(env.data.unwrap_or(Value::Null))
 }
 
-async fn endpoint(db: &AppDatabase) -> Result<PlatformEndpoint, String> {
+pub(crate) async fn endpoint(db: &AppDatabase) -> Result<PlatformEndpoint, String> {
     let hooks = crate::commands::chat_channel::get_chat_event_webhooks_core(db)
         .await
         .map_err(|_| "could not read this instance's platform webhook config".to_string())?;

@@ -18,7 +18,7 @@ test('all bundled resource types and main effort sources are fingerprinted once 
     const resources = ['codeg-effort-wire.mjs', 'pi/effort-probe.mjs', 'dsh/codeg-headless-runner.mjs',
       'hermes/steering.py', 'openclaw/openclaw.plugin.json', 'nested/deep/bootstrap.cjs', 'nested/deep/plugin.js'];
     const files = ['Cargo.lock', 'Cargo.toml', 'build.rs'].map(file => `src-tauri/${file}`)
-      .concat(['src-tauri/src/fixture.rs'], resources.map(file => `src-tauri/resources/${file}`));
+      .concat(['src-tauri/src/fixture.rs', 'src-tauri/src/tool_schema.json'], resources.map(file => `src-tauri/resources/${file}`));
     const contents = 'reviewed fixture\r\n';
     for (const file of files) {
       const source = join(repo, file);
@@ -100,4 +100,12 @@ test('a failing approved suite is not reported as success', () => {
   assert.throws(() => runNoDbTests({mode: 'server', manifest, fingerprint: () => 'reviewed-source',
     invoke: () => ++calls === 1 ? {status: 0, stdout: `${name}: test`} : {status: 1},
   }), /tests failed/);
+});
+
+test('port-preview suite stays inside its exact reviewed module',()=>{
+ const portName='web::handlers::port_preview::tests::ports_and_hosts_are_scoped';
+ const portManifest={...manifest,tests:[portName]}; const calls=[];
+ runNoDbTests({mode:'server',suite:'port-preview',manifest:portManifest,fingerprint:()=> 'reviewed-source',invoke:(cmd,args)=>{calls.push(args);return {status:0,stdout:`${portName}: test`}}});
+ assert.equal(calls.length,2);assert.ok(calls.every(args=>args.includes('web::handlers::port_preview::tests::')));
+ assert.throws(()=>runNoDbTests({mode:'server',suite:'all',manifest:portManifest,fingerprint:()=> 'reviewed-source',invoke:()=>{throw Error('must not execute')}}));
 });

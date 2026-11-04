@@ -876,6 +876,9 @@ impl DelegationListener {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             return Err("invalid token".to_string());
         };
+        if req.name == "expose_preview" {
+            return self.uploads.expose_preview(req.arguments).await;
+        }
         let conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)

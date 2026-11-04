@@ -123,7 +123,8 @@ pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
 /// 只写**跨 runtime 都成立**的事实:用户拿不到路径;工具名照工具表原样用(实测模型会自己
 /// 拼 `mcp:` 前缀、也会抄历史里的旧名)。**不写具体工具名** —— 各 runtime 的前缀不同。
 pub const COMPANION_INSTRUCTIONS: &str = "\
-This server is the platform's own channel, injected into every session — not a user integration.
+This server is the platform's own channel, injected into every session — not a user integration. \
+When this server lists expose_preview, use it after starting an HTTP service the user wants to preview. Pass only port and return its successful HTTPS URL instead of localhost.
 
 DELIVERY IS NOT OPTIONAL. The person you are talking to cannot open files on this machine: a \
 filesystem path, a `MEDIA:` marker or an attachment delivers nothing. Whenever you produce \
@@ -326,6 +327,7 @@ impl CompanionFeatures {
             "create_automation" => self.automations,
             "create_work_task" => self.taskboard,
             "upload_file" => self.uploads,
+            "expose_preview" => self.platform,
             "browser_exec" | "browser_screenshot" => self.browser,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation"
             | "resume_delegation" => self.delegation,
@@ -994,6 +996,16 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_session_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_session_result).await
+        }
+        "expose_preview" => {
+            if let Err(message) = crate::commands::myclaw_preview::parse_arguments(arguments.clone()) {
+                return LineAction::Respond(err(id, -32602, message));
+            }
+            // Reuse the authenticated broker wire, but listener dispatches this
+            // embedded name locally; it never calls the platform tools endpoint.
+            let req = BrokerPlatformCallRequest {token:ctx.token.clone(), name, arguments};
+            let round_trip = Box::pin(async move {client_platform_call_round_trip(&socket,&req).await});
+            register_and_spawn(inflight,id,None,round_trip,render_platform_result).await
         }
         "upload_file" => {
             // 路径是必填的非空字符串; 其余校验(存在、大小、类型)在父进程那边做 ——
@@ -3140,7 +3152,7 @@ mod tests {
         let resp = unwrap_respond(dispatch_line(&ctx, Arc::new(InflightCalls::new()), &line).await);
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["upload_file", "list_agents"]);
+        assert_eq!(names, vec!["upload_file", "expose_preview", "list_agents"]);
         let upload = tools.iter().find(|t| t["name"] == "upload_file").unwrap();
         assert_ne!(
             upload["description"],
@@ -3196,7 +3208,7 @@ mod tests {
     async fn tools_list_survives_an_unreachable_platform() {
         let line = json!({ "jsonrpc": "2.0", "id": 61, "method": "tools/list" }).to_string();
         let names = list_tool_names(dispatch_with_features(UPLOADS_AND_PLATFORM, &line).await);
-        assert_eq!(names, vec!["upload_file".to_string()]);
+        assert_eq!(names, vec!["upload_file".to_string(), "expose_preview".to_string()]);
     }
 
     #[tokio::test]

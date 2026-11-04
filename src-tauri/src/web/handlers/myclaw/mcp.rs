@@ -306,6 +306,16 @@ async fn call_tool(
         return envelope_err(id, -32602, format!("unknown tool: {name}"));
     }
     match name.as_str() {
+        "expose_preview" => {
+            if let Err(error)=crate::commands::myclaw_preview::parse_arguments(arguments.clone()) {
+                return envelope_err(id,-32602,error);
+            }
+            let outcome=match uploads.expose_preview(arguments).await {
+                Ok(result)=>json!({"ok":true,"result":result}),
+                Err(error)=>json!({"ok":false,"error":error}),
+            };
+            envelope_ok(id,render_platform_result(&outcome))
+        }
         "upload_file" => {
             let path = arguments
                 .get("path")
@@ -349,6 +359,8 @@ struct StateUpload<'a>(&'a crate::db::AppDatabase);
 
 #[async_trait::async_trait]
 impl ArtifactUploadAccess for StateUpload<'_> {
+    async fn expose_preview(&self, arguments:Value)->Result<Value,String>{crate::commands::myclaw_preview::expose(self.0,arguments).await}
+
     async fn upload(&self, path: &str) -> Result<String, String> {
         crate::commands::myclaw_upload::upload_file(self.0, path).await
     }
@@ -929,7 +941,7 @@ mod tests {
     #[test]
     fn tools_list_exposes_only_upload_file() {
         let names = tool_names(&tools_list_result(features()).unwrap());
-        assert_eq!(names, vec!["upload_file".to_string()]);
+        assert_eq!(names, vec!["upload_file".to_string(), "expose_preview".to_string()]);
     }
 
     #[tokio::test]
@@ -960,7 +972,7 @@ mod tests {
         let listed = tool_names(&tools_list_result(with_pdf).unwrap());
         assert_eq!(
             listed,
-            vec!["upload_file", "pdf_guide", "pdf_export", "pdf_read", "pdf_render"]
+            vec!["upload_file", "expose_preview", "pdf_guide", "pdf_export", "pdf_read", "pdf_render"]
         );
         let out = call_tool(
             &StubUpload(Ok(String::new())),
@@ -1086,7 +1098,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             tool_names(&result),
-            vec!["upload_file".to_string(), "list_agents".to_string()]
+            vec!["upload_file".to_string(), "expose_preview".to_string(), "list_agents".to_string()]
         );
         assert_ne!(result["tools"][0]["description"], "impostor");
     }
@@ -1097,7 +1109,7 @@ mod tests {
         let result = tools_list_with_platform(&StubUpload(Ok(String::new())), features())
             .await
             .unwrap();
-        assert_eq!(tool_names(&result), vec!["upload_file".to_string()]);
+        assert_eq!(tool_names(&result), vec!["upload_file".to_string(), "expose_preview".to_string()]);
     }
 
     /// 非内置名字转平台,身份是 URL 里的 agent 段。
@@ -1191,7 +1203,7 @@ mod tests {
             .contains("CREATIVE_3D_DIRECT_MCP_REQUIRED"));
         assert_eq!(
             tool_names(&tools_list_result(features()).unwrap()),
-            ["upload_file"]
+            ["upload_file", "expose_preview"]
         );
     }
 
@@ -1408,4 +1420,9 @@ mod tests {
             assert!(!valid_agent_segment(bad), "{bad:?} must be refused");
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn preview_call_for_test(access:&dyn ArtifactUploadAccess,args:Value)->Value {
+    call_tool(access,"va-test",json!(1),CompanionFeatures::parse(Some("platform")),Some(json!({"name":"expose_preview","arguments":args}))).await
 }

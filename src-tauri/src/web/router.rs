@@ -29,6 +29,7 @@ pub fn build_router(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let port_previews = handlers::port_preview::shared();
     let token_for_ws = token.clone();
     // `/myclaw/file` 在公共组里自己认凭证(Bearer 或下载票),需要同一条 token。
     let token_for_file = token.clone();
@@ -1973,6 +1974,8 @@ pub fn build_router(
         // remote proxy's progress source) and SSE stays unbuffered; see
         // `web::compression`.
         .layer(crate::web::compression::compression_layer())
+        // Preserve application CORS, streaming and WS; never apply API middleware to tunnels.
+        .layer(middleware::from_fn_with_state(port_previews, handlers::port_preview::worker_proxy))
 }
 
 async fn health_check() -> impl IntoResponse {
@@ -1984,7 +1987,8 @@ async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         // Protocol support does not claim that third-party accounts are enabled.
-        "capabilities": ["whatsapp_relay_proxy_v2", "whatsapp_relay_endpoint_v1", "whatsapp_relay_presentation_v1", "whatsapp_question_reply_v1", "internal_prompt_inline_v1", "native_steering_v1", "hermes_reasoning_snapshot_v1", "automation_reasoning_v1"],
+        "capabilities": ["whatsapp_relay_proxy_v2", "whatsapp_relay_endpoint_v1", "whatsapp_relay_presentation_v1", "whatsapp_question_reply_v1", "internal_prompt_inline_v1", "native_steering_v1", "hermes_reasoning_snapshot_v1", "automation_reasoning_v1", "native_port_preview_v1"],
+
     }))
 }
 

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "review": "Reviewed all 11 exact tests. Tests use pure schema/feature/argument objects, in-memory registry, fake PreviewPublisher and ArtifactUploadAccess, and ephemeral loopback mock HTTP/WS servers. Native HTTP MCP is injected with a fake native handler and platform_call panics if reached. Stdio creates but does not poll a broker future; invalid arguments fail before I/O. No real Agent, cloud services, AppDatabase, SQLite, migrations or seeds. Production relay listeners were removed; unsupported OVH registration now fails before KV publication. Production source, native tool JSON and all 11 test call paths reviewed before fingerprinting. Default Prompt suite remains separate. Test correction: malformed capability cases use the cp1 namespace; non-cp1 headers intentionally remain ordinary authenticated Codeg API traffic. Only literal fake inputs changed. Final instruction-only cleanup removes an escaped-newline warning and gates guidance on native tool availability; all 11 reviewed call paths unchanged. Native expose_preview commit audit: unrelated channel-media handlers and router entries are excluded. The new schema/feature gate, local handler, signed-registration publisher and outer HTTP middleware do not execute in the original 102 Prompt/steering fake-runtime tests; those previously reviewed exact names and call boundaries remain unchanged. Dedicated 11 port-preview tests use memory/fake publishers, an unpolled broker future and loopback mock HTTP/WS only. Native tool-schema JSON now joins Rust/resources in the fingerprint. No full test suite, AppDatabase, SQLite, migration, actual Agent/model or cloud request is executed. Fingerprint computed from the feature-only tree that will be committed.",
+  "sourceSha256": "89b80bec7b596939be712528d2c8201a6fe5b8299542e2d5e64a0ca8e43b3dfa",
+  "tests": [
+    "web::handlers::port_preview::tests::ports_and_hosts_are_scoped",
+    "web::handlers::port_preview::tests::auth_repeated_registration_and_restart",
+    "web::handlers::port_preview::tests::http_preserves_path_range_headers_and_stream",
+    "web::handlers::port_preview::tests::websocket_text_binary_and_subprotocol",
+    "web::handlers::port_preview::tests::redirects_preserve_public_origin",
+    "web::handlers::port_preview::tests::encoded_paths_are_not_decoded_by_router",
+    "web::handlers::port_preview::tests::legacy_worker_uses_actual_uri_and_strips_private_headers",
+    "web::handlers::port_preview::tests::native_preview_is_embedded_and_rejects_extra_arguments",
+    "web::handlers::port_preview::tests::native_flow_prepares_before_registration_and_verifies_before_return",
+    "web::handlers::port_preview::tests::http_companion_uses_native_handler_and_never_platform_tools_call",
+    "web::handlers::port_preview::tests::stdio_companion_dispatches_native_preview_and_validates_arguments"
+  ]
+}

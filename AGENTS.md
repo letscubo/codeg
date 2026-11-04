@@ -148,3 +148,14 @@ cargo insta review
 - WhatsApp outbound 必须携带 `relayEndpoint`，并同时使用原有短期 `deliveryGrant`。Codeg 只接受与本轮 `turnId` 完全匹配的公开 HTTPS relay URL。
 - WhatsApp relay 不读取 `chat_event_webhooks`，也不从普通 Codeg 事件回调推导平台地址；`vm_codeg_config.webhook_origin` 只属于普通 Codeg 事件链。
 - health 能力 `whatsapp_relay_endpoint_v1` 用于 MyClaw 协商。未提供该字段的旧调用应在反序列化阶段失败，不能静默回退到事件 webhook。
+
+## 端口预览：Codeg 原生工具（2026-11-04，仅本地修改）
+
+- expose_preview 只接受 port，直接列入 Codeg 内置 MCP schema，受 platform 工具组控制；stdio/HTTP 两条入口共用本机实现。复用已鉴权 broker wire，但 listener 对该名称本地分派，不调用 MyClaw tools/call。
+- Codeg 本机 prepare → 签名 POST /api/codeg/preview/register → 验证公网 URL → 返回工具结果。MyClaw 只校验身份、读取运行时域名、写原有 origin/target KV，不反向调用 Codeg。
+- 兼容原 Worker：p-<port>-<VM UUID>.myclaw.build；target 为 cp1 端口专用票据，由最外层 middleware 识别 X-Preview-Target。正常 API 请求保持原鉴权；应用 /api/* 不进入 Codeg API。内部头不传给应用。
+- 当前仅支持 EKS/Cube 直达 HTTPS 入口，宿主机后端在 KV 写入前明确拒绝。随机 relay 方案已删除，避免重启后旧映射暴露复用端口的其他服务。
+- native_port_preview_v1 表示本协议；Codeg 重启清空内存票据。禁止 Codeg 自身端口及已知控制端口，包括浏览器 CDP 9230–9330。每进程最多 64 个登记。
+- 旧 Worker 不提供原始 URI 头。前置 ingress 已解码的 %2F 无法靠 Codeg 恢复，不承诺未经验证的端到端编码保真。
+- 本地 Rust 只通过 scripts/test-no-db.mjs server --port-preview 执行独立精确白名单；使用内存 mock、未轮询的 broker future 和临时 loopback HTTP/WS，不建数据库、不启动真实 Agent。内置 tool_schema.json 同样纳入源码指纹。默认 Prompt 清单未刷新或扩大。
+- 2026-11-04 经用户单独授权，已将本版测试包仅更新到 C10 并完成真实原生 MCP、HTTPS/WS 验收；配套 MyClaw 仅部署预览。尚未正式发布或全量升级。原 Worker 版本 24d89e9f-edc6-4071-95cc-f465898f5c06 未改未部署，此前 C10 专用 Worker 保持已删除状态。验收证据在 /tmp/native-port-preview-20261104/verification.json。
