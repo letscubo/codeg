@@ -292,7 +292,7 @@ impl ConnectionManager {
             None,
         );
         session.transport = ConnectionTransport::Cli;
-        session.cli_effort_context = matches!(request.agent_type, AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek).then(|| effort::CliEffortContext {
+        session.cli_effort_context = matches!(request.agent_type, AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek | AgentType::Codex).then(|| effort::CliEffortContext {
             agent_type: request.agent_type,
             provider: provider.clone(),
             executable: request.executable.clone(),

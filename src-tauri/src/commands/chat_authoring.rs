@@ -234,6 +234,7 @@ impl ChatAuthoringAccess for DbChatAuthoring {
             action: spec.action,
             prompt_blocks,
             display_text: spec.prompt.clone(),
+            reasoning_effort: None,
             mode_id: None,
             config_values: BTreeMap::new(),
             label_snapshot: None,

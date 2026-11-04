@@ -205,6 +205,11 @@ impl CliEffortContext {
         if matches!(self.agent_type, AgentType::Pi | AgentType::DeepSeek) {
             return super::sdk_effort::resolve_turn(self, model, provider, requested).await;
         }
+        // Codex validates against native model/list inside the accepted turn's
+        // app-server process. No shared configuration or stale capability cache.
+        if self.agent_type == AgentType::Codex {
+            return Ok(requested.clone().flatten());
+        }
         if self.agent_type != AgentType::ClaudeCode {
             return Err("Per-turn effort is unavailable for this runtime".into());
         }

@@ -63,6 +63,7 @@ const ID_INITIALIZE: u64 = 1;
 const ID_THREAD: u64 = 2;
 const ID_TURN: u64 = 3;
 const ID_INTERRUPT: u64 = 4;
+const ID_MODELS: u64 = 5;
 
 /// Codex runs inside the MyClaw instance container, which is the sandbox: no
 /// approvals, no inner sandbox (bubblewrap is not installed there either).
@@ -104,6 +105,7 @@ struct TurnRecord {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Initializing,
+    LoadingModels,
     OpeningThread,
     StartingTurn,
     Streaming,
@@ -118,9 +120,9 @@ impl CodexDriver {
                 ConnectionCommand::Prompt {
                     blocks,
                     user_message,
-                    ..
+                    cli_options,
                 } => {
-                    let disconnect = self.run_turn(blocks, user_message, &mut commands).await;
+                    let disconnect = self.run_turn(blocks, user_message, cli_options, &mut commands).await;
                     if disconnect {
                         break;
                     }
@@ -146,6 +148,7 @@ impl CodexDriver {
         &self,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<UserMessageBlock>)>,
+        cli_options: Option<super::effort::CliTurnOptions>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> bool {
         self.emit(AcpEvent::StatusChanged {
@@ -182,7 +185,9 @@ impl CodexDriver {
             ),
             Ok(input) => match self.spawn().await {
                 Ok(child) => {
-                    self.drive(child, input, &mut record, model.clone(), commands)
+                    self.drive(child, input, &mut record, model.clone(),
+                        cli_options.and_then(|o| o.reasoning_effort),
+                        commands)
                         .await
                 }
                 Err(err) => (
@@ -232,6 +237,7 @@ impl CodexDriver {
         input: Vec<Value>,
         record: &mut TurnRecord,
         model: Option<String>,
+        reasoning_effort: Option<Option<String>>,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
     ) -> (TurnFinish, bool) {
         let pid = child.id().unwrap_or(0);
@@ -254,7 +260,9 @@ impl CodexDriver {
         let mut mapper = CodexStreamMapper::new(Some(self.working_dir.clone()), model.clone());
         let end = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
-                self.pump(stdin, stdout, input, model, &mut mapper, record, commands)
+                self.pump(stdin, stdout, input, model,
+                    reasoning_effort,
+                    &mut mapper, record, commands)
                     .await
             }
             _ => TurnEnd::Eof,
@@ -337,6 +345,7 @@ impl CodexDriver {
         stdout: R,
         input: Vec<Value>,
         model: Option<String>,
+        reasoning_effort: Option<Option<String>>,
         mapper: &mut CodexStreamMapper,
         record: &mut TurnRecord,
         commands: &mut mpsc::Receiver<ConnectionCommand>,
@@ -344,6 +353,7 @@ impl CodexDriver {
         let mut lines = BufReader::new(stdout).lines();
         let mut unparsable = 0usize;
         let mut phase = Phase::Initializing;
+        let mut resolved_effort: Option<String> = None;
         let mut thread_id: Option<String> = None;
         let mut turn_id: Option<String> = None;
         let mut pending_finish: Option<TurnFinish> = None;
@@ -432,12 +442,37 @@ impl CodexDriver {
                             let result = &msg["result"];
                             match id {
                                 ID_INITIALIZE if phase == Phase::Initializing => {
-                                    phase = Phase::OpeningThread;
-                                    let open = thread_request(record.session_id.as_deref(), &self.working_dir, model.as_deref());
-                                    for m in [json!({ "method": "initialized" }), open] {
-                                        if let Err(e) = send(&mut stdin, &m).await {
-                                            return TurnEnd::Failed(write_failed(e));
+                                    if let Err(e) = send(&mut stdin, &json!({"method":"initialized"})).await {
+                                        return TurnEnd::Failed(write_failed(e));
+                                    }
+                                    let next = if reasoning_effort.is_some() {
+                                        phase = Phase::LoadingModels;
+                                        json!({"id":ID_MODELS,"method":"model/list","params":{"limit":100,"includeHidden":true}})
+                                    } else {
+                                        phase = Phase::OpeningThread;
+                                        thread_request(record.session_id.as_deref(), &self.working_dir, model.as_deref())
+                                    };
+                                    if let Err(e) = send(&mut stdin, &next).await {
+                                        return TurnEnd::Failed(write_failed(e));
+                                    }
+                                }
+                                ID_MODELS if phase == Phase::LoadingModels => {
+                                    match resolve_effort(result, model.as_deref(), reasoning_effort.as_ref().unwrap()) {
+                                        Ok(Some(effort)) => resolved_effort = Some(effort),
+                                        Ok(None) => {
+                                            let Some(cursor) = result["nextCursor"].as_str().filter(|s| !s.is_empty()) else {
+                                                return TurnEnd::Failed(effort_error());
+                                            };
+                                            if let Err(e) = send(&mut stdin, &json!({"id":ID_MODELS,"method":"model/list","params":{"limit":100,"includeHidden":true,"cursor":cursor}})).await {
+                                                return TurnEnd::Failed(write_failed(e));
+                                            }
+                                            continue;
                                         }
+                                        Err(error) => return TurnEnd::Failed(error),
+                                    }
+                                    phase = Phase::OpeningThread;
+                                    if let Err(e) = send(&mut stdin, &thread_request(record.session_id.as_deref(), &self.working_dir, model.as_deref())).await {
+                                        return TurnEnd::Failed(write_failed(e));
                                     }
                                 }
                                 ID_THREAD if phase == Phase::OpeningThread => {
@@ -453,7 +488,7 @@ impl CodexDriver {
                                         self.emit_recorded(AcpEvent::SessionStarted { session_id: id.to_string() }, record).await;
                                     }
                                     phase = Phase::StartingTurn;
-                                    if let Err(e) = send(&mut stdin, &turn_request(id, &input, model.as_deref())).await {
+                                    if let Err(e) = send(&mut stdin, &turn_request(id, &input, model.as_deref(), resolved_effort.as_deref())).await {
                                         return TurnEnd::Failed(write_failed(e));
                                     }
                                 }
@@ -521,6 +556,15 @@ impl CodexDriver {
                             let _ = reply.send(Err(AcpError::NoActiveTurn)); continue;
                         };
                         steer_sequence += 1;
+                            let catalog = json!({"data":[{"id":"model-a","defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}]});
+            for depth in [Some("low".into()), Some("high".into()), None] {
+                let effort = resolve_effort(&catalog, Some("model-a"), &depth).unwrap().unwrap();
+                assert_eq!(turn_request("thread-a", &[], Some("model-a"), Some(&effort))["params"]["effort"], json!(depth.unwrap_or("medium".into())));
+            }
+            assert!(resolve_effort(&catalog, Some("model-a"), &Some("max".into())).is_err());
+            assert_eq!(resolve_effort(&catalog, Some("missing"), &None).unwrap(), None);
+            assert!(resolve_effort(&json!({}), Some("model-a"), &None).is_err());
+            assert!(turn_request("thread-a", &[], None, None)["params"].get("effort").is_none());
                         let request = steer_request(steer_sequence, thread, turn, &input);
                         if send(&mut stdin, &request).await.is_err() { continue; }
                         pending_steers.insert(steer_sequence, (blocks, reply));
@@ -758,12 +802,59 @@ pub(crate) fn thread_request(
     }
 }
 
-fn turn_request(thread_id: &str, input: &[Value], model: Option<&str>) -> Value {
+fn turn_request(thread_id: &str, input: &[Value], model: Option<&str>,
+    effort: Option<&str>,
+) -> Value {
     let mut params = json!({ "threadId": thread_id, "input": input });
     if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
         params["model"] = json!(model);
     }
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
+    }
     json!({ "id": ID_TURN, "method": "turn/start", "params": params })
+}
+
+fn effort_error() -> CliTurnError {
+    CliTurnError {
+        code: "reasoning_effort_unavailable".into(),
+        message: "Codex did not confirm this model's thinking depth".into(),
+        details: None,
+    }
+}
+
+/// Official app-server model/list metadata is authoritative for this exact process/model.
+fn resolve_effort(
+    result: &Value,
+    model: Option<&str>,
+    requested: &Option<String>,
+) -> Result<Option<String>, CliTurnError> {
+    let rows = result["data"].as_array().ok_or_else(effort_error)?;
+    let entry = rows.iter().find(|entry| {
+        model
+            .map(|model| {
+                ["id", "model", "displayName"]
+                    .iter()
+                    .any(|key| entry[*key].as_str() == Some(model))
+            })
+            .unwrap_or(entry["isDefault"].as_bool() == Some(true))
+    });
+    let Some(entry) = entry else { return Ok(None) };
+    let chosen = requested
+        .as_deref()
+        .or_else(|| entry["defaultReasoningEffort"].as_str())
+        .ok_or_else(effort_error)?;
+    if !entry["supportedReasoningEfforts"]
+        .as_array()
+        .is_some_and(|efforts| {
+            efforts
+                .iter()
+                .any(|effort| effort["reasoningEffort"].as_str() == Some(chosen))
+        })
+    {
+        return Err(effort_error());
+    }
+    Ok(Some(chosen.into()))
 }
 
 fn steer_request(id: u64, thread_id: &str, turn_id: &str, input: &[Value]) -> Value {

@@ -92,3 +92,5 @@ pub fn continued_session_ids(agent_type: crate::models::AgentType, session_id: &
     }
     crate::acp_transcript::continuation_ancestors(registry::registry_id_for(agent_type), session_id)
 }
+
+pub(crate) mod automation_reasoning;

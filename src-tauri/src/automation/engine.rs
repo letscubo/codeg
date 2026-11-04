@@ -441,6 +441,7 @@ impl AutomationEngine {
             return self.enqueue_task(auto, &cfg, run_id).await;
         }
         let agent_type = parse_agent_type(&auto.agent_type)?;
+        let reasoning = crate::acp::automation_reasoning::plan(agent_type, &cfg)?;
         let blocks = cfg
             .prompt_blocks
             .iter()
@@ -508,6 +509,7 @@ impl AutomationEngine {
         // `AutomationConfig::runtime_env`) — same precedence as acp_connect's
         // per-connection overlay: a per-launch key belongs to the launch.
         runtime_env.extend(cfg.runtime_env.clone());
+        runtime_env.extend(reasoning.runtime_env.clone());
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;
@@ -567,7 +569,7 @@ impl AutomationEngine {
                         agent_type,
                         Some(cwd.working_dir.clone()),
                         None,
-                        runtime_env,
+                        runtime_env.clone(),
                         "automation".to_string(),
                         self.emitter.clone(),
                         cfg.mode_id.clone(),
@@ -578,6 +580,19 @@ impl AutomationEngine {
             }
             Err(e) => return Err(e.to_string()),
         };
+
+        // Apply the task snapshot after establishment/reset and before any prompt.
+        if let Err(error) = crate::acp::automation_reasoning::prepare_openclaw(
+            &self.manager,
+            &conn_id,
+            &runtime_env,
+            reasoning.openclaw_level.as_ref(),
+        )
+        .await
+        {
+            let _ = self.manager.disconnect(&conn_id).await;
+            return Err(error);
+        }
 
         // Conversation row: reuse the previous run's when we actually resumed its
         // session (so the thread reads as one continuous conversation), otherwise
@@ -670,7 +685,7 @@ impl AutomationEngine {
 
         match self
             .manager
-            .send_prompt_linked_with_message_id(
+            .send_prompt_linked_with_cli_options(
                 &self.db,
                 &conn_id,
                 blocks,
@@ -678,6 +693,7 @@ impl AutomationEngine {
                 Some(conversation_id),
                 None,
                 None,
+                reasoning.cli_options,
             )
             .await
         {

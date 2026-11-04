@@ -93,6 +93,13 @@ pub struct AutomationConfig {
     pub prompt_blocks: Vec<serde_json::Value>,
     #[serde(default)]
     pub display_text: String,
+    /// Per-run override. Missing preserves legacy jobs; null restores runtime defaults.
+    #[serde(
+        default,
+        deserialize_with = "crate::acp::cli::effort::deserialize_effort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_effort: Option<Option<String>>,
     #[serde(default)]
     pub mode_id: Option<String>,
     #[serde(default)]

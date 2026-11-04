@@ -181,7 +181,9 @@ fn validate_draft(draft: &AutomationDraft) -> Result<(), DbError> {
     if draft.name.trim().is_empty() {
         return Err(DbError::Validation("name is required".into()));
     }
-    let cfg: AutomationConfig = serde_json::from_value(draft.config.clone()).unwrap_or_default();
+    let cfg: AutomationConfig = serde_json::from_value(draft.config.clone()).map_err(|_| DbError::Validation("invalid automation config".into()))?;
+    crate::acp::automation_reasoning::validate_config(&draft.agent_type, &cfg)
+        .map_err(DbError::Validation)?;
     if cfg.display_text.trim().is_empty() && cfg.prompt_blocks.is_empty() {
         return Err(DbError::Validation("prompt is required".into()));
     }

@@ -191,12 +191,12 @@ async fn cli_prompt_impl(
         && params.connection_id.is_none()
         && !matches!(
             params.agent_type,
-            Some(AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek)
+            Some(AgentType::ClaudeCode | AgentType::Pi | AgentType::DeepSeek | AgentType::Codex)
         )
     {
         return Err(coded_invalid(
             "unsupported_reasoning_effort",
-            "Per-turn effort is implemented only for Claude Code, Pi and DeepSeek Harness",
+            "Per-turn effort is unavailable for this runtime",
         ));
     }
     if params.blocks.is_empty() {

@@ -19,7 +19,7 @@ async fn read_message(
     serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
 }
 
-async fn protocol_roundtrip(receipt: Receipt) {
+async fn protocol_roundtrip(receipt: Receipt, depth: Option<Option<String>>) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_string_lossy().to_string();
     temp_env::async_with_vars([("CODEG_HOME", Some(root.as_str()))], async {
@@ -53,12 +53,20 @@ async fn protocol_roundtrip(receipt: Receipt) {
             send(&mut peer_write, &json!({"id":ID_INITIALIZE,"result":{}})).await.unwrap();
             let initialized = read_message(&mut lines).await;
             methods.push(initialized["method"].as_str().unwrap().to_string());
+            if let Some(depth) = &depth {
+                let list = read_message(&mut lines).await;
+                assert_eq!(list["method"], "model/list");
+                send(&mut peer_write, &json!({"id":ID_MODELS,"result":{"data":[{"id":"fixture-model","defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}]}})).await.unwrap();
+                assert!(depth.as_deref().is_none_or(|s| s == "low" || s == "high"));
+            }
             let thread = read_message(&mut lines).await;
             methods.push(thread["method"].as_str().unwrap().to_string());
             send(&mut peer_write, &json!({"id":ID_THREAD,"result":{"thread":{"id":sid}}})).await.unwrap();
             let start = read_message(&mut lines).await;
             methods.push(start["method"].as_str().unwrap().to_string());
             assert_eq!(start["params"]["input"][0]["text"], "A initial task");
+            if let Some(depth) = &depth { assert_eq!(start["params"]["effort"], depth.as_deref().unwrap_or("medium")); }
+            else { assert!(start["params"].get("effort").is_none()); }
             send(&mut peer_write, &json!({"id":ID_TURN,"result":{"turn":{"id":"turn-a","status":"inProgress"}}})).await.unwrap();
             while !state.read().await.native_steer_v1_available { tokio::task::yield_now().await; }
             let expected = crate::acp::steering::turn_id(&*state.read().await);
@@ -103,7 +111,7 @@ async fn protocol_roundtrip(receipt: Receipt) {
             assert!(lines.next_line().await.unwrap().is_none(), "no hidden turn/start or turn/interrupt may follow");
             methods
         };
-        let pump = driver.pump(host_write, host_read, vec![json!({"type":"text","text":"A initial task"})], None, &mut mapper, &mut record, &mut command_rx);
+        let pump = driver.pump(host_write, host_read, vec![json!({"type":"text","text":"A initial task"})], depth.as_ref().map(|_| "fixture-model".into()), depth.clone(), &mut mapper, &mut record, &mut command_rx);
         let (end, methods) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(pump, fake_server) }).await.unwrap();
         assert_eq!(methods.iter().filter(|m| m.as_str() == "turn/start").count(), 1);
         assert!(!methods.iter().any(|m| m == "turn/interrupt"));
@@ -126,19 +134,26 @@ async fn protocol_roundtrip(receipt: Receipt) {
 
 #[tokio::test]
 async fn myclaw_prompt_codex_native_driver_turn_steer_finish_and_transcript() {
-    protocol_roundtrip(Receipt::Injected).await;
+    protocol_roundtrip(Receipt::Injected, None).await;
 }
 #[tokio::test]
 async fn myclaw_prompt_codex_native_driver_no_active_turn_is_unconsumed() {
-    protocol_roundtrip(Receipt::NoActiveTurn).await;
+    protocol_roundtrip(Receipt::NoActiveTurn, None).await;
 }
 #[tokio::test]
 async fn myclaw_prompt_codex_native_driver_unknown_or_lost_reply_is_unconfirmed() {
-    protocol_roundtrip(Receipt::Unknown).await;
-    protocol_roundtrip(Receipt::Lost).await;
+    protocol_roundtrip(Receipt::Unknown, None).await;
+    protocol_roundtrip(Receipt::Lost, None).await;
 }
 
 #[tokio::test]
 async fn myclaw_prompt_codex_native_driver_terminal_before_ack_keeps_receipt_and_transcript() {
-    protocol_roundtrip(Receipt::TerminalFirst).await;
+    protocol_roundtrip(Receipt::TerminalFirst, None).await;
+}
+
+#[tokio::test]
+async fn myclaw_prompt_codex_automation_depth_survives_resume_and_restores_native_default() {
+    for depth in [Some("low".into()), Some("high".into()), None] {
+        protocol_roundtrip(Receipt::Injected, Some(depth)).await;
+    }
 }
