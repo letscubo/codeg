@@ -24,12 +24,24 @@ def _chain_original():
 
 # Consume before chaining: tools and provider subprocesses must not install this.
 _enabled = os.environ.pop("CODEG_HERMES_NATIVE_BOOTSTRAP", None) == "1"
+_reasoning_enabled = os.environ.pop("CODEG_HERMES_REASONING_BOOTSTRAP", None) == "1"
 _chain_original()
-if _enabled and ("acp" in sys.argv[1:] or "hermes-acp" in pathlib.Path(sys.argv[0]).name
-                 or "acp_adapter.entry" in sys.argv):
-    try:
-        from codeg_native_steering import install
-        install()
-    except Exception:
-        # Normal Hermes ACP remains available, with no advertised v1 capability.
-        pass
+if "acp" in sys.argv[1:] or "hermes-acp" in pathlib.Path(sys.argv[0]).name or "acp_adapter.entry" in sys.argv:
+    if _enabled:
+        try:
+            from codeg_native_steering import install
+            # The source-pinned Finder must be present before reasoning imports
+            # Hermes modules; installing after those imports would disable it.
+            install()
+        except Exception:
+            # Ordinary Hermes keeps its existing native-capability fallback.
+            pass
+    if _reasoning_enabled:
+        try:
+            from reasoning_bridge import install_snapshot_bridge
+            install_snapshot_bridge()
+        except Exception:
+            # A selected depth must never become a successful ordinary launch.
+            # Avoid printing config exceptions, which can contain credentials.
+            sys.stderr.write("Codeg could not initialize Hermes reasoning support\n")
+            os._exit(78)

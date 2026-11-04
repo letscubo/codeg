@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::models::agent::AgentType;
 
 const HERMES_MARKER: &str = "CODEG_HERMES_NATIVE_BOOTSTRAP";
+const REASONING_MARKER: &str = "CODEG_HERMES_REASONING_BOOTSTRAP";
 const PYTHON_PATH: &str = "PYTHONPATH";
 const NODE_OPTIONS: &str = "NODE_OPTIONS";
 const HERMES_OWNED_DIR: &str = "CODEG_HERMES_OWNED_BOOTSTRAP_DIR";
@@ -25,6 +26,10 @@ const HERMES_RESOURCES: &[Resource<'_>] = &[
     Resource {
         name: "codeg_native_steering.py",
         source: include_str!("../../resources/hermes/codeg_native_steering.py"),
+    },
+    Resource {
+        name: "reasoning_bridge.py",
+        source: include_str!("../../resources/hermes/reasoning_bridge.py"),
     },
 ];
 
@@ -55,6 +60,10 @@ fn disabled(env: &[(String, String)]) -> bool {
     })
 }
 
+fn reasoning_requested(env: &[(String, String)]) -> bool {
+    env_value(env, super::hermes_reasoning::SNAPSHOT_ENV).is_some()
+}
+
 /// Plan only child-environment additions. A present empty value is the ACP
 /// launcher's explicit env_remove convention, so it must suppress inheritance.
 fn plan_launch_env(
@@ -64,7 +73,9 @@ fn plan_launch_env(
     inherited_python_path: Option<&OsStr>,
     inherited_node_options: Option<&OsStr>,
 ) -> Option<Vec<(String, String)>> {
-    if agent_type != AgentType::Hermes || disabled(env) {
+    let native_enabled = !disabled(env);
+    let reasoning_enabled = reasoning_requested(env);
+    if agent_type != AgentType::Hermes || (!native_enabled && !reasoning_enabled) {
         return None;
     }
     let original = match env_value(env, PYTHON_PATH) {
@@ -87,12 +98,17 @@ fn plan_launch_env(
         serde_json::to_string(script_dir.join("node-bootstrap.mjs").to_str()?).ok()?;
     let mut planned = env.to_vec();
     planned.retain(|(key, _)| {
+        let generated = [
+            PYTHON_PATH,
+            HERMES_MARKER,
+            REASONING_MARKER,
+            NODE_OPTIONS,
+            HERMES_OWNED_DIR,
+        ];
         if cfg!(windows) {
-            ![PYTHON_PATH, HERMES_MARKER, NODE_OPTIONS, HERMES_OWNED_DIR]
-                .iter()
-                .any(|name| key.eq_ignore_ascii_case(name))
+            !generated.iter().any(|name| key.eq_ignore_ascii_case(name))
         } else {
-            ![PYTHON_PATH, HERMES_MARKER, NODE_OPTIONS, HERMES_OWNED_DIR].contains(&key.as_str())
+            !generated.contains(&key.as_str())
         }
     });
     planned.push((PYTHON_PATH.into(), python_path));
@@ -103,7 +119,17 @@ fn plan_launch_env(
             .into(),
     ));
     planned.push((HERMES_OWNED_DIR.into(), script_dir.to_str()?.into()));
-    planned.push((HERMES_MARKER.into(), "1".into()));
+    planned.push((
+        HERMES_MARKER.into(),
+        if native_enabled {
+            "1".into()
+        } else {
+            env_value(env, HERMES_MARKER).unwrap_or("0").into()
+        },
+    ));
+    if reasoning_enabled {
+        planned.push((REASONING_MARKER.into(), "1".into()));
+    }
     Some(planned)
 }
 
@@ -203,9 +229,10 @@ fn materialize_named(
 
 /// Called after the ordinary environment merge; launcher, argv, cwd, home,
 /// credentials and process ownership remain those of the existing ACP launch.
-/// Failure leaves the ordinary launcher untouched and native support disabled.
+/// A failure leaves this environment unchanged. Snapshot callers reject that
+/// failure; native-only callers preserve their ordinary ACP fallback.
 pub(super) fn prepare_launch_env(agent_type: AgentType, env: &mut Vec<(String, String)>) -> bool {
-    if agent_type != AgentType::Hermes || disabled(env) {
+    if agent_type != AgentType::Hermes || (disabled(env) && !reasoning_requested(env)) {
         return false;
     }
     let inherited: Option<OsString> = std::env::var_os(PYTHON_PATH);

@@ -3,6 +3,45 @@
 use super::*;
 
 #[test]
+fn myclaw_prompt_hermes_owned_bootstrap_snapshot_enables_both_bridges() {
+    let env = vec![(
+        crate::acp::hermes_reasoning::SNAPSHOT_ENV.into(),
+        "low".into(),
+    )];
+    let original = env.clone();
+    let result = plan_launch_env(AgentType::Hermes, &env, Path::new("owned"), None, None).unwrap();
+    assert_eq!(env_value(&result, HERMES_MARKER), Some("1"));
+    assert_eq!(env_value(&result, REASONING_MARKER), Some("1"));
+    assert_eq!(
+        env_value(&result, crate::acp::hermes_reasoning::SNAPSHOT_ENV),
+        Some("low")
+    );
+    assert_eq!(env, original);
+    assert!(plan_launch_env(AgentType::ClaudeCode, &env, Path::new("owned"), None, None).is_none());
+}
+
+#[test]
+fn myclaw_prompt_hermes_owned_bootstrap_native_opt_out_keeps_snapshot_enabled() {
+    for opt_out in ["0", "false", "OFF", "stock"] {
+        let env = vec![
+            (HERMES_MARKER.into(), opt_out.into()),
+            (
+                crate::acp::hermes_reasoning::SNAPSHOT_ENV.into(),
+                "high".into(),
+            ),
+        ];
+        let result =
+            plan_launch_env(AgentType::Hermes, &env, Path::new("owned"), None, None).unwrap();
+        assert_eq!(env_value(&result, HERMES_MARKER), Some(opt_out));
+        assert_eq!(env_value(&result, REASONING_MARKER), Some("1"));
+        assert_eq!(
+            env_value(&result, crate::acp::hermes_reasoning::SNAPSHOT_ENV),
+            Some("high")
+        );
+    }
+}
+
+#[test]
 fn myclaw_prompt_owned_bootstrap_preserves_child_env_and_inherited_python_path() {
     let env = vec![
         ("HERMES_HOME".into(), "/identity-a".into()),

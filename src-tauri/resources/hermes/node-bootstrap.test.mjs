@@ -125,3 +125,39 @@ test('Hermes verified selector spelling can differ from canonical owned director
   const result = restoreOwnedEnvironment({ ...h.env, CODEG_HERMES_OWNED_BOOTSTRAP_DIR: selector }, h.invocation, ['acp'], plan)
   assert.equal(result.PYTHONPATH, h.owned)
 })
+
+test('Hermes native optout zero permits only the requested reasoning bootstrap', t => {
+  const h = setup(t)
+  writeFileSync(join(h.owned, 'reasoning_bridge.py'), '# fake resource, never executed')
+  const options = { ...h.options, env: { ...h.options.env, CODEG_HERMES_NATIVE_BOOTSTRAP: '0',
+    CODEG_HERMES_REASONING_BOOTSTRAP: '1', CODEG_HERMES_REASONING_EFFORT: 'high' } }
+  const plan = inspectWrapper(options)
+  assert.ok(plan)
+  const env = { ...h.env, ...options.env }
+  const restored = restoreOwnedEnvironment(env, h.invocation, ['acp'], plan)
+  assert.equal(restored.PYTHONPATH, h.owned)
+  assert.equal(restored.CODEG_HERMES_NATIVE_BOOTSTRAP, '0')
+  assert.equal(restored.CODEG_HERMES_REASONING_BOOTSTRAP, '1')
+  assert.equal(restored.CODEG_HERMES_REASONING_EFFORT, 'high')
+  assert.equal(restoreOwnedEnvironment({ ...env, CODEG_HERMES_NATIVE_BOOTSTRAP: '1' }, h.invocation, ['acp'], plan).PYTHONPATH, undefined)
+})
+
+test('Hermes joint bootstrap keeps both markers and requires its reasoning resource', t => {
+  const h = setup(t)
+  const options = { ...h.options, env: { ...h.options.env,
+    CODEG_HERMES_REASONING_BOOTSTRAP: '1', CODEG_HERMES_REASONING_EFFORT: 'low' } }
+  assert.equal(inspectWrapper(options), null)
+  writeFileSync(join(h.owned, 'reasoning_bridge.py'), '# fake resource, never executed')
+  const plan = inspectWrapper(options)
+  assert.ok(plan)
+  const env = { ...h.env, ...options.env }
+  const restored = restoreOwnedEnvironment(env, h.invocation, ['acp'], plan)
+  assert.equal(restored.PYTHONPATH, h.owned)
+  assert.equal(restored.CODEG_HERMES_NATIVE_BOOTSTRAP, '1')
+  assert.equal(restored.CODEG_HERMES_REASONING_BOOTSTRAP, '1')
+  assert.equal(restored.CODEG_HERMES_REASONING_EFFORT, 'low')
+  for (const value of ['0', undefined]) {
+    const changed = { ...env, CODEG_HERMES_REASONING_BOOTSTRAP: value }
+    assert.equal(restoreOwnedEnvironment(changed, h.invocation, ['acp'], plan), changed)
+  }
+})

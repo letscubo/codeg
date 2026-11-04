@@ -17,10 +17,13 @@ const ownFile = fileURLToPath(import.meta.url)
 
 export function inspectWrapper({ entry = process.argv[1], args = process.argv.slice(2), env = process.env, bootstrapFile = ownFile, platform = process.platform } = {}) {
   try {
-    if (env.CODEG_HERMES_NATIVE_BOOTSTRAP !== '1' || args.length !== 1 || args[0] !== 'acp') return null
+    const nativeEnabled = env.CODEG_HERMES_NATIVE_BOOTSTRAP === '1'
+    const reasoningEnabled = env.CODEG_HERMES_REASONING_BOOTSTRAP === '1'
+    if ((!nativeEnabled && !reasoningEnabled) || args.length !== 1 || args[0] !== 'acp') return null
     const ownedDir = realpathSync(dirname(bootstrapFile))
     if (!env.CODEG_HERMES_OWNED_BOOTSTRAP_DIR || realpathSync(env.CODEG_HERMES_OWNED_BOOTSTRAP_DIR) !== ownedDir) return null
-    if (!['sitecustomize.py', 'codeg_native_steering.py'].every(name => statSync(join(ownedDir, name)).isFile())) return null
+    const required = ['sitecustomize.py', ...(nativeEnabled ? ['codeg_native_steering.py'] : []), ...(reasoningEnabled ? ['reasoning_bridge.py'] : [])]
+    if (!required.every(name => statSync(join(ownedDir, name)).isFile())) return null
     const resolved = realpathSync(entry)
     const root = dirname(dirname(resolved))
     if (resolved !== join(root, 'bin', 'hermes.js')) return null
@@ -31,6 +34,8 @@ export function inspectWrapper({ entry = process.argv[1], args = process.argv.sl
     const venv = join(root, 'runtime', 'hermes-agent', 'venv')
     return {
       root, ownedDir, ownedSelector: env.CODEG_HERMES_OWNED_BOOTSTRAP_DIR, venv,
+      nativeMarker: env.CODEG_HERMES_NATIVE_BOOTSTRAP,
+      reasoningMarker: env.CODEG_HERMES_REASONING_BOOTSTRAP,
       console: platform === 'win32' ? join(venv, 'Scripts', 'hermes.exe') : join(venv, 'bin', 'hermes'),
       entryUrl: pathToFileURL(resolved).href,
       launcherUrl: pathToFileURL(join(root, 'lib', 'python-launcher.js')).href,
@@ -46,7 +51,10 @@ export function restoreOwnedEnvironment(env, invocation, userArgs, plan) {
       !Array.isArray(invocation.args) || invocation.args.length !== 1 || invocation.args[0] !== 'acp' ||
       env.HERMES_NPM_BRIDGE !== '1' || env.HERMES_NPM_PACKAGE_ROOT !== plan.root ||
       env.HERMES_NPM_PACKAGE_VERSION !== '0.21.3' || env.HERMES_NPM_RELEASE_TAG !== 'v2026.9.14' ||
-      env.VIRTUAL_ENV !== plan.venv || env.CODEG_HERMES_NATIVE_BOOTSTRAP !== '1' ||
+      env.VIRTUAL_ENV !== plan.venv ||
+      (env.CODEG_HERMES_NATIVE_BOOTSTRAP !== '1' && env.CODEG_HERMES_REASONING_BOOTSTRAP !== '1') ||
+      env.CODEG_HERMES_NATIVE_BOOTSTRAP !== plan.nativeMarker ||
+      env.CODEG_HERMES_REASONING_BOOTSTRAP !== plan.reasoningMarker ||
       env.CODEG_HERMES_OWNED_BOOTSTRAP_DIR !== plan.ownedSelector ||
       Object.hasOwn(env, 'PYTHONHOME') || Object.hasOwn(env, 'PYTHONPATH')) return env
   const result = { ...env, PYTHONPATH: plan.ownedDir }
@@ -60,7 +68,7 @@ export function patchLauncher(source, plan) {
   if (!plan || hash(source) !== PINS['lib/python-launcher.js']) return null
   const anchor = 'env: getRuntimeEnvironment(),'
   if (source.split(anchor).length !== 2) return null
-  const selector = JSON.stringify({ root: plan.root, ownedDir: plan.ownedDir, ownedSelector: plan.ownedSelector, venv: plan.venv, console: plan.console })
+  const selector = JSON.stringify({ root: plan.root, ownedDir: plan.ownedDir, ownedSelector: plan.ownedSelector, venv: plan.venv, console: plan.console, nativeMarker: plan.nativeMarker, reasoningMarker: plan.reasoningMarker })
   return `const __codegHermesOwnedEnvironment = (${restoreOwnedEnvironment.toString()});\nconst __codegHermesOwnedPlan = ${selector};\n` +
     source.replace(anchor, 'env: __codegHermesOwnedEnvironment(getRuntimeEnvironment(), invocation, userArgs, __codegHermesOwnedPlan),')
 }

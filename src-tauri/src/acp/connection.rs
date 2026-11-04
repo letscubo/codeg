@@ -1982,7 +1982,16 @@ async fn build_agent(
                 }
             }
             let mut merged_env = merge_agent_env(env, runtime_env, scratch);
-            super::owned_bootstrap::prepare_launch_env(agent_type, &mut merged_env);
+            crate::acp::hermes_reasoning::validate_snapshot(agent_type, runtime_env)?;
+            let hermes_bootstrap =
+                super::owned_bootstrap::prepare_launch_env(agent_type, &mut merged_env);
+            if crate::acp::hermes_reasoning::snapshot_required(agent_type, runtime_env)
+                && !hermes_bootstrap
+            {
+                return Err(AcpError::protocol(
+                    "Could not prepare the requested Hermes reasoning bootstrap",
+                ));
+            }
             super::openclaw_bootstrap::prepare_launch_env(agent_type, &mut merged_env);
             // Resolve the config-derived preset HERE (like Grok's
             // `grok_launch_permission_mode` below) so the policy helper stays a
@@ -2582,6 +2591,8 @@ pub async fn spawn_agent_connection(
         }
         _ => false,
     };
+    let hermes_reasoning_required =
+        crate::acp::hermes_reasoning::snapshot_required(agent_type, &runtime_env);
 
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
@@ -2677,6 +2688,7 @@ pub async fn spawn_agent_connection(
             host_tools,
             deepseek_mcp_store,
             session_absent,
+            hermes_reasoning_required,
             stderr_tail,
         )
         .await;
@@ -5670,6 +5682,9 @@ async fn run_connection(
     // `spawn_agent_connection`): skip resume/load and go straight to the
     // linked `session/new` fallback.
     session_absent: bool,
+    // A snapshot-managed Hermes must confirm its owned bridge before opening
+    // or restoring any session. An ordinary Hermes caller keeps its old path.
+    hermes_reasoning_required: bool,
     // Connection-scoped agent stderr buffer, shared with the `with_debug`
     // callback installed by `build_agent`. Read only when a turn ends without
     // agent output, to attach evidence to the synthesized error.
@@ -6077,6 +6092,13 @@ async fn run_connection(
                     return Err(sacp::util::internal_error(INIT_TIMEOUT_SENTINEL));
                 }
             };
+            if hermes_reasoning_required
+                && !crate::acp::hermes_reasoning::init_confirms_snapshot(init_resp.meta.as_ref())
+            {
+                return Err(sacp::util::internal_error(
+                    "Hermes did not confirm the requested reasoning snapshot bridge",
+                ));
+            }
             emit_prompt_capabilities(
                 &state,
                 &emitter_clone,
